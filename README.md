@@ -41,7 +41,7 @@ Tomato 是一个日程管理软件。
 1. **下载**：在 Release 或者 compiled 文件夹里面找到最新的版本，下载，将解压的 .app 软件放入程序文件夹（Application）中。
 
 2. **打开**：在文件夹或者 launchpad 中双击打开，会弹出如下弹窗，请选择“打开”。
-  ![K4ffys4](https://i.imgur.com/K4ffys4.png)
+    ![K4ffys4](https://i.imgur.com/K4ffys4.png)
 
 3. **权限**：Tomato 需要三种权限。
 	
@@ -55,11 +55,22 @@ Tomato 是一个日程管理软件。
 	
 	- 控制软件权限：要实现对 Reminders 和 Calendar 两个软件的同步和联动控制，Tomato 就需要获得修改这两个软件数据的权限。请在弹出的对“System Events”、“Reminders”和“Calendar”三个弹窗内点击“OK”。
 	
-	  ![yBtyDFz](https://i.imgur.com/yBtyDFz.png)
-	
-	  ![6iDLBOl](https://i.imgur.com/6iDLBOl.png)
-	
-	  ![fmNI87a](https://i.imgur.com/fmNI87a.png)
+	  <p align="center">
+	    <img src="https://i.imgur.com/yBtyDFz.png" width=200 />
+	    <img src="https://i.imgur.com/6iDLBOl.png" width=200 />
+	    <img src="https://i.imgur.com/fmNI87a.png" width=200 />
+	  </p>
+	  
+	  
+	  
 
 ## 功能运用
 
+
+
+## 支持作者
+
+<p align="center">
+  <img src="https://i.imgur.com/OHHJD4y.png" width=240 />
+  <img src="https://i.imgur.com/6XiKMAK.png" width=240 />
+</p>
