@@ -41,28 +41,32 @@ Tomato 是一个日程管理软件。
 1. **下载**：在 Release 或者 compiled 文件夹里面找到最新的版本，下载，将解压的 .app 软件放入程序文件夹（Application）中。
 
 2. **打开**：在文件夹或者 launchpad 中双击打开，会弹出如下弹窗，请选择“打开”。
-    ![K4ffys4](https://i.imgur.com/K4ffys4.png)
+
+     <p align="center">
+       <img src="https://i.imgur.com/K4ffys4.png" width=240 />
+     </p>
 
 3. **权限**：Tomato 需要三种权限。
-	
-	- 辅助功能权限：Tomato 会请求用户的 Accessiblity 权限，请允许。Tomato 完全是一个本地软件，不会上传任何关于您的数据。
-	
-	- 读取数据权限：Tomato 需要在您的电脑中存放数据，并将这些数据存储在 Reminders 和 Calendar 中。请在弹出的这两个窗口中选择“OK”。
-	
-	  ![vjZqKmy](https://i.imgur.com/vjZqKmy.png)
-	
-	  ![boeUagz](https://i.imgur.com/boeUagz.png)
-	
-	- 控制软件权限：要实现对 Reminders 和 Calendar 两个软件的同步和联动控制，Tomato 就需要获得修改这两个软件数据的权限。请在弹出的对“System Events”、“Reminders”和“Calendar”三个弹窗内点击“OK”。
-	
-	  <p align="center">
-	    <img src="https://i.imgur.com/yBtyDFz.png" width=200 />
-	    <img src="https://i.imgur.com/6iDLBOl.png" width=200 />
-	    <img src="https://i.imgur.com/fmNI87a.png" width=200 />
-	  </p>
-	  
-	  
-	  
+
+  - 辅助功能权限：Tomato 会请求用户的 Accessiblity 权限，请允许。Tomato 完全是一个本地软件，不会上传任何关于您的数据。
+
+  - 读取数据权限：Tomato 需要在您的电脑中存放数据，并将这些数据存储在 Reminders 和 Calendar 中。请在弹出的这两个窗口中选择“OK”。
+
+    <p align="center">
+      <img src="https://i.imgur.com/vjZqKmy.png" width=240 />
+      <img src="https://i.imgur.com/boeUagz.png" width=240 />
+    </p>
+
+  - 控制软件权限：要实现对 Reminders 和 Calendar 两个软件的同步和联动控制，Tomato 就需要获得修改这两个软件数据的权限。请在弹出的对“System Events”、“Reminders”和“Calendar”三个弹窗内点击“OK”。
+
+    <p align="center">
+      <img src="https://i.imgur.com/yBtyDFz.png" width=240 />
+      <img src="https://i.imgur.com/6iDLBOl.png" width=240 />
+      <img src="https://i.imgur.com/fmNI87a.png" width=240 />
+    </p>
+    
+    
+    
 
 ## 功能运用
 
