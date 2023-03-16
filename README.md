@@ -50,7 +50,12 @@ Tomato 是一个日程管理软件。
 
   - 辅助功能权限：Tomato 会请求用户的 Accessiblity 权限，请允许。Tomato 完全是一个本地软件，不会上传任何关于您的数据。
 
-  - 读取数据权限：Tomato 需要在您的电脑中存放数据，并将这些数据存储在 Reminders 和 Calendar 中。请在弹出的这两个窗口中选择“OK”。
+  - 读取数据权限：Tomato 需要在您的电脑中存放数据，并将这些数据存储在 Reminders 和 Calendar 中。请在弹出的这两个窗口中选择“OK”。如果在 System Preferences 里面看到对应的部分（即 Calendar 和 Reminders）的权限列表里面没有 Tomato 的话，那么请在 Terminal 里运行以下命令，即可让 Tomato 在列表中显示出来：
+
+    ```sudo sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db "INSERT or REPLACE INTO access VALUES('kTCCServiceReminders','org.pythonmac.unspecified.Tomato',0,0,4,1,NULL,NULL,0,'UNUSED',NULL,0,1622199671)"```
+
+    ```sudo sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db "INSERT or REPLACE INTO access VALUES('kTCCServiceCalendar','org.pythonmac.unspecified.Tomato',0,0,4,1,NULL,NULL,0,'UNUSED',NULL,0,1622199671)"```
+
 
     <p align="center">
       <img src="https://i.imgur.com/vjZqKmy.png" width=240 />
