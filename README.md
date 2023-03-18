@@ -32,7 +32,7 @@ Tomato 是一个日程管理软件。
 
    Tomato 提供了一个基于 Reminders 和 Calendar 的统一控制平台，无论是添加日程，抑或是完成日程、删除日程，都可以方便地实现，一次操作可同时命令两个软件。
 
-3. 以表格形式展现换管理日程。
+3. 以表格形式管理日程。
 
    目前，Calendar 和 Reminder 都使用的是层层套叠的形式。为了简洁明了，macOS 将大量功能隐藏在点按拖拽的背后，虽然形式上更好看，但操作起来更不直观，获取信息也需要多次点击。Tomato 以更传统、更经典和更直白的数据库形式排列日程，使你所有的信息和功能都可以轻松点击，所见即所得。
 
@@ -79,7 +79,21 @@ Tomato 是一个日程管理软件。
 
 ## 功能运用
 
+![JZ05oN0](https://i.imgur.com/JZ05oN0.jpg)
 
+![yaJHeiA](https://i.imgur.com/yaJHeiA.jpg)
+
+![J6wL9j5](https://i.imgur.com/J6wL9j5.jpg)
+
+![zukt4iu](https://i.imgur.com/zukt4iu.jpg)
+
+![mpPpvkG](https://i.imgur.com/mpPpvkG.jpg)
+
+![0jbwKd3](https://i.imgur.com/0jbwKd3.jpg)
+
+![98ZXqXi](https://i.imgur.com/98ZXqXi.jpg)
+
+![AR4NHbw](https://i.imgur.com/AR4NHbw.jpg)
 
 ## 支持作者
 
