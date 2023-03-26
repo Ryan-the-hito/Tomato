@@ -101,6 +101,12 @@ Tomato 是一个日程管理软件。
 2. 当双击修改主表格内容时，请一定不要忘记修改完之后再点击一次，任意框都可以，这样才算修改完成，否则修改的数据将不会被保存。
 3. 右下角的文本框和主表格一样，也可以直接修改随时保存。但为防止出现数据复写的情况，在输入前，请一定先用鼠标在主表格里点击选择一个事项，再对文本框或者表格做出修改。只有这样，你的修改才会在最新的修改记录上得以保存。
 
+
+
+1. When entering items, please make sure to follow the specific format requirements. 
+2. When double-clicking to modify the content of the main table, please do not forget to click again after finishing the modification. Any box can be clicked to be considered as a completed modification, otherwise the modified data will not be saved. 
+3. The text box in the lower right corner is the same as the main table, and can be directly modified and saved at any time. However, to prevent data overwriting, please use the mouse to click on an item in the main table (the biggest table above) before inputting, and then make modifications to the text box or table. Only in this way, your modifications will be saved in the latest modification record. 
+
 ## 支持作者
 
 <p align="center">
