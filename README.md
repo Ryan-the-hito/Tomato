@@ -1,4 +1,4 @@
-# Tomato
+# 🍅Tomato: A Schedule Management Software
 
 ![prR6egA](https://i.imgur.com/prR6egA.png)
 
@@ -40,6 +40,29 @@ Tomato 是一个日程管理软件。
 
    现有的计划软件并不经常与日记相互关联，使用户任何时候完成一个事项，都需要重新将计划的内容在日记中重新录入一次，十分耗费精力。而 Tomato 可以合二为一，甚至合三为一：当你完成了一个事项的时候，将事项的状态改为“DONE”的一刻，今日日记会追加记录一条完成的信息，同时，如果这一事项是重复性的，那么它将拥有一个独立的表格，记录每一次完成时的情况。用户可以在“Comment”区域写下此时的想法，抑或记录此刻这一事项的进展，Tomato 会将这一内容同步记录至日志与记录中。
 
+## 界面一览
+
+![JZ05oN0](https://i.imgur.com/JZ05oN0.jpg)
+
+![yaJHeiA](https://i.imgur.com/yaJHeiA.jpg)
+
+![J6wL9j5](https://i.imgur.com/J6wL9j5.jpg)
+
+![zukt4iu](https://i.imgur.com/zukt4iu.jpg)
+
+![mpPpvkG](https://i.imgur.com/mpPpvkG.jpg)
+
+![0jbwKd3](https://i.imgur.com/0jbwKd3.jpg)
+
+![98ZXqXi](https://i.imgur.com/98ZXqXi.jpg)
+
+![AR4NHbw](https://i.imgur.com/AR4NHbw.jpg)
+
+## 环境要求
+
+- MacOS（测试环境为 MacOS 12.6.5）
+- M1、M2 芯片
+
 ## 下载安装
 
 1. **下载**：在 Release 或者 compiled 文件夹里面找到最新的版本，下载，将解压的 .app 软件放入程序文件夹（Application）中。
@@ -73,27 +96,6 @@ Tomato 是一个日程管理软件。
       <img src="https://i.imgur.com/6iDLBOl.png" width=240 />
       <img src="https://i.imgur.com/fmNI87a.png" width=240 />
     </p>
-    
-    
-    
-
-## 功能运用
-
-![JZ05oN0](https://i.imgur.com/JZ05oN0.jpg)
-
-![yaJHeiA](https://i.imgur.com/yaJHeiA.jpg)
-
-![J6wL9j5](https://i.imgur.com/J6wL9j5.jpg)
-
-![zukt4iu](https://i.imgur.com/zukt4iu.jpg)
-
-![mpPpvkG](https://i.imgur.com/mpPpvkG.jpg)
-
-![0jbwKd3](https://i.imgur.com/0jbwKd3.jpg)
-
-![98ZXqXi](https://i.imgur.com/98ZXqXi.jpg)
-
-![AR4NHbw](https://i.imgur.com/AR4NHbw.jpg)
 
 ## 注意事项
 
