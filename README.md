@@ -1,4 +1,4 @@
-# 🍅Tomato: A Schedule Management Software
+# 🍅Tomato: An Automatic Schedule Manager = Calendar + Reminders
 
 ![prR6egA](https://i.imgur.com/prR6egA.png)
 
