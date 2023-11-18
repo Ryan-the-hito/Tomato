@@ -615,10 +615,10 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
 	def upd(self):
-		webbrowser.open('https://drive.google.com/drive/folders/1OFbVRi5nCUwG12VCUYpTzxA12W5uRoec?usp=sharing')
+		pass
 
 	def upd2(self):
-		webbrowser.open('https://pan.baidu.com/s/1wqtKv2G8fP4uHeh6P0kuNw?pwd=rkuu')
+		pass
 
 	def center(self):  # 设置窗口居中
 		qr = self.frameGeometry()
