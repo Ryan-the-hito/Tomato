@@ -123,7 +123,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.0.0', self)
+		lbl1 = QLabel('Version 1.0.1', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -586,7 +586,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.0.0', self)
+		self.lbl = QLabel('Current Version: v1.0.1', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -943,9 +943,17 @@ end tell"""
 	quit
 end tell
 """
+			cmd3 = """tell application "Calendar"
+	set theCalendarName to "Tomato-old"
+	set theCalendarDescription to "Calendar for the completed items."
+	set theNewCalendar to make new calendar with properties {name:theCalendarName, description:theCalendarDescription}
+	quit
+end tell
+"""
 			try:
 				subprocess.call(['osascript', '-e', cmd])
 				subprocess.call(['osascript', '-e', cmd2])
+				subprocess.call(['osascript', '-e', cmd3])
 				shutil.copy('All.csv', fulldir1)
 				with open(fulldir2, 'w', encoding='utf-8') as f0:
 					f0.write('1')
@@ -1415,10 +1423,10 @@ end tell
 			if self.changing_column == 4 and self.tableWidget.item(self.changing_row, 4).text() == 'UNDONE' and self.to_done == 2:
 				new1_text = self.changing_text
 				old_date = self.changing_date
+				old_length = self.changing_length
 				stamp_item = self.to_stamp(old_date)
 				timeArray = time.localtime(float(stamp_item))
 				otherStyleTime = time.strftime("%m/%d/%Y %H:%M", timeArray)
-				new3_leng = self.tableWidget.item(self.changing_row, 2).text()
 				cmd = """tell application "Reminders"
 						set eachLine to "%s"
 						set mylist to list "Tomato"
@@ -1427,13 +1435,22 @@ end tell
 						end tell
 						quit
 					end tell""" % (new1_text, otherStyleTime)
+				cmd2 = '''tell application "Calendar"
+					tell calendar "Tomato"
+						make new event at end with properties {summary:"%s", start date:date "%s", end date:date "%s" + (%s * hours)} 
+					end tell
+					quit
+				end tell
+				''' % (new1_text, otherStyleTime, otherStyleTime, old_length)
 				try:
 					subprocess.call(['osascript', '-e', cmd])
+					subprocess.call(['osascript', '-e', cmd2])
 				except Exception as e:
 					pass
 			if self.changing_column == 4 and self.tableWidget.item(self.changing_row, 4).text() == 'DONE' and self.to_done == 1:
 				old_text = self.changing_text
 				old_date = self.changing_date
+				old_length = self.changing_length
 				stamp_item = self.to_stamp(old_date)
 				timeArray = time.localtime(float(stamp_item))
 				otherStyleTime = time.strftime("%m/%d/%Y %H:%M", timeArray)
@@ -1444,8 +1461,19 @@ end tell
 					end tell
 					quit
 				end tell""" % (old_text, otherStyleTime)
+				cmd2 = '''tell application "Calendar"
+					tell calendar "Tomato"
+						delete (events whose (start date is date "%s") and (summary is "%s"))
+					end tell
+					tell calendar "Tomato-old"
+						make new event at end with properties {summary:"%s", start date:date "%s", end date:date "%s" + (%s * hours)} 
+					end tell
+					quit
+				end tell
+				''' % (otherStyleTime, old_text, old_text, otherStyleTime, otherStyleTime, old_length)
 				try:
 					subprocess.call(['osascript', '-e', cmd])
+					subprocess.call(['osascript', '-e', cmd2])
 				except Exception as e:
 					pass
 				if self.tableWidget.item(self.changing_row, 3).text() != '-':
@@ -1589,6 +1617,7 @@ end tell
 		self.changing_column = self.tableWidget.currentIndex().column()
 		self.changing_text = self.tableWidget.item(self.changing_row, 0).text()
 		self.changing_date = self.tableWidget.item(self.changing_row, 1).text()
+		self.changing_length = self.tableWidget.item(self.changing_row, 2).text()
 		self.changing_done = self.tableWidget.item(self.changing_row, 4).text()
 		if self.changing_done == 'UNDONE':
 			self.to_done = 1
@@ -1881,6 +1910,16 @@ end tell""" % (ite1_inp, otherStyleTime, otherStyleTime, len3_inp)
 							csv_writer = csv.writer(csv_file)
 							csv_writer.writerows(new_lines)
 
+		cmd = """tell application "Reminders"
+			set myList to list "Tomato"
+			delete (reminders in myList) whose completed is true
+			quit
+		end tell"""
+		try:
+			subprocess.call(['osascript', '-e', cmd])
+		except:
+			pass
+
 		self.le4.setText('-')
 		self.le4.setText('')
 
@@ -1981,6 +2020,7 @@ end tell""" % (ite1_inp, otherStyleTime, otherStyleTime, len3_inp)
 			if self.tableWidget.item(self.changing_row, 4).text() == 'DONE':
 				old_text = self.changing_text
 				old_date = self.changing_date
+				old_length = self.changing_length
 				stamp_item = self.to_stamp(old_date)
 				timeArray = time.localtime(float(stamp_item))
 				otherStyleTime = time.strftime("%m/%d/%Y %H:%M", timeArray)
@@ -1991,8 +2031,19 @@ end tell""" % (ite1_inp, otherStyleTime, otherStyleTime, len3_inp)
 					end tell
 					quit
 				end tell""" % (old_text, otherStyleTime)
+				cmd2 = '''tell application "Calendar"
+					tell calendar "Tomato"
+						delete (events whose (start date is date "%s") and (summary is "%s"))
+					end tell
+					tell calendar "Tomato-old"
+						make new event at end with properties {summary:"%s", start date:date "%s", end date:date "%s" + (%s * hours)} 
+					end tell
+					quit
+				end tell
+				''' % (otherStyleTime, old_text, old_text, otherStyleTime, otherStyleTime, old_length)
 				try:
 					subprocess.call(['osascript', '-e', cmd])
+					subprocess.call(['osascript', '-e', cmd2])
 				except Exception as e:
 					pass
 				if self.tableWidget.item(self.changing_row, 3).text() != '-':
