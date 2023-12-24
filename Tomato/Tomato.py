@@ -123,7 +123,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.0.1', self)
+		lbl1 = QLabel('Version 1.0.2', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -586,7 +586,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.0.1', self)
+		self.lbl = QLabel('Current Version: v1.0.2', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -2205,7 +2205,7 @@ end tell""" % (ite1_inp, otherStyleTime, otherStyleTime, len3_inp)
 				row = []
 				i = 0
 				while 0 <= i <= col - 1:
-					if self.tableWidget_record.item(t, i) != None and self.tableWidget.item(t, i).text() != '':
+					if self.tableWidget_record.item(t, i) != None and self.tableWidget_record.item(t, i).text() != '':
 						cell = str(self.tableWidget_record.item(t, i).text())
 						row.append(cell)
 					if self.tableWidget_record.item(t, i) == None:
@@ -2962,7 +2962,7 @@ end tell""" % (ite1_inp, otherStyleTime, otherStyleTime, len3_inp)
 				row = []
 				i = 0
 				while 0 <= i <= col - 1:
-					if self.tableWidget_record2.item(t, i) != None and self.tableWidget_freq.item(t, i).text() != '':
+					if self.tableWidget_record2.item(t, i) != None and self.tableWidget_record2.item(t, i).text() != '':
 						cell = str(self.tableWidget_record2.item(t, i).text())
 						row.append(cell)
 					if self.tableWidget_record2.item(t, i) == None:
