@@ -123,7 +123,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.0.2', self)
+		lbl1 = QLabel('Version 1.1.0', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -586,7 +586,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.0.2', self)
+		self.lbl = QLabel('Current Version: v1.1.0', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -812,19 +812,16 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		BIGGIST_HEIGHT = int(self.screen().availableGeometry().height())
 
 		self.resize(HALF_WEIGHT, DE_HEIGHT)
-		self.center()
-		self.move_window2(0, self.pos().y())
+		self.move(self.width() + 3, int((DE_HEIGHT - 70) / 2))
+		self.move_window2(0, int((DE_HEIGHT - 70) / 2))
 		self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
 		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-		self.setMinimumSize(MINI_WEIGHT, HALF_HEIGHT)
-		self.setMaximumSize(MOST_WEIGHT, BIGGIST_HEIGHT)
 		self.show()
 		self.tab_bar.setVisible(False)
 		with open(BasePath + 'win_width.txt', 'w', encoding='utf-8') as f0:
 			f0.write(str(self.width()))
-		self.new_width = 17
-		self.resize(self.new_width, DE_HEIGHT)
-		self.setFixedWidth(self.new_width)
+		self.new_width = 10
+		self.setFixedSize(self.new_width, 120)
 		app.setStyleSheet(style_sheet_ori)
 		self.assigntoall()
 
@@ -885,14 +882,6 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		new_pos = QRect(width, height, self.width(), self.height())
 		animation.setEndValue(new_pos)
 		animation.start()
-
-	def mousePressEvent(self, event):
-		if event.button() == Qt.MouseButton.LeftButton:
-			self.dragPosition = event.globalPosition().toPoint() - self.pos()
-
-	def mouseMoveEvent(self, event):
-		if event.buttons() == Qt.MouseButton.LeftButton:
-			self.move(event.globalPosition().toPoint() - self.dragPosition)
 
 	def assigntoall(self):
 		cmd = """osascript -e '''on run
@@ -3826,237 +3815,331 @@ end tell""" % (ite1_inp, otherStyleTime, otherStyleTime, len3_inp)
 		SCREEN_WEIGHT = int(self.screen().availableGeometry().width())
 		WINDOW_WEIGHT = int(self.width())
 		DE_HEIGHT = int(self.screen().availableGeometry().height())
-		if self.pos().x() + WINDOW_WEIGHT + 4 < SCREEN_WEIGHT and self.pos().x() > 4:
+		target_x = 0
+		target_y = self.pos().y()
+		if self.i % 2 == 1: # show
+			win_old_width = codecs.open(BasePath + 'win_width.txt', 'r', encoding='utf-8').read()
+			btna4.setChecked(True)
 			self.btn_00.setStyleSheet('''
-									border: 1px outset grey;
-									background-color: #FFFFFF;
-									border-radius: 4px;
-									padding: 1px;
-									color: #000000''')
-		else:
+						border: 1px outset grey;
+						background-color: #0085FF;
+						border-radius: 4px;
+						padding: 1px;
+						color: #FFFFFF''')
+			self.tab_bar.setVisible(True)
+			self.setMinimumSize(0, 0)
+			self.setMaximumSize(16777215, 16777215)
+			self.resize(int(win_old_width), DE_HEIGHT)
+			self.move(0 - int(win_old_width) + 10, 0)
+			target_x = 3
+			target_y = 0
+		if self.i % 2 == 0: # hide
+			btna4.setChecked(False)
+			self.btn_00.setStyleSheet('''
+						border: 1px outset grey;
+						background-color: #FFFFFF;
+						border-radius: 4px;
+						padding: 1px;
+						color: #000000''')
+			self.tab_bar.setVisible(False)
+			with open(BasePath + 'win_width.txt', 'w', encoding='utf-8') as f0:
+				f0.write(str(self.width()))
+			self.setFixedSize(self.new_width, 120)
+			self.move(self.width() + 3, int((DE_HEIGHT - 70) / 2))
 			target_x = 0
-			if self.i % 2 == 1:
-				win_old_width = codecs.open(BasePath + 'win_width.txt', 'r', encoding='utf-8').read()
-				btna4.setChecked(True)
-				self.btn_00.setStyleSheet('''
-							border: 1px outset grey;
-							background-color: #0085FF;
-							border-radius: 4px;
-							padding: 1px;
-							color: #FFFFFF''')
-				self.tab_bar.setVisible(True)
-				self.resize(int(win_old_width), DE_HEIGHT)
-				self.move(0 - int(win_old_width) + 10, self.pos().y())
-				target_x = 3
-				self.setFixedWidth(int(win_old_width))
-			if self.i % 2 == 0:
-				btna4.setChecked(False)
-				self.btn_00.setStyleSheet('''
-							border: 1px outset grey;
-							background-color: #FFFFFF;
-							border-radius: 4px;
-							padding: 1px;
-							color: #000000''')
-				self.tab_bar.setVisible(False)
-				with open(BasePath + 'win_width.txt', 'w', encoding='utf-8') as f0:
-					f0.write(str(self.width()))
-				self.resize(self.new_width, DE_HEIGHT)
-				self.move(self.width() + 3, self.pos().y())
-				target_x = 0
-				self.setFixedWidth(self.new_width)
+			target_y = int((DE_HEIGHT - 70) / 2)
 
-			ISOTIMEFORMAT = '%Y-%m-%d diary'
-			theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
-			diary_name = str(theTime) + ".md"
-			diary_file = os.path.join(self.fulldir_dia, diary_name)
-			if not os.path.exists(diary_file):
-				with open(diary_file, 'a', encoding='utf-8') as f0:
-					f0.write(f'# {theTime}')
-			contm = codecs.open(diary_file, 'r', encoding='utf-8').read()
+		ISOTIMEFORMAT = '%Y-%m-%d diary'
+		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
+		diary_name = str(theTime) + ".md"
+		diary_file = os.path.join(self.fulldir_dia, diary_name)
+		if not os.path.exists(diary_file):
+			with open(diary_file, 'a', encoding='utf-8') as f0:
+				f0.write(f'# {theTime}')
+		contm = codecs.open(diary_file, 'r', encoding='utf-8').read()
 
-			tabnum = self.tab_bar.currentIndex()
-			self.openwidth = self.tableWidget.width()
-			leng_small = self.tableWidget_record.width()
-			if tabnum == 0:
-				self.tableWidget.setColumnWidth(0, int(self.openwidth / 8 * 3))
-				self.tableWidget.setColumnWidth(1, int(self.openwidth / 16 * 3))
-				self.tableWidget.setColumnWidth(2, int(self.openwidth / 48 * 7))
-				self.tableWidget.setColumnWidth(3, int(self.openwidth / 48 * 7))
-				self.tableWidget.setColumnWidth(4, int(self.openwidth / 48 * 7))
-				self.tableWidget.setColumnWidth(5, 0)
-				self.tableWidget.setColumnWidth(6, 0)
-				self.tableWidget.setColumnWidth(7, 0)
-				self.tableWidget.setColumnWidth(8, 0)
-				self.tableWidget_record.setColumnWidth(0, int(leng_small / 2))
-				self.tableWidget_record.setColumnWidth(1, int(leng_small / 2))
-				self.le4.setText('-')
-				self.le4.clear()
-				self.textii1.setText(contm)
-				self.textii1.ensureCursorVisible()  # 游标可用
-				cursor = self.textii1.textCursor()  # 设置游标
-				pos = len(self.textii1.toPlainText())  # 获取文本尾部的位置
-				cursor.setPosition(pos)  # 游标位置设置为尾部
-				self.textii1.setTextCursor(cursor)  # 滚动到游标位置
-			if tabnum == 1:
-				self.tableWidget_freq.setColumnWidth(0, int(self.openwidth / 16 * 9))
-				self.tableWidget_freq.setColumnWidth(1, 0)
-				self.tableWidget_freq.setColumnWidth(2, 0)
-				self.tableWidget_freq.setColumnWidth(3, 0)
-				self.tableWidget_freq.setColumnWidth(4, int(self.openwidth / 48 * 7))
-				self.tableWidget_freq.setColumnWidth(5, int(self.openwidth / 48 * 7))
-				self.tableWidget_freq.setColumnWidth(6, int(self.openwidth / 48 * 7))
-				self.tableWidget_freq.setColumnWidth(7, 0)
-				self.tableWidget_freq.setColumnWidth(8, 0)
-				self.tableWidget_record2.setColumnWidth(0, int(leng_small / 2))
-				self.tableWidget_record2.setColumnWidth(1, int(leng_small / 2))
-				self.lf2.setText('-')
-				self.lf2.clear()
-				self.textii2.setText(contm)
-				self.textii2.ensureCursorVisible()  # 游标可用
-				cursor = self.textii2.textCursor()  # 设置游标
-				pos = len(self.textii2.toPlainText())  # 获取文本尾部的位置
-				cursor.setPosition(pos)  # 游标位置设置为尾部
-				self.textii2.setTextCursor(cursor)  # 滚动到游标位置
-			if tabnum == 2:
-				self.tableWidget_memo.setColumnWidth(0, int(self.openwidth / 48 * 41))
-				self.tableWidget_memo.setColumnWidth(1, 0)
-				self.tableWidget_memo.setColumnWidth(2, 0)
-				self.tableWidget_memo.setColumnWidth(3, 0)
-				self.tableWidget_memo.setColumnWidth(4, int(self.openwidth / 48 * 7))
-				self.tableWidget_memo.setColumnWidth(5, 0)
-				self.tableWidget_memo.setColumnWidth(6, 0)
-				self.tableWidget_memo.setColumnWidth(7, 0)
-				self.tableWidget_memo.setColumnWidth(8, 0)
-				self.lm1.setText('-')
-				self.lm1.clear()
-				#self.tableWidget_record3.setColumnWidth(0, int(leng_small / 2))
-				#self.tableWidget_record3.setColumnWidth(1, int(leng_small / 2))
-				self.textii3.setText(contm)
-				self.textii3.ensureCursorVisible()  # 游标可用
-				cursor = self.textii3.textCursor()  # 设置游标
-				pos = len(self.textii3.toPlainText())  # 获取文本尾部的位置
-				cursor.setPosition(pos)  # 游标位置设置为尾部
-				self.textii3.setTextCursor(cursor)  # 滚动到游标位置
+		# update desktop widget
+		home_dir = str(Path.home())
+		tarname1 = "Library"
+		fulldir1 = os.path.join(home_dir, tarname1)
+		tarname2 = "Application Support"
+		fulldir2 = os.path.join(fulldir1, tarname2)
+		tarname3 = "Übersicht"
+		fulldir3 = os.path.join(fulldir2, tarname3)
+		tarname4 = "widgets"
+		fulldir4 = os.path.join(fulldir3, tarname4)
+		tarname5 = ".totomato.txt"
+		fulldir5 = os.path.join(fulldir4, tarname5)
+		if os.path.isfile(fulldir5):
+			totomato = codecs.open(fulldir5, 'r', encoding='utf-8').read()
+			if totomato != '':
+				tomato_list = totomato.split('\n')
+				while '' in tomato_list:
+					tomato_list.remove('')
+				for i in range(len(tomato_list)):
+					new_time_sns = []
+					outerlist = []
+					part1 = tomato_list[i].replace('\n', '')
+					ISOTIMEFORMAT = '%Y-%m-%d %H:%M'
+					theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
+					part2 = str(theTime)
+					part3 = '-'
+					part4 = '-'
+					part5 = 'UNDONE'
+					part6 = '-'
+					part7 = '-'
+					part8 = 'MEMO_SNS'
+					part9 = str(self.to_stamp(part2))
+					new_time_sns.append(part1)
+					new_time_sns.append(part2)
+					new_time_sns.append(part3)
+					new_time_sns.append(part4)
+					new_time_sns.append(part5)
+					new_time_sns.append(part6)
+					new_time_sns.append(part7)
+					new_time_sns.append(part8)
+					new_time_sns.append(part9)
+					outerlist.append(new_time_sns)
+					with open(self.fulldirall, 'r', encoding='utf8') as csv_file:
+						csv_reader = csv.reader(csv_file)
+						lines = list(csv_reader)
+						lines = lines + outerlist
+					with open(self.fulldirall, 'w', encoding='utf8') as csv_file:
+						csv_writer = csv.writer(csv_file)
+						csv_writer.writerows(lines)
+				with open(fulldir5, 'w', encoding='utf-8') as f0:
+					f0.write('')
 
-			self.move_window(target_x, self.pos().y())
+		tabnum = self.tab_bar.currentIndex()
+		self.openwidth = self.tableWidget.width()
+		leng_small = self.tableWidget_record.width()
+		if tabnum == 0:
+			self.tableWidget.setColumnWidth(0, int(self.openwidth / 8 * 3))
+			self.tableWidget.setColumnWidth(1, int(self.openwidth / 16 * 3))
+			self.tableWidget.setColumnWidth(2, int(self.openwidth / 48 * 7))
+			self.tableWidget.setColumnWidth(3, int(self.openwidth / 48 * 7))
+			self.tableWidget.setColumnWidth(4, int(self.openwidth / 48 * 7))
+			self.tableWidget.setColumnWidth(5, 0)
+			self.tableWidget.setColumnWidth(6, 0)
+			self.tableWidget.setColumnWidth(7, 0)
+			self.tableWidget.setColumnWidth(8, 0)
+			self.tableWidget_record.setColumnWidth(0, int(leng_small / 2))
+			self.tableWidget_record.setColumnWidth(1, int(leng_small / 2))
+			self.le4.setText('-')
+			self.le4.clear()
+			self.textii1.setText(contm)
+			self.textii1.ensureCursorVisible()  # 游标可用
+			cursor = self.textii1.textCursor()  # 设置游标
+			pos = len(self.textii1.toPlainText())  # 获取文本尾部的位置
+			cursor.setPosition(pos)  # 游标位置设置为尾部
+			self.textii1.setTextCursor(cursor)  # 滚动到游标位置
+		if tabnum == 1:
+			self.tableWidget_freq.setColumnWidth(0, int(self.openwidth / 16 * 9))
+			self.tableWidget_freq.setColumnWidth(1, 0)
+			self.tableWidget_freq.setColumnWidth(2, 0)
+			self.tableWidget_freq.setColumnWidth(3, 0)
+			self.tableWidget_freq.setColumnWidth(4, int(self.openwidth / 48 * 7))
+			self.tableWidget_freq.setColumnWidth(5, int(self.openwidth / 48 * 7))
+			self.tableWidget_freq.setColumnWidth(6, int(self.openwidth / 48 * 7))
+			self.tableWidget_freq.setColumnWidth(7, 0)
+			self.tableWidget_freq.setColumnWidth(8, 0)
+			self.tableWidget_record2.setColumnWidth(0, int(leng_small / 2))
+			self.tableWidget_record2.setColumnWidth(1, int(leng_small / 2))
+			self.lf2.setText('-')
+			self.lf2.clear()
+			self.textii2.setText(contm)
+			self.textii2.ensureCursorVisible()  # 游标可用
+			cursor = self.textii2.textCursor()  # 设置游标
+			pos = len(self.textii2.toPlainText())  # 获取文本尾部的位置
+			cursor.setPosition(pos)  # 游标位置设置为尾部
+			self.textii2.setTextCursor(cursor)  # 滚动到游标位置
+		if tabnum == 2:
+			self.tableWidget_memo.setColumnWidth(0, int(self.openwidth / 48 * 41))
+			self.tableWidget_memo.setColumnWidth(1, 0)
+			self.tableWidget_memo.setColumnWidth(2, 0)
+			self.tableWidget_memo.setColumnWidth(3, 0)
+			self.tableWidget_memo.setColumnWidth(4, int(self.openwidth / 48 * 7))
+			self.tableWidget_memo.setColumnWidth(5, 0)
+			self.tableWidget_memo.setColumnWidth(6, 0)
+			self.tableWidget_memo.setColumnWidth(7, 0)
+			self.tableWidget_memo.setColumnWidth(8, 0)
+			self.lm1.setText('-')
+			self.lm1.clear()
+			#self.tableWidget_record3.setColumnWidth(0, int(leng_small / 2))
+			#self.tableWidget_record3.setColumnWidth(1, int(leng_small / 2))
+			self.textii3.setText(contm)
+			self.textii3.ensureCursorVisible()  # 游标可用
+			cursor = self.textii3.textCursor()  # 设置游标
+			pos = len(self.textii3.toPlainText())  # 获取文本尾部的位置
+			cursor.setPosition(pos)  # 游标位置设置为尾部
+			self.textii3.setTextCursor(cursor)  # 滚动到游标位置
+
+		self.move_window(target_x, target_y)
 
 	def pin_a_tab2(self):
 		SCREEN_WEIGHT = int(self.screen().availableGeometry().width())
 		WINDOW_WEIGHT = int(self.width())
 		DE_HEIGHT = int(self.screen().availableGeometry().height())
-		if self.pos().x() + WINDOW_WEIGHT + 4 < SCREEN_WEIGHT and self.pos().x() > 4:
+		target_x = 0
+		target_y = self.pos().y()
+		if self.i % 2 == 1:
+			win_old_width = codecs.open(BasePath + 'win_width.txt', 'r', encoding='utf-8').read()
+			btna4.setChecked(True)
 			self.btn_00.setStyleSheet('''
-									border: 1px outset grey;
-									background-color: #FFFFFF;
-									border-radius: 4px;
-									padding: 1px;
-									color: #000000''')
-		else:
+						border: 1px outset grey;
+						background-color: #0085FF;
+						border-radius: 4px;
+						padding: 1px;
+						color: #FFFFFF''')
+			self.tab_bar.setVisible(True)
+			self.setMinimumSize(0, 0)
+			self.setMaximumSize(16777215, 16777215)
+			self.resize(int(win_old_width), DE_HEIGHT)
+			self.move(0 - int(win_old_width) + 10, 0)
+			target_x = 3
+			target_y = 0
+		if self.i % 2 == 0:
+			btna4.setChecked(False)
+			self.btn_00.setStyleSheet('''
+						border: 1px outset grey;
+						background-color: #FFFFFF;
+						border-radius: 4px;
+						padding: 1px;
+						color: #000000''')
+			self.tab_bar.setVisible(False)
+			with open(BasePath + 'win_width.txt', 'w', encoding='utf-8') as f0:
+				f0.write(str(self.width()))
+			self.resize(self.new_width, 120)
+			self.move(self.width() + 3, int((DE_HEIGHT - 70) / 2))
 			target_x = 0
-			if self.i % 2 == 1:
-				win_old_width = codecs.open(BasePath + 'win_width.txt', 'r', encoding='utf-8').read()
-				btna4.setChecked(True)
-				self.btn_00.setStyleSheet('''
-							border: 1px outset grey;
-							background-color: #0085FF;
-							border-radius: 4px;
-							padding: 1px;
-							color: #FFFFFF''')
-				self.tab_bar.setVisible(True)
-				self.resize(int(win_old_width), DE_HEIGHT)
-				self.move(0 - int(win_old_width) + 10, self.pos().y())
-				target_x = 3
-				self.setFixedWidth(int(win_old_width))
-			if self.i % 2 == 0:
-				btna4.setChecked(False)
-				self.btn_00.setStyleSheet('''
-							border: 1px outset grey;
-							background-color: #FFFFFF;
-							border-radius: 4px;
-							padding: 1px;
-							color: #000000''')
-				self.tab_bar.setVisible(False)
-				with open(BasePath + 'win_width.txt', 'w', encoding='utf-8') as f0:
-					f0.write(str(self.width()))
-				self.resize(self.new_width, DE_HEIGHT)
-				self.move(self.width() + 3, self.pos().y())
-				target_x = 0
-				self.setFixedWidth(self.new_width)
+			target_y = int((DE_HEIGHT - 70) / 2)
 
-			ISOTIMEFORMAT = '%Y-%m-%d diary'
-			theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
-			diary_name = str(theTime) + ".md"
-			diary_file = os.path.join(self.fulldir_dia, diary_name)
-			if not os.path.exists(diary_file):
-				with open(diary_file, 'a', encoding='utf-8') as f0:
-					f0.write(f'# {theTime}')
-			contm = codecs.open(diary_file, 'r', encoding='utf-8').read()
+		ISOTIMEFORMAT = '%Y-%m-%d diary'
+		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
+		diary_name = str(theTime) + ".md"
+		diary_file = os.path.join(self.fulldir_dia, diary_name)
+		if not os.path.exists(diary_file):
+			with open(diary_file, 'a', encoding='utf-8') as f0:
+				f0.write(f'# {theTime}')
+		contm = codecs.open(diary_file, 'r', encoding='utf-8').read()
 
-			tabnum = self.tab_bar.currentIndex()
-			self.openwidth = self.tableWidget.width()
-			leng_small = self.tableWidget_record.width()
-			if tabnum == 0:
-				self.tableWidget.setColumnWidth(0, int(self.openwidth / 8 * 3))
-				self.tableWidget.setColumnWidth(1, int(self.openwidth / 16 * 3))
-				self.tableWidget.setColumnWidth(2, int(self.openwidth / 48 * 7))
-				self.tableWidget.setColumnWidth(3, int(self.openwidth / 48 * 7))
-				self.tableWidget.setColumnWidth(4, int(self.openwidth / 48 * 7))
-				self.tableWidget.setColumnWidth(5, 0)
-				self.tableWidget.setColumnWidth(6, 0)
-				self.tableWidget.setColumnWidth(7, 0)
-				self.tableWidget.setColumnWidth(8, 0)
-				self.tableWidget_record.setColumnWidth(0, int(leng_small / 2))
-				self.tableWidget_record.setColumnWidth(1, int(leng_small / 2))
-				self.le4.setText('-')
-				self.le4.clear()
-				self.textii1.setText(contm)
-				self.textii1.ensureCursorVisible()  # 游标可用
-				cursor = self.textii1.textCursor()  # 设置游标
-				pos = len(self.textii1.toPlainText())  # 获取文本尾部的位置
-				cursor.setPosition(pos)  # 游标位置设置为尾部
-				self.textii1.setTextCursor(cursor)  # 滚动到游标位置
-			if tabnum == 1:
-				self.tableWidget_freq.setColumnWidth(0, int(self.openwidth / 16 * 9))
-				self.tableWidget_freq.setColumnWidth(1, 0)
-				self.tableWidget_freq.setColumnWidth(2, 0)
-				self.tableWidget_freq.setColumnWidth(3, 0)
-				self.tableWidget_freq.setColumnWidth(4, int(self.openwidth / 48 * 7))
-				self.tableWidget_freq.setColumnWidth(5, int(self.openwidth / 48 * 7))
-				self.tableWidget_freq.setColumnWidth(6, int(self.openwidth / 48 * 7))
-				self.tableWidget_freq.setColumnWidth(7, 0)
-				self.tableWidget_freq.setColumnWidth(8, 0)
-				self.tableWidget_record2.setColumnWidth(0, int(leng_small / 2))
-				self.tableWidget_record2.setColumnWidth(1, int(leng_small / 2))
-				self.lf2.setText('-')
-				self.lf2.clear()
-				self.textii2.setText(contm)
-				self.textii2.ensureCursorVisible()  # 游标可用
-				cursor = self.textii2.textCursor()  # 设置游标
-				pos = len(self.textii2.toPlainText())  # 获取文本尾部的位置
-				cursor.setPosition(pos)  # 游标位置设置为尾部
-				self.textii2.setTextCursor(cursor)  # 滚动到游标位置
-			if tabnum == 2:
-				self.tableWidget_memo.setColumnWidth(0, int(self.openwidth / 48 * 41))
-				self.tableWidget_memo.setColumnWidth(1, 0)
-				self.tableWidget_memo.setColumnWidth(2, 0)
-				self.tableWidget_memo.setColumnWidth(3, 0)
-				self.tableWidget_memo.setColumnWidth(4, int(self.openwidth / 48 * 7))
-				self.tableWidget_memo.setColumnWidth(5, 0)
-				self.tableWidget_memo.setColumnWidth(6, 0)
-				self.tableWidget_memo.setColumnWidth(7, 0)
-				self.tableWidget_memo.setColumnWidth(8, 0)
-				self.lm1.setText('-')
-				self.lm1.clear()
-				#self.tableWidget_record3.setColumnWidth(0, int(leng_small / 2))
-				#self.tableWidget_record3.setColumnWidth(1, int(leng_small / 2))
-				self.textii3.setText(contm)
-				self.textii3.ensureCursorVisible()  # 游标可用
-				cursor = self.textii3.textCursor()  # 设置游标
-				pos = len(self.textii3.toPlainText())  # 获取文本尾部的位置
-				cursor.setPosition(pos)  # 游标位置设置为尾部
-				self.textii3.setTextCursor(cursor)  # 滚动到游标位置
+		# update desktop widget
+		home_dir = str(Path.home())
+		tarname1 = "Library"
+		fulldir1 = os.path.join(home_dir, tarname1)
+		tarname2 = "Application Support"
+		fulldir2 = os.path.join(fulldir1, tarname2)
+		tarname3 = "Übersicht"
+		fulldir3 = os.path.join(fulldir2, tarname3)
+		tarname4 = "widgets"
+		fulldir4 = os.path.join(fulldir3, tarname4)
+		tarname5 = ".totomato.txt"
+		fulldir5 = os.path.join(fulldir4, tarname5)
+		if os.path.isfile(fulldir5):
+			totomato = codecs.open(fulldir5, 'r', encoding='utf-8').read()
+			if totomato != '':
+				tomato_list = totomato.split('\n')
+				while '' in tomato_list:
+					tomato_list.remove('')
+				for i in range(len(tomato_list)):
+					new_time_sns = []
+					outerlist = []
+					part1 = tomato_list[i].replace('\n', '')
+					ISOTIMEFORMAT = '%Y-%m-%d %H:%M'
+					theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
+					part2 = str(theTime)
+					part3 = '-'
+					part4 = '-'
+					part5 = 'UNDONE'
+					part6 = '-'
+					part7 = '-'
+					part8 = 'MEMO_SNS'
+					part9 = str(self.to_stamp(part2))
+					new_time_sns.append(part1)
+					new_time_sns.append(part2)
+					new_time_sns.append(part3)
+					new_time_sns.append(part4)
+					new_time_sns.append(part5)
+					new_time_sns.append(part6)
+					new_time_sns.append(part7)
+					new_time_sns.append(part8)
+					new_time_sns.append(part9)
+					outerlist.append(new_time_sns)
+					with open(self.fulldirall, 'r', encoding='utf8') as csv_file:
+						csv_reader = csv.reader(csv_file)
+						lines = list(csv_reader)
+						lines = lines + outerlist
+					with open(self.fulldirall, 'w', encoding='utf8') as csv_file:
+						csv_writer = csv.writer(csv_file)
+						csv_writer.writerows(lines)
+				with open(fulldir5, 'w', encoding='utf-8') as f0:
+					f0.write('')
 
-			self.move_window(target_x, self.pos().y())
+		tabnum = self.tab_bar.currentIndex()
+		self.openwidth = self.tableWidget.width()
+		leng_small = self.tableWidget_record.width()
+		if tabnum == 0:
+			self.tableWidget.setColumnWidth(0, int(self.openwidth / 8 * 3))
+			self.tableWidget.setColumnWidth(1, int(self.openwidth / 16 * 3))
+			self.tableWidget.setColumnWidth(2, int(self.openwidth / 48 * 7))
+			self.tableWidget.setColumnWidth(3, int(self.openwidth / 48 * 7))
+			self.tableWidget.setColumnWidth(4, int(self.openwidth / 48 * 7))
+			self.tableWidget.setColumnWidth(5, 0)
+			self.tableWidget.setColumnWidth(6, 0)
+			self.tableWidget.setColumnWidth(7, 0)
+			self.tableWidget.setColumnWidth(8, 0)
+			self.tableWidget_record.setColumnWidth(0, int(leng_small / 2))
+			self.tableWidget_record.setColumnWidth(1, int(leng_small / 2))
+			self.le4.setText('-')
+			self.le4.clear()
+			self.textii1.setText(contm)
+			self.textii1.ensureCursorVisible()  # 游标可用
+			cursor = self.textii1.textCursor()  # 设置游标
+			pos = len(self.textii1.toPlainText())  # 获取文本尾部的位置
+			cursor.setPosition(pos)  # 游标位置设置为尾部
+			self.textii1.setTextCursor(cursor)  # 滚动到游标位置
+		if tabnum == 1:
+			self.tableWidget_freq.setColumnWidth(0, int(self.openwidth / 16 * 9))
+			self.tableWidget_freq.setColumnWidth(1, 0)
+			self.tableWidget_freq.setColumnWidth(2, 0)
+			self.tableWidget_freq.setColumnWidth(3, 0)
+			self.tableWidget_freq.setColumnWidth(4, int(self.openwidth / 48 * 7))
+			self.tableWidget_freq.setColumnWidth(5, int(self.openwidth / 48 * 7))
+			self.tableWidget_freq.setColumnWidth(6, int(self.openwidth / 48 * 7))
+			self.tableWidget_freq.setColumnWidth(7, 0)
+			self.tableWidget_freq.setColumnWidth(8, 0)
+			self.tableWidget_record2.setColumnWidth(0, int(leng_small / 2))
+			self.tableWidget_record2.setColumnWidth(1, int(leng_small / 2))
+			self.lf2.setText('-')
+			self.lf2.clear()
+			self.textii2.setText(contm)
+			self.textii2.ensureCursorVisible()  # 游标可用
+			cursor = self.textii2.textCursor()  # 设置游标
+			pos = len(self.textii2.toPlainText())  # 获取文本尾部的位置
+			cursor.setPosition(pos)  # 游标位置设置为尾部
+			self.textii2.setTextCursor(cursor)  # 滚动到游标位置
+		if tabnum == 2:
+			self.tableWidget_memo.setColumnWidth(0, int(self.openwidth / 48 * 41))
+			self.tableWidget_memo.setColumnWidth(1, 0)
+			self.tableWidget_memo.setColumnWidth(2, 0)
+			self.tableWidget_memo.setColumnWidth(3, 0)
+			self.tableWidget_memo.setColumnWidth(4, int(self.openwidth / 48 * 7))
+			self.tableWidget_memo.setColumnWidth(5, 0)
+			self.tableWidget_memo.setColumnWidth(6, 0)
+			self.tableWidget_memo.setColumnWidth(7, 0)
+			self.tableWidget_memo.setColumnWidth(8, 0)
+			self.lm1.setText('-')
+			self.lm1.clear()
+			#self.tableWidget_record3.setColumnWidth(0, int(leng_small / 2))
+			#self.tableWidget_record3.setColumnWidth(1, int(leng_small / 2))
+			self.textii3.setText(contm)
+			self.textii3.ensureCursorVisible()  # 游标可用
+			cursor = self.textii3.textCursor()  # 设置游标
+			pos = len(self.textii3.toPlainText())  # 获取文本尾部的位置
+			cursor.setPosition(pos)  # 游标位置设置为尾部
+			self.textii3.setTextCursor(cursor)  # 滚动到游标位置
+
+		self.move_window(target_x, target_y)
 
 	def auto_record(self):
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
