@@ -66,7 +66,6 @@ menu.addSeparator()
 
 # Add a Quit option to the menu.
 quit = QAction("Quit")
-quit.triggered.connect(app.quit)
 menu.addAction(quit)
 
 # Add the menu to the tray
@@ -123,7 +122,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.1.0', self)
+		lbl1 = QLabel('Version 1.1.1', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -229,7 +228,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg9.setLayout(blay9)
 
 		widg10 = QWidget()
-		lbl6 = QLabel('© 2023 Ryan-the-hito. All rights reserved.', self)
+		lbl6 = QLabel('© 2023-2024 Ryan-the-hito. All rights reserved.', self)
 		blay10 = QHBoxLayout()
 		blay10.setContentsMargins(0, 0, 0, 0)
 		blay10.addStretch()
@@ -586,7 +585,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.1.0', self)
+		self.lbl = QLabel('Current Version: v1.1.1', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -3844,8 +3843,8 @@ end tell""" % (ite1_inp, otherStyleTime, otherStyleTime, len3_inp)
 			self.tab_bar.setVisible(False)
 			with open(BasePath + 'win_width.txt', 'w', encoding='utf-8') as f0:
 				f0.write(str(self.width()))
-			self.setFixedSize(self.new_width, 120)
 			self.move(self.width() + 3, int((DE_HEIGHT - 70) / 2))
+			self.setFixedSize(self.new_width, 120)
 			target_x = 0
 			target_y = int((DE_HEIGHT - 70) / 2)
 
@@ -4173,6 +4172,31 @@ end tell""" % (ite1_inp, otherStyleTime, otherStyleTime, len3_inp)
 			except Exception as e:
 				pass
 
+	def totalquit(self):
+		ISOTIMEFORMAT = '%Y-%m-%d diary'
+		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
+		diary_name = str(theTime) + ".md"
+		diary_file = os.path.join(self.fulldir_dia, diary_name)
+		if not os.path.exists(diary_file):
+			with open(diary_file, 'a', encoding='utf-8') as f0:
+				f0.write(f'# {theTime}')
+
+		ISOTIMEFORMAT = '%H:%M:%S '
+		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
+		pretext = '- ' + theTime
+		with open(diary_file, 'a', encoding='utf-8') as f0:
+			f0.write(pretext)
+		cmd2 = """
+					tell application "/Applications/Tomato.app/Contents/Auto/TomatoAuto.app"
+						quit
+					end tell"""
+		try:
+			subprocess.call(['osascript', '-e', cmd2])
+		except Exception as e:
+			pass
+
+		app.quit()
+
 	def center(self):  # 设置窗口居中
 		qr = self.frameGeometry()
 		cp = self.screen().availableGeometry().center()
@@ -4271,5 +4295,6 @@ action3.triggered.connect(w3.pin_a_tab)
 action4.triggered.connect(w3.auto_record)
 # tray.activated.connect(w3.activate)
 btna4.triggered.connect(w3.pin_a_tab2)
+quit.triggered.connect(w3.totalquit)
 app.setStyleSheet(style_sheet_ori)
 app.exec()
