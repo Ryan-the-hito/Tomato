@@ -3,13 +3,13 @@
 
 block_cipher = None
 
-__version__ = '1.1.2'
+__version__ = '1.1.3'
 
 a = Analysis(
     ['Tomato.py'],
     pathex=['/Users/ryanshenefield/Downloads/Tomato.py'],
     binaries=[],
-    datas=[('tmt.icns', '.'), ('tmt_dsk.icns', '.'), ('tmt.png', '.'), ('wechat50.png', '.'), ('wechat20.png', '.'), ('wechat10.png', '.'), ('wechat5.png', '.'), ('alipay50.png', '.'), ('alipay20.png', '.'), ('alipay10.png', '.'), ('alipay5.png', '.'), ('All.csv', '.'), ('Record.csv', '.'), ('win_width.txt', '.')],
+    datas=[('tmt.icns', '.'), ('tmt_dsk.icns', '.'), ('tmt.png', '.'), ('wechat50.png', '.'), ('wechat20.png', '.'), ('wechat10.png', '.'), ('wechat5.png', '.'), ('alipay50.png', '.'), ('alipay20.png', '.'), ('alipay10.png', '.'), ('alipay5.png', '.'), ('All.csv', '.'), ('Record.csv', '.')],
     hiddenimports=['subprocess'],
     hookspath=[],
     hooksconfig={},

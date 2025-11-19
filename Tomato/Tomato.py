@@ -11,8 +11,8 @@ from PyQt6.QtWidgets import (QWidget, QPushButton, QApplication,
 							 QPlainTextEdit, QTabWidget, QTextEdit, QGraphicsOpacityEffect,
 							 QTableWidget, QTableWidgetItem, QAbstractItemView, QInputDialog,
 							 QMessageBox, QSplitter, QDialogButtonBox, QListWidget, QListWidgetItem)
-from PyQt6.QtCore import Qt, QRect, QPropertyAnimation, QDate, QTime, QTimer, QObject
-from PyQt6.QtGui import QAction, QIcon, QColor
+from PyQt6.QtCore import Qt, QRect, QPropertyAnimation, QDate, QTime, QTimer, QObject, QEvent
+from PyQt6.QtGui import QAction, QIcon, QColor, QCursor, QGuiApplication
 import PyQt6.QtGui
 import sys
 import webbrowser
@@ -338,19 +338,45 @@ class TimeSensitiveTrayController(QObject):
 		self._update_section_visibility()
 
 	def _update_selected_task_actions(self):
+		now = datetime.datetime.now()
 		for task_id in list(self.main_actions.keys()):
-			self._update_single_action(task_id)
+			self._update_single_action(task_id, now)
+		self._reorder_main_actions(now)
 
-	def _update_single_action(self, task_id):
+	def _update_single_action(self, task_id, now=None):
 		task = self.selected_tasks.get(task_id)
 		action = self.main_actions.get(task_id)
 		if not task or not action:
 			return
-		now = datetime.datetime.now()
+		now = now or datetime.datetime.now()
 		delta_seconds = (task.due - now).total_seconds()
 		countdown_text = self._format_countdown(delta_seconds)
 		prefix = "Still: " if delta_seconds >= 0 else "Overdue: "
 		action.setText(f"{task.name} · {task.due_label} · {prefix}{countdown_text}")
+
+	def _reorder_main_actions(self, now=None):
+		if not self.main_actions:
+			return
+		now = now or datetime.datetime.now()
+		ordered_ids = []
+		for task_id, task in self.selected_tasks.items():
+			action = self.main_actions.get(task_id)
+			if not action or not task:
+				continue
+			delta = abs((task.due - now).total_seconds())
+			ordered_ids.append((delta, task.due, task_id))
+		if not ordered_ids:
+			return
+		ordered_ids.sort(key=lambda item: (item[0], item[1]))
+		actions = []
+		for _, _, task_id in ordered_ids:
+			action = self.main_actions.get(task_id)
+			if not action:
+				continue
+			self.menu.removeAction(action)
+			actions.append((task_id, action))
+		for task_id, action in actions:
+			self.menu.insertAction(self.section_separator, action)
 
 	def _format_countdown(self, seconds):
 		total = int(abs(seconds))
@@ -544,7 +570,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.1.2', self)
+		lbl1 = QLabel('Version 1.1.3', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1007,7 +1033,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.1.2', self)
+		self.lbl = QLabel('Current Version: v1.1.3', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -1203,6 +1229,9 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 	def __init__(self):
 		super().__init__()
 		self.dragPosition = self.pos()
+		self._diary_text_edits = []
+		self._diary_viewport_owner = {}
+		self._suppress_diary_write = False
 		self.initUI()
 
 	def initUI(self):  # 设置窗口内布局
@@ -1244,8 +1273,6 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 		self.show()
 		self.tab_bar.setVisible(False)
-		with open(BasePath + 'win_width.txt', 'w', encoding='utf-8') as f0:
-			f0.write(str(self.width()))
 		self.new_width = 10
 		self.setFixedSize(self.new_width, 120)
 		app.setStyleSheet(style_sheet_ori)
@@ -1322,13 +1349,58 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		animation.start()
 
 	def _current_screen_geometry(self):
+		screen = QGuiApplication.screenAt(QCursor.pos())
+		if screen:
+			return screen.availableGeometry()
 		window_handle = self.windowHandle()
 		if window_handle and window_handle.screen():
 			return window_handle.screen().availableGeometry()
 		if self.screen():
 			return self.screen().availableGeometry()
-		primary = QApplication.primaryScreen()
+		primary = QGuiApplication.primaryScreen()
 		return primary.availableGeometry() if primary else QRect(0, 0, 1440, 900)
+
+	def _register_diary_refresh(self, widget):
+		widget.installEventFilter(self)
+		self._diary_text_edits.append(widget)
+		viewport = getattr(widget, "viewport", None)
+		if callable(viewport):
+			vp = widget.viewport()
+			if vp:
+				vp.installEventFilter(self)
+				self._diary_viewport_owner[vp] = widget
+
+	def _load_today_diary_content(self):
+		ISOTIMEFORMAT = '%Y-%m-%d diary'
+		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
+		diary_file = os.path.join(self.fulldir_dia, f"{theTime}.md")
+		if not os.path.exists(diary_file):
+			with open(diary_file, 'a', encoding='utf-8') as f0:
+				f0.write(f'# {theTime}')
+		with open(diary_file, 'r', encoding='utf-8') as fh:
+			return fh.read()
+
+	def _refresh_diary_text_widget(self, widget):
+		try:
+			self._suppress_diary_write = True
+			contm = self._load_today_diary_content()
+		except Exception:
+			self._suppress_diary_write = False
+			return
+		widget.setText(contm)
+		widget.ensureCursorVisible()
+		cursor = widget.textCursor()
+		cursor.setPosition(len(widget.toPlainText()))
+		widget.setTextCursor(cursor)
+		self._suppress_diary_write = False
+
+	def eventFilter(self, obj, event):
+		target = obj
+		if obj in self._diary_viewport_owner:
+			target = self._diary_viewport_owner.get(obj)
+		if target in self._diary_text_edits and event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.FocusIn):
+			self._refresh_diary_text_widget(target)
+		return super().eventFilter(obj, event)
 
 	def assigntoall(self):
 		cmd = """osascript -e '''on run
@@ -1417,78 +1489,89 @@ end tell
 				pass
 
 	def clickbarss(self, index):
-		self.openwidth = self.tableWidget.width()
-		leng_small = self.tableWidget_record.width()
+		self._suppress_diary_write = True
+		try:
+			self.openwidth = self.tableWidget.width()
+			leng_small = self.tableWidget_record.width()
 
-		ISOTIMEFORMAT = '%Y-%m-%d diary'
-		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
-		diary_name = str(theTime) + ".md"
-		diary_file = os.path.join(self.fulldir_dia, diary_name)
-		if not os.path.exists(diary_file):
-			with open(diary_file, 'a', encoding='utf-8') as f0:
-				f0.write(f'# {theTime}')
-		contm = codecs.open(diary_file, 'r', encoding='utf-8').read()
+			ISOTIMEFORMAT = '%Y-%m-%d diary'
+			theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
+			diary_name = str(theTime) + ".md"
+			diary_file = os.path.join(self.fulldir_dia, diary_name)
+			if not os.path.exists(diary_file):
+				with open(diary_file, 'a', encoding='utf-8') as f0:
+					f0.write(f'# {theTime}')
+			contm = codecs.open(diary_file, 'r', encoding='utf-8').read()
 
-		if index == 0:
-			self.tableWidget.setColumnWidth(0, int(self.openwidth / 8 * 3))
-			self.tableWidget.setColumnWidth(1, int(self.openwidth / 16 * 3))
-			self.tableWidget.setColumnWidth(2, int(self.openwidth / 48 * 7))
-			self.tableWidget.setColumnWidth(3, int(self.openwidth / 48 * 7))
-			self.tableWidget.setColumnWidth(4, int(self.openwidth / 48 * 7))
-			self.tableWidget.setColumnWidth(5, 0)
-			self.tableWidget.setColumnWidth(6, 0)
-			self.tableWidget.setColumnWidth(7, 0)
-			self.tableWidget.setColumnWidth(8, 0)
-			self.tableWidget_record.setColumnWidth(0, int(leng_small / 2))
-			self.tableWidget_record.setColumnWidth(1, int(leng_small / 2))
-			self.le4.setText('-')
-			self.le4.clear()
-			self.textii1.setText(contm)
-			self.textii1.ensureCursorVisible()  # 游标可用
-			cursor = self.textii1.textCursor()  # 设置游标
-			pos = len(self.textii1.toPlainText())  # 获取文本尾部的位置
-			cursor.setPosition(pos)  # 游标位置设置为尾部
-			self.textii1.setTextCursor(cursor)  # 滚动到游标位置
-		if index == 1:
-			self.tableWidget_freq.setColumnWidth(0, int(self.openwidth / 16 * 9))
-			self.tableWidget_freq.setColumnWidth(1, 0)
-			self.tableWidget_freq.setColumnWidth(2, 0)
-			self.tableWidget_freq.setColumnWidth(3, 0)
-			self.tableWidget_freq.setColumnWidth(4, int(self.openwidth / 48 * 7))
-			self.tableWidget_freq.setColumnWidth(5, int(self.openwidth / 48 * 7))
-			self.tableWidget_freq.setColumnWidth(6, int(self.openwidth / 48 * 7))
-			self.tableWidget_freq.setColumnWidth(7, 0)
-			self.tableWidget_freq.setColumnWidth(8, 0)
-			self.tableWidget_record2.setColumnWidth(0, int(leng_small / 2))
-			self.tableWidget_record2.setColumnWidth(1, int(leng_small / 2))
-			self.lf2.setText('-')
-			self.lf2.clear()
-			self.textii2.setText(contm)
-			self.textii2.ensureCursorVisible()  # 游标可用
-			cursor = self.textii2.textCursor()  # 设置游标
-			pos = len(self.textii2.toPlainText())  # 获取文本尾部的位置
-			cursor.setPosition(pos)  # 游标位置设置为尾部
-			self.textii2.setTextCursor(cursor)  # 滚动到游标位置
-		if index == 2:
-			self.tableWidget_memo.setColumnWidth(0, int(self.openwidth / 48 * 41))
-			self.tableWidget_memo.setColumnWidth(1, 0)
-			self.tableWidget_memo.setColumnWidth(2, 0)
-			self.tableWidget_memo.setColumnWidth(3, 0)
-			self.tableWidget_memo.setColumnWidth(4, int(self.openwidth / 48 * 7))
-			self.tableWidget_memo.setColumnWidth(5, 0)
-			self.tableWidget_memo.setColumnWidth(6, 0)
-			self.tableWidget_memo.setColumnWidth(7, 0)
-			self.tableWidget_memo.setColumnWidth(8, 0)
-			self.lm1.setText('-')
-			self.lm1.clear()
-			#self.tableWidget_record3.setColumnWidth(0, int(leng_small / 2))
-			#self.tableWidget_record3.setColumnWidth(1, int(leng_small / 2))
-			self.textii3.setText(contm)
-			self.textii3.ensureCursorVisible()  # 游标可用
-			cursor = self.textii3.textCursor()  # 设置游标
-			pos = len(self.textii3.toPlainText())  # 获取文本尾部的位置
-			cursor.setPosition(pos)  # 游标位置设置为尾部
-			self.textii3.setTextCursor(cursor)  # 滚动到游标位置
+			if index == 0:
+				self.tableWidget.setColumnWidth(0, int(self.openwidth / 8 * 3))
+				self.tableWidget.setColumnWidth(1, int(self.openwidth / 16 * 3))
+				self.tableWidget.setColumnWidth(2, int(self.openwidth / 48 * 7))
+				self.tableWidget.setColumnWidth(3, int(self.openwidth / 48 * 7))
+				self.tableWidget.setColumnWidth(4, int(self.openwidth / 48 * 7))
+				self.tableWidget.setColumnWidth(5, 0)
+				self.tableWidget.setColumnWidth(6, 0)
+				self.tableWidget.setColumnWidth(7, 0)
+				self.tableWidget.setColumnWidth(8, 0)
+				self.tableWidget_record.setColumnWidth(0, int(leng_small / 2))
+				self.tableWidget_record.setColumnWidth(1, int(leng_small / 2))
+				self.le4.setText('-')
+				self.le4.clear()
+				self.textii1.setText(contm)
+				self.textii1.ensureCursorVisible()  # 游标可用
+				cursor = self.textii1.textCursor()  # 设置游标
+				pos = len(self.textii1.toPlainText())  # 获取文本尾部的位置
+				cursor.setPosition(pos)  # 游标位置设置为尾部
+				self.textii1.setTextCursor(cursor)  # 滚动到游标位置
+			if index == 1:
+				self.tableWidget_freq.setColumnWidth(0, int(self.openwidth / 16 * 9))
+				self.tableWidget_freq.setColumnWidth(1, 0)
+				self.tableWidget_freq.setColumnWidth(2, 0)
+				self.tableWidget_freq.setColumnWidth(3, 0)
+				self.tableWidget_freq.setColumnWidth(4, int(self.openwidth / 48 * 7))
+				self.tableWidget_freq.setColumnWidth(5, int(self.openwidth / 48 * 7))
+				self.tableWidget_freq.setColumnWidth(6, int(self.openwidth / 48 * 7))
+				self.tableWidget_freq.setColumnWidth(7, 0)
+				self.tableWidget_freq.setColumnWidth(8, 0)
+				self.tableWidget_record2.setColumnWidth(0, int(leng_small / 2))
+				self.tableWidget_record2.setColumnWidth(1, int(leng_small / 2))
+				self.lf2.setText('-')
+				self.lf2.clear()
+				self.textii2.setText(contm)
+				self.textii2.ensureCursorVisible()  # 游标可用
+				cursor = self.textii2.textCursor()  # 设置游标
+				pos = len(self.textii2.toPlainText())  # 获取文本尾部的位置
+				cursor.setPosition(pos)  # 游标位置设置为尾部
+				self.textii2.setTextCursor(cursor)  # 滚动到游标位置
+			if index == 2:
+				self.tableWidget_memo.setColumnWidth(0, int(self.openwidth / 48 * 41))
+				self.tableWidget_memo.setColumnWidth(1, 0)
+				self.tableWidget_memo.setColumnWidth(2, 0)
+				self.tableWidget_memo.setColumnWidth(3, 0)
+				self.tableWidget_memo.setColumnWidth(4, int(self.openwidth / 48 * 7))
+				self.tableWidget_memo.setColumnWidth(5, 0)
+				self.tableWidget_memo.setColumnWidth(6, 0)
+				self.tableWidget_memo.setColumnWidth(7, 0)
+				self.tableWidget_memo.setColumnWidth(8, 0)
+				self.lm1.setText('-')
+				self.lm1.clear()
+				#self.tableWidget_record3.setColumnWidth(0, int(leng_small / 2))
+				#self.tableWidget_record3.setColumnWidth(1, int(leng_small / 2))
+				self.textii3.setText(contm)
+				self.textii3.ensureCursorVisible()  # 游标可用
+				cursor = self.textii3.textCursor()  # 设置游标
+				pos = len(self.textii3.toPlainText())  # 获取文本尾部的位置
+				cursor.setPosition(pos)  # 游标位置设置为尾部
+				self.textii3.setTextCursor(cursor)  # 滚动到游标位置
+			if index == 3:
+				self.textiii1.setText(contm)
+				self.textiii1.ensureCursorVisible()  # 游标可用
+				cursor = self.textiii1.textCursor()  # 设置游标
+				pos = len(self.textiii1.toPlainText())  # 获取文本尾部的位置
+				cursor.setPosition(pos)  # 游标位置设置为尾部
+				self.textiii1.setTextCursor(cursor)  # 滚动到游标位置
+		finally:
+			self._suppress_diary_write = False
 
 	def wordTab(self):
 		conLayout = QVBoxLayout()
@@ -1670,11 +1753,17 @@ end tell
 		b2 = QVBoxLayout()
 		b2.setContentsMargins(0, 0, 0, 0)
 		b2.addWidget(self.widget0)
+		b2.addStretch()
 		b2.addWidget(btn_t2)
+		b2.addStretch()
 		b2.addWidget(btn_t7)
+		b2.addStretch()
 		b2.addWidget(self.frame2)
+		b2.addStretch()
 		b2.addWidget(btn_t3)
+		b2.addStretch()
 		b2.addWidget(btn_t5)
+		b2.addStretch()
 		b2.addWidget(btn_t6)
 		t2.setLayout(b2)
 
@@ -1698,6 +1787,7 @@ end tell
 		self.textii1 = QTextEdit(self)
 		self.textii1.setReadOnly(False)
 		self.textii1.textChanged.connect(self.on_text_change)
+		self._register_diary_refresh(self.textii1)
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
 		diary_name = str(theTime) + ".md"
@@ -2733,6 +2823,8 @@ end tell""" % (escaped_item, otherStyleTime, otherStyleTime, length_hours)
 			shutil.copy(fulldir2, fj)
 
 	def on_text_change(self):
+		if self._suppress_diary_write:
+			return
 		if self.textii1.toPlainText() != '':
 			ISOTIMEFORMAT = '%Y-%m-%d diary'
 			theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
@@ -3118,11 +3210,17 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		b2 = QVBoxLayout()
 		b2.setContentsMargins(0, 0, 0, 0)
 		b2.addWidget(self.widget1)
+		b2.addStretch()
 		b2.addWidget(btn_t2)
+		b2.addStretch()
 		b2.addWidget(btn_t7)
+		b2.addStretch()
 		b2.addWidget(self.freq1)
+		b2.addStretch()
 		b2.addWidget(btn_t3)
+		b2.addStretch()
 		b2.addWidget(btn_t5)
+		b2.addStretch()
 		b2.addWidget(btn_t6)
 		t2.setLayout(b2)
 
@@ -3204,6 +3302,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.textii2 = QTextEdit(self)
 		self.textii2.setReadOnly(False)
 		self.textii2.textChanged.connect(self.freq_text_change)
+		self._register_diary_refresh(self.textii2)
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
 		diary_name = str(theTime) + ".md"
@@ -3744,6 +3843,8 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.lf2.clear()
 
 	def freq_text_change(self):
+		if self._suppress_diary_write:
+			return
 		if self.textii2.toPlainText() != '':
 			ISOTIMEFORMAT = '%Y-%m-%d diary'
 			theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
@@ -4150,11 +4251,17 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		b2 = QVBoxLayout()
 		b2.setContentsMargins(0, 0, 0, 0)
 		b2.addWidget(self.widget2)
+		b2.addStretch()
 		b2.addWidget(btn_t2)
+		b2.addStretch()
 		b2.addWidget(btn_t7)
+		b2.addStretch()
 		b2.addWidget(self.memo1)
+		b2.addStretch()
 		b2.addWidget(btn_t3)
+		b2.addStretch()
 		b2.addWidget(btn_t5)
+		b2.addStretch()
 		b2.addWidget(btn_t6)
 		t2.setLayout(b2)
 
@@ -4236,6 +4343,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.textii3 = QTextEdit(self)
 		self.textii3.setReadOnly(False)
 		self.textii3.textChanged.connect(self.memo_text_change)
+		self._register_diary_refresh(self.textii3)
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
 		diary_name = str(theTime) + ".md"
@@ -4335,11 +4443,17 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		file_bar.addWidget(self.collection_file_combo, 1)
 		# file_bar.addWidget(btn_new_csv)
 		# file_bar.addWidget(btn_delete_csv)
+		file_bar.addStretch()
 		file_bar.addWidget(t4)
+		file_bar.addStretch()
 		file_bar.addWidget(btn_open_dir)
+		file_bar.addStretch()
 		file_bar.addWidget(self.frame21)
+		file_bar.addStretch()
 		file_bar.addWidget(btn_t3)
+		file_bar.addStretch()
 		file_bar.addWidget(btn_t5)
+		file_bar.addStretch()
 		file_bar.addWidget(btn_t6)
 		#file_bar.addStretch()
 		# file_bar.addWidget(btn_manage_columns)
@@ -4520,11 +4634,17 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		#mid_bar.addLayout(sort_bar)
 		#mid_bar.addWidget(self.frame22)
 		mid_bar.addLayout(row_bar)
+		mid_bar.addStretch()
 		mid_bar.addLayout(col_bar)
+		mid_bar.addStretch()
 		mid_bar.addWidget(btn_rename_col)
+		mid_bar.addStretch()
 		mid_bar.addWidget(self.frame23)
+		mid_bar.addStretch()
 		mid_bar.addLayout(collect_time_row)
+		mid_bar.addStretch()
 		mid_bar.addLayout(collect_length_row)
+		mid_bar.addStretch()
 		mid_bar.addWidget(btn_collect_copy)
 		#mid_bar.addStretch()
 		mid_widget.setLayout(mid_bar)
@@ -4533,6 +4653,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.textiii1 = QTextEdit(self)
 		self.textiii1.setReadOnly(False)
 		self.textiii1.textChanged.connect(self.on_text_change)
+		self._register_diary_refresh(self.textiii1)
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
 		diary_name = str(theTime) + ".md"
@@ -5421,6 +5542,8 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		self.lm1.clear()
 
 	def memo_text_change(self):
+		if self._suppress_diary_write:
+			return
 		if self.textii3.toPlainText() != '':
 			ISOTIMEFORMAT = '%Y-%m-%d diary'
 			theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
@@ -5600,7 +5723,7 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		target_x = 0
 		target_y = self.pos().y()
 		if self.i % 2 == 1: # show
-			win_old_width = codecs.open(BasePath + 'win_width.txt', 'r', encoding='utf-8').read()
+			target_width = int(screen_geom.width() / 2)
 			btna4.setChecked(True)
 			self.btn_00.setStyleSheet('''
 						border: 1px outset grey;
@@ -5611,8 +5734,8 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 			self.tab_bar.setVisible(True)
 			self.setMinimumSize(0, 0)
 			self.setMaximumSize(16777215, 16777215)
-			self.resize(int(win_old_width), DE_HEIGHT)
-			self.move(0 - int(win_old_width) + 10, 0)
+			self.resize(int(target_width), DE_HEIGHT)
+			self.move(0 - int(target_width) + 10, 0)
 			target_x = 3
 			target_y = 0
 		if self.i % 2 == 0: # hide
@@ -5624,8 +5747,6 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 						padding: 1px;
 						color: #000000''')
 			self.tab_bar.setVisible(False)
-			with open(BasePath + 'win_width.txt', 'w', encoding='utf-8') as f0:
-				f0.write(str(self.width()))
 			self.move(self.width() + 3, int((DE_HEIGHT - 70) / 2))
 			self.setFixedSize(self.new_width, 120)
 			target_x = 0
@@ -5755,8 +5876,16 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 			pos = len(self.textii3.toPlainText())  # 获取文本尾部的位置
 			cursor.setPosition(pos)  # 游标位置设置为尾部
 			self.textii3.setTextCursor(cursor)  # 滚动到游标位置
+		if tabnum == 3:
+			self.textiii1.setText(contm)
+			self.textiii1.ensureCursorVisible()  # 游标可用
+			cursor = self.textiii1.textCursor()  # 设置游标
+			pos = len(self.textiii1.toPlainText())  # 获取文本尾部的位置
+			cursor.setPosition(pos)  # 游标位置设置为尾部
+			self.textiii1.setTextCursor(cursor)  # 滚动到游标位置
 
 		self.move_window(target_x, target_y)
+		self._suppress_diary_write = False
 
 	def pin_a_tab2(self):
 		screen_geom = self._current_screen_geometry()
@@ -5766,7 +5895,7 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		target_x = 0
 		target_y = self.pos().y()
 		if self.i % 2 == 1:
-			win_old_width = codecs.open(BasePath + 'win_width.txt', 'r', encoding='utf-8').read()
+			target_width = int(screen_geom.width() / 2)
 			btna4.setChecked(True)
 			self.btn_00.setStyleSheet('''
 						border: 1px outset grey;
@@ -5777,8 +5906,8 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 			self.tab_bar.setVisible(True)
 			self.setMinimumSize(0, 0)
 			self.setMaximumSize(16777215, 16777215)
-			self.resize(int(win_old_width), DE_HEIGHT)
-			self.move(0 - int(win_old_width) + 10, 0)
+			self.resize(int(target_width), DE_HEIGHT)
+			self.move(0 - int(target_width) + 10, 0)
 			target_x = 3
 			target_y = 0
 		if self.i % 2 == 0:
@@ -5790,8 +5919,6 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 						padding: 1px;
 						color: #000000''')
 			self.tab_bar.setVisible(False)
-			with open(BasePath + 'win_width.txt', 'w', encoding='utf-8') as f0:
-				f0.write(str(self.width()))
 			self.resize(self.new_width, 120)
 			self.move(self.width() + 3, int((DE_HEIGHT - 70) / 2))
 			target_x = 0
@@ -5921,6 +6048,13 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 			pos = len(self.textii3.toPlainText())  # 获取文本尾部的位置
 			cursor.setPosition(pos)  # 游标位置设置为尾部
 			self.textii3.setTextCursor(cursor)  # 滚动到游标位置
+		if tabnum == 3:
+			self.textiii1.setText(contm)
+			self.textiii1.ensureCursorVisible()  # 游标可用
+			cursor = self.textiii1.textCursor()  # 设置游标
+			pos = len(self.textiii1.toPlainText())  # 获取文本尾部的位置
+			cursor.setPosition(pos)  # 游标位置设置为尾部
+			self.textiii1.setTextCursor(cursor)  # 滚动到游标位置
 
 		self.move_window(target_x, target_y)
 
