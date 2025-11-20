@@ -169,9 +169,13 @@ class ReminderSyncThread(threading.Thread):
 	def run(self):
 		while not self._stop_event.is_set():
 			try:
+				start_time = time.time()
 				snapshot = self._fetch_snapshot()
 				if snapshot is not None:
-					self.output_queue.put(snapshot)
+					self.output_queue.put({
+						'timestamp': start_time,
+						'snapshot': snapshot
+					})
 			except Exception:
 				logging.exception("Failed to fetch reminders snapshot.")
 			if self._stop_event.wait(self.interval):
@@ -570,7 +574,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.1.3', self)
+		lbl1 = QLabel('Version 1.2.0', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1033,7 +1037,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.1.3', self)
+		self.lbl = QLabel('Current Version: v1.2.0', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -1232,6 +1236,7 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		self._diary_text_edits = []
 		self._diary_viewport_owner = {}
 		self._suppress_diary_write = False
+		self._last_local_reminder_change = 0.0
 		self.initUI()
 
 	def initUI(self):  # 设置窗口内布局
@@ -2239,10 +2244,14 @@ end tell
 		self._show_sync_indicator()
 		try:
 			subprocess.call(['osascript', '-e', script])
+			self._mark_local_reminder_change()
 		except Exception:
 			pass
 		finally:
 			self._hide_sync_indicator()
+
+	def _mark_local_reminder_change(self):
+		self._last_local_reminder_change = time.time()
 
 	def _escape_applescript_string(self, value):
 		if value is None:
@@ -2342,10 +2351,28 @@ end tell
 					message = self.reminder_sync_queue.get_nowait()
 				except queue.Empty:
 					break
-				if message is not None:
-					self._handle_reminder_snapshot(message)
+				if message is None:
+					continue
+				snapshot, snapshot_timestamp = self._parse_reminder_sync_message(message)
+				if snapshot is None:
+					continue
+				last_change = getattr(self, '_last_local_reminder_change', 0.0)
+				if snapshot_timestamp is not None and snapshot_timestamp < last_change:
+					continue
+				self._handle_reminder_snapshot(snapshot)
 		finally:
 			self._reminder_sync_processing = False
+
+	def _parse_reminder_sync_message(self, message):
+		if isinstance(message, dict):
+			return message.get('snapshot'), message.get('timestamp')
+		if isinstance(message, (tuple, list)) and len(message) == 2:
+			first, second = message
+			if isinstance(first, (int, float)):
+				return second, first
+			if isinstance(second, (int, float)):
+				return first, second
+		return message, None
 
 	def _handle_reminder_snapshot(self, snapshot):
 		if not isinstance(snapshot, list):
