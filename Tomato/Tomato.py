@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (QWidget, QPushButton, QApplication,
 							 QSystemTrayIcon, QMenu, QComboBox, QDialog, QMenuBar, QFrame, QFileDialog,
 							 QPlainTextEdit, QTabWidget, QTextEdit, QGraphicsOpacityEffect,
 							 QTableWidget, QTableWidgetItem, QAbstractItemView, QInputDialog,
-							 QMessageBox, QSplitter, QDialogButtonBox, QListWidget, QListWidgetItem)
+							 QMessageBox, QSplitter, QDialogButtonBox, QListWidget, QListWidgetItem, QCheckBox)
 from PyQt6.QtCore import Qt, QRect, QPropertyAnimation, QDate, QTime, QTimer, QObject, QEvent
 from PyQt6.QtGui import QAction, QIcon, QColor, QCursor, QGuiApplication
 import PyQt6.QtGui
@@ -231,6 +231,92 @@ function run() {
 		if payload.get('status') != 'ok':
 			if payload.get('status') not in ('missing', 'error'):
 				logging.warning("Unexpected reminder snapshot status: %s", payload.get('status'))
+			return None
+		return payload.get('data', [])
+
+
+class CalendarSyncThread(threading.Thread):
+	def __init__(self, output_queue, interval_seconds=120):
+		super().__init__(daemon=True)
+		self.output_queue = output_queue
+		self.interval = max(30, int(interval_seconds))
+		self._stop_event = threading.Event()
+
+	def stop(self, timeout=2.0):
+		self._stop_event.set()
+		if self.is_alive():
+			self.join(timeout)
+
+	def run(self):
+		while not self._stop_event.is_set():
+			try:
+				start_time = time.time()
+				snapshot = self._fetch_snapshot()
+				if snapshot is not None:
+					self.output_queue.put({
+						'timestamp': start_time,
+						'snapshot': snapshot
+					})
+			except Exception:
+				logging.exception("Failed to fetch calendar snapshot.")
+			if self._stop_event.wait(self.interval):
+				break
+
+	def _fetch_snapshot(self):
+		script = r'''
+function run() {
+	var result = {status: "ok", data: []};
+	try {
+		var app = Application("Calendar");
+		var cals = app.calendars.whose({name: "Tomato"});
+		if (cals.length === 0) {
+			result.status = "missing";
+			return JSON.stringify(result);
+		}
+		var cal = cals[0];
+		var events = cal.events();
+		for (var i = 0; i < events.length; i++) {
+			var ev = events[i];
+			var start = ev.startDate();
+			if (!start) {
+				continue;
+			}
+			var end = ev.endDate();
+			var duration = 0;
+			if (end) {
+				duration = Math.floor((end.getTime() - start.getTime()) / 1000);
+			}
+			result.data.push({
+				id: ev.id(),
+				name: ev.summary() || "",
+				stamp: Math.floor(start.getTime() / 1000),
+				duration: duration
+			});
+		}
+	} catch (err) {
+		result.status = "error";
+		result.message = err.toString();
+	}
+	return JSON.stringify(result);
+}
+'''
+		try:
+			output = subprocess.check_output(
+				['osascript', '-l', 'JavaScript', '-e', script],
+				text=True
+			).strip()
+		except subprocess.CalledProcessError:
+			return None
+		if not output:
+			return None
+		try:
+			payload = json.loads(output)
+		except json.JSONDecodeError:
+			logging.warning("Unable to parse calendar snapshot: %s", output)
+			return None
+		if payload.get('status') != 'ok':
+			if payload.get('status') not in ('missing', 'error'):
+				logging.warning("Unexpected calendar snapshot status: %s", payload.get('status'))
 			return None
 		return payload.get('data', [])
 
@@ -574,7 +660,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.2.0', self)
+		lbl1 = QLabel('Version 1.2.1', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1037,7 +1123,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.2.0', self)
+		self.lbl = QLabel('Current Version: v1.2.1', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -1284,13 +1370,18 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		self.assigntoall()
 		self.auto_record_thread = None
 		self.reminder_sync_thread = None
+		self.calendar_sync_thread = None
 		self.reminder_sync_queue = queue.Queue()
-		self._reminder_sync_processing = False
+		self.calendar_sync_queue = queue.Queue()
+		self._sync_processing = False
+		self._last_calendar_snapshot_ts = 0.0
+		self._last_reminder_snapshot_ts = 0.0
 		self.reminder_sync_timer = QTimer(self)
 		self.reminder_sync_timer.setInterval(3000)
-		self.reminder_sync_timer.timeout.connect(self._process_reminder_sync_messages)
+		self.reminder_sync_timer.timeout.connect(self._process_sync_messages)
 		self.reminder_sync_timer.start()
 		self._start_reminder_sync_worker()
+		self._start_calendar_sync_worker()
 
 	def setUpMainWindow(self):
 		self.tab_bar = QTabWidget()
@@ -1689,6 +1780,16 @@ end tell
 			self.repeat_unit.addItem(label, factor)
 		self.repeat_unit.setCurrentIndex(self._time_unit_hours_index + 1)
 
+		self.repeat_until_check = QCheckBox('Repeat until', self)
+		self.repeat_until_check.setChecked(False)
+		self.repeat_until_date = QDateEdit(self)
+		self.repeat_until_date.setCalendarPopup(True)
+		self.repeat_until_date.setDisplayFormat('yyyy-MM-dd')
+		self.repeat_until_date.setDate(QDate.currentDate())
+		self.repeat_until_date.setFixedHeight(20)
+		self.repeat_until_date.setEnabled(False)
+		self.repeat_until_check.toggled.connect(lambda _: self._apply_repeat_until_enable(self.repeat_until_check, self.repeat_until_date))
+
 		b1_row1 = QHBoxLayout()
 		b1_row1.setContentsMargins(0, 0, 0, 0)
 		b1_row1.addWidget(self.le1)
@@ -1702,10 +1803,16 @@ end tell
 		b1_row2.addWidget(self.le4)
 		b1_row2.addWidget(self.repeat_unit)
 
+		b1_row3 = QHBoxLayout()
+		b1_row3.setContentsMargins(0, 0, 0, 0)
+		b1_row3.addWidget(self.repeat_until_check)
+		b1_row3.addWidget(self.repeat_until_date)
+
 		b1 = QVBoxLayout()
 		b1.setContentsMargins(0, 0, 0, 0)
 		b1.addLayout(b1_row1)
 		b1.addLayout(b1_row2)
+		b1.addLayout(b1_row3)
 		t1.setLayout(b1)
 
 		t1_5 = QWidget()
@@ -2327,6 +2434,32 @@ end tell
 		hours = value * float(factor)
 		return self._format_hours(hours)
 
+	def _apply_repeat_until_enable(self, checkbox, date_edit):
+		enabled = checkbox.isChecked()
+		date_edit.setEnabled(enabled)
+
+	def _get_repeat_until_stamp(self, checkbox, date_edit):
+		if checkbox is None or date_edit is None or not checkbox.isChecked():
+			return '-'
+		try:
+			end_date = date_edit.date().toPyDate()
+			end_dt = datetime.datetime.combine(end_date, datetime.time(23, 59, 59))
+			return str(int(end_dt.timestamp()))
+		except Exception:
+			return '-'
+
+	def _read_repeat_until_from_row(self, row):
+		item = self.tableWidget.item(row, 6)
+		if item is None:
+			return None
+		text = (item.text() or '').strip()
+		if text in ('', '-'):
+			return None
+		try:
+			return float(text)
+		except ValueError:
+			return None
+
 	def _start_reminder_sync_worker(self):
 		if self.reminder_sync_thread and self.reminder_sync_thread.is_alive():
 			return
@@ -2339,31 +2472,80 @@ end tell
 			if self.reminder_sync_timer.isActive():
 				self.reminder_sync_timer.stop()
 
-	def _process_reminder_sync_messages(self):
+	def _start_calendar_sync_worker(self):
+		if self.calendar_sync_thread and self.calendar_sync_thread.is_alive():
+			return
+		try:
+			self.calendar_sync_thread = CalendarSyncThread(self.calendar_sync_queue)
+			self.calendar_sync_thread.start()
+		except Exception:
+			logging.exception("Failed to start calendar sync thread.")
+			self.calendar_sync_thread = None
+			if self.reminder_sync_timer.isActive():
+				self.reminder_sync_timer.stop()
+
+	def _process_sync_messages(self):
+		if self._sync_processing:
+			return
+		self._sync_processing = True
+		try:
+			self._drain_reminder_queue()
+			self._drain_calendar_queue()
+		finally:
+			self._sync_processing = False
+
+	def _drain_reminder_queue(self):
 		if not self.reminder_sync_queue:
 			return
-		if self._reminder_sync_processing:
+		while True:
+			try:
+				message = self.reminder_sync_queue.get_nowait()
+			except queue.Empty:
+				break
+			if message is None:
+				continue
+			snapshot, snapshot_timestamp = self._parse_reminder_sync_message(message)
+			if snapshot is None:
+				continue
+			last_change = getattr(self, '_last_local_reminder_change', 0.0)
+			if snapshot_timestamp is not None:
+				if snapshot_timestamp < last_change:
+					continue
+				self._last_reminder_snapshot_ts = snapshot_timestamp
+			self._handle_reminder_snapshot(snapshot)
+
+	def _drain_calendar_queue(self):
+		if not self.calendar_sync_queue:
 			return
-		self._reminder_sync_processing = True
-		try:
-			while True:
-				try:
-					message = self.reminder_sync_queue.get_nowait()
-				except queue.Empty:
-					break
-				if message is None:
+		while True:
+			try:
+				message = self.calendar_sync_queue.get_nowait()
+			except queue.Empty:
+				break
+			if message is None:
+				continue
+			snapshot, snapshot_timestamp = self._parse_calendar_sync_message(message)
+			if snapshot is None:
+				continue
+			last_change = getattr(self, '_last_local_reminder_change', 0.0)
+			if snapshot_timestamp is not None:
+				if snapshot_timestamp < last_change:
 					continue
-				snapshot, snapshot_timestamp = self._parse_reminder_sync_message(message)
-				if snapshot is None:
-					continue
-				last_change = getattr(self, '_last_local_reminder_change', 0.0)
-				if snapshot_timestamp is not None and snapshot_timestamp < last_change:
-					continue
-				self._handle_reminder_snapshot(snapshot)
-		finally:
-			self._reminder_sync_processing = False
+				self._last_calendar_snapshot_ts = snapshot_timestamp
+			self._handle_calendar_snapshot(snapshot, snapshot_timestamp)
 
 	def _parse_reminder_sync_message(self, message):
+		if isinstance(message, dict):
+			return message.get('snapshot'), message.get('timestamp')
+		if isinstance(message, (tuple, list)) and len(message) == 2:
+			first, second = message
+			if isinstance(first, (int, float)):
+				return second, first
+			if isinstance(second, (int, float)):
+				return first, second
+		return message, None
+
+	def _parse_calendar_sync_message(self, message):
 		if isinstance(message, dict):
 			return message.get('snapshot'), message.get('timestamp')
 		if isinstance(message, (tuple, list)) and len(message) == 2:
@@ -2417,6 +2599,75 @@ end tell
 			if delete_cmds is not None:
 				if delete_cmds:
 					commands.extend(delete_cmds)
+				table_changed = True
+
+		if table_changed:
+			self._refresh_stamp_column()
+			self._write_time_csv_from_table()
+			with contextlib.suppress(Exception):
+				self.tableWidget.sortByColumn(8, Qt.SortOrder.AscendingOrder)
+		if commands:
+			self._run_osascript_batch(commands)
+
+	def _handle_calendar_snapshot(self, snapshot, snapshot_ts=None):
+		if not isinstance(snapshot, list):
+			return
+		if snapshot_ts and self._last_reminder_snapshot_ts:
+			if snapshot_ts + 300 < self._last_reminder_snapshot_ts:
+				return
+		calendar_map = {}
+		for entry in snapshot:
+			name = (entry.get('name') or '').strip()
+			stamp_value = self._normalize_stamp(entry.get('stamp'))
+			if not name or not stamp_value:
+				continue
+			calendar_map[(name, stamp_value)] = entry
+		local_entries = self._collect_time_entries()
+		if not local_entries and not calendar_map:
+			return
+
+		commands = []
+		table_changed = False
+
+		# Handle time change (same name, different stamp) when unique
+		name_to_local = {}
+		for (lname, lstamp), info in local_entries.items():
+			name_to_local.setdefault(lname, []).append((lstamp, info))
+
+		for (cname, cstamp), entry in calendar_map.items():
+			locals_for_name = name_to_local.get(cname, [])
+			if (cname, cstamp) in local_entries:
+				continue
+			if len(locals_for_name) == 1:
+				old_stamp, info = locals_for_name[0]
+				row = info.get('row')
+				if row is not None and self._update_time_row_from_calendar(row, entry):
+					commands.extend(self._build_reminder_update_command(cname, old_stamp, cstamp))
+					table_changed = True
+					local_entries.pop((cname, old_stamp), None)
+					local_entries[(cname, cstamp)] = info
+
+		# Additions
+		for key, entry in calendar_map.items():
+			if key in local_entries:
+				continue
+			add_cmds = self._add_time_row_from_calendar(entry)
+			if add_cmds is not None:
+				if add_cmds:
+					commands.extend(add_cmds)
+				table_changed = True
+
+		# Deletions
+		for key, info in list(local_entries.items()):
+			if key in calendar_map:
+				continue
+			row = info.get('row')
+			if row is None:
+				continue
+			del_cmds = self._delete_time_row_by_key(key[0], key[1])
+			if del_cmds is not None:
+				if del_cmds:
+					commands.extend(del_cmds)
 				table_changed = True
 
 		if table_changed:
@@ -2521,11 +2772,78 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime)
 		if otherStyleTime is None:
 			return []
 		escaped_name = self._escape_applescript_string(name)
-		cmd = """tell application "Calendar"
+		cmd1 = """tell application "Reminders"
+	set mylist to list "Tomato"
+	tell mylist
+		delete (reminders whose (name is "%s") and (remind me date is date "%s"))
+	end tell
+end tell""" % (escaped_name, otherStyleTime)
+		cmd2 = """tell application "Calendar"
 	tell calendar "Tomato"
 		delete (events whose (start date is date "%s") and (summary is "%s"))
 	end tell
 end tell""" % (otherStyleTime, escaped_name)
+		return [cmd1, cmd2]
+
+	def _add_time_row_from_calendar(self, entry):
+		name = (entry.get('name') or '').strip()
+		stamp_value = self._normalize_stamp(entry.get('stamp'))
+		if not name or not stamp_value:
+			return None
+		try:
+			stamp_int = int(stamp_value)
+		except ValueError:
+			return None
+		dt = datetime.datetime.fromtimestamp(stamp_int)
+		time_text = dt.strftime("%Y-%m-%d %H:%M")
+		duration = entry.get('duration') or 0
+		length_hours = self._format_hours(round(duration / 3600, 6)) if duration else '1'
+		row_values = [name, time_text, length_hours, '-', 'UNDONE', '-', '-', 'TIME_SNS', stamp_value]
+		self._append_time_row_to_table(row_values)
+		escaped_name = self._escape_applescript_string(name)
+		otherStyleTime = dt.strftime("%m/%d/%Y %H:%M")
+		cmd = """tell application "Reminders"
+	set eachLine to "%s"
+	set mylist to list "Tomato"
+	tell mylist
+		make new reminder at end with properties {name:eachLine, remind me date:date "%s"}
+	end tell
+end tell""" % (escaped_name, otherStyleTime)
+		return [cmd]
+
+	def _update_time_row_from_calendar(self, row, entry):
+		name = (entry.get('name') or '').strip()
+		stamp_value = self._normalize_stamp(entry.get('stamp'))
+		if not name or not stamp_value:
+			return False
+		try:
+			stamp_int = int(stamp_value)
+		except ValueError:
+			return False
+		dt = datetime.datetime.fromtimestamp(stamp_int)
+		time_text = dt.strftime("%Y-%m-%d %H:%M")
+		duration = entry.get('duration') or 0
+		length_hours = self.tableWidget.item(row, 2).text() if self.tableWidget.item(row, 2) else '1'
+		if duration:
+			length_hours = self._format_hours(round(duration / 3600, 6))
+		self.tableWidget.setItem(row, 1, QTableWidgetItem(time_text))
+		self.tableWidget.setItem(row, 8, QTableWidgetItem(stamp_value))
+		self.tableWidget.setItem(row, 2, QTableWidgetItem(str(length_hours)))
+		return True
+
+	def _build_reminder_update_command(self, name, old_stamp, new_stamp):
+		escaped_name = self._escape_applescript_string(name)
+		try:
+			old_time = time.strftime("%m/%d/%Y %H:%M", time.localtime(int(old_stamp)))
+			new_time = time.strftime("%m/%d/%Y %H:%M", time.localtime(int(new_stamp)))
+		except Exception:
+			return []
+		cmd = """tell application "Reminders"
+	set mylist to list "Tomato"
+	tell mylist
+		set remind me date of (reminders whose (name is "%s") and (remind me date is date "%s")) to date "%s"
+	end tell
+end tell""" % (escaped_name, old_time, new_time)
 		return [cmd]
 
 	def _refresh_stamp_column(self):
@@ -2665,7 +2983,7 @@ end tell""" % (otherStyleTime, escaped_name)
 			repeat_hours = repeat_converted
 		sta5_inp = 'UNDONE'
 		tar6_inp = '-'
-		pro7_inp = '-'
+		pro7_inp = self._get_repeat_until_stamp(self.repeat_until_check, self.repeat_until_date)
 		typ8_inp = 'TIME_SNS'
 		pattern = re.compile(r'{(.*?)}')
 		result = pattern.findall(self.le1.text().replace('\n', ''))
@@ -2718,6 +3036,8 @@ end tell""" % (escaped_item, otherStyleTime, otherStyleTime, length_hours)
 				self.le4.clear()
 				self.length_unit.setCurrentIndex(self._time_unit_hours_index)
 				self.repeat_unit.setCurrentIndex(self._time_unit_hours_index + 1)
+				self.repeat_until_check.setChecked(False)
+				self.repeat_until_date.setDate(QDate.currentDate())
 				self.date_edit.setDate(QDate.currentDate())
 				self.time_edit.setTime(QTime.currentTime())
 
@@ -2924,12 +3244,17 @@ end tell
 			if repeat_hours is not None:
 				new1_text = self.tableWidget.item(self.changing_row, 0).text()
 				new_time = self.tableWidget.item(self.changing_row, 1).text()
+				repeat_end_stamp = self._read_repeat_until_from_row(self.changing_row)
+				new_stamp = None
 				try:
 					base_stamp = float(self.to_stamp(new_time))
 				except Exception:
 					base_stamp = None
 				if base_stamp is not None:
 					new_stamp = base_stamp + 3600 * repeat_hours
+					if repeat_end_stamp is not None and new_stamp > repeat_end_stamp:
+						new_stamp = None
+				if new_stamp is not None:
 					next_time_array = time.localtime(new_stamp)
 					otherStyleTime_new = time.strftime("%m/%d/%Y %H:%M", next_time_array)
 					new2_time = time.strftime("%Y-%m-%d %H:%M", next_time_array)
@@ -2937,7 +3262,7 @@ end tell
 					new4_rep = repeat_item.text()
 					new5_sta = 'UNDONE'
 					new6_tar = '-'
-					new7_pro = '-'
+					new7_pro = self.tableWidget.item(self.changing_row, 6).text() if self.tableWidget.item(self.changing_row, 6) else '-'
 					new8_typ = 'TIME_SNS'
 					new9_sta = str(new_stamp)
 					new_row_values = [new1_text, new2_time, new3_leng, new4_rep,
@@ -3300,12 +3625,27 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.freq_repeat_unit.setCurrentIndex(0)
 		self.freq_repeat_unit.setFixedWidth(100)
 
+		self.freq_repeat_until_check = QCheckBox('Repeat until', self)
+		self.freq_repeat_until_check.setChecked(False)
+		self.freq_repeat_until_date = QDateEdit(self)
+		self.freq_repeat_until_date.setCalendarPopup(True)
+		self.freq_repeat_until_date.setDisplayFormat('yyyy-MM-dd')
+		self.freq_repeat_until_date.setDate(QDate.currentDate())
+		self.freq_repeat_until_date.setFixedHeight(20)
+		self.freq_repeat_until_date.setEnabled(False)
+		self.freq_repeat_until_check.toggled.connect(lambda _: self._apply_repeat_until_enable(self.freq_repeat_until_check, self.freq_repeat_until_date))
+
 		length_repeat_row = QHBoxLayout()
 		length_repeat_row.setContentsMargins(0, 0, 0, 0)
 		length_repeat_row.addWidget(self.lf4)
 		length_repeat_row.addWidget(self.freq_length_unit)
 		length_repeat_row.addWidget(self.lf5)
 		length_repeat_row.addWidget(self.freq_repeat_unit)
+
+		freq_until_row = QHBoxLayout()
+		freq_until_row.setContentsMargins(0, 0, 0, 0)
+		freq_until_row.addWidget(self.freq_repeat_until_check)
+		freq_until_row.addWidget(self.freq_repeat_until_date)
 
 		btn_t5 = QPushButton('Copy to Time-sensitive list', self)
 		btn_t5.clicked.connect(self.freq_move_time)
@@ -3322,6 +3662,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		b3.addWidget(self.freq2)
 		b3.addLayout(freq_datetime_row)
 		b3.addLayout(length_repeat_row)
+		b3.addLayout(freq_until_row)
 		b3.addWidget(btn_t5)
 		t3.setLayout(b3)
 
@@ -4109,7 +4450,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 				repeat_hours = repeat_converted
 			sta5_inp = 'UNDONE'
 			tar6_inp = '-'
-			pro7_inp = '-'
+			pro7_inp = self._get_repeat_until_stamp(self.freq_repeat_until_check, self.freq_repeat_until_date)
 			typ8_inp = 'TIME_SNS'
 			sta9_inp = ''
 			if ite1_inp != '' and tim2_inp != '' and self.tableWidget_freq.item(self.tableWidget_freq.currentIndex().row(), 0) != None:
@@ -4157,6 +4498,8 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 					self.lf5.clear()
 					self.freq_length_unit.setCurrentIndex(self._time_unit_hours_index)
 					self.freq_repeat_unit.setCurrentIndex(0)
+					self.freq_repeat_until_check.setChecked(False)
+					self.freq_repeat_until_date.setDate(QDate.currentDate())
 					self.le4.setText('-')
 					self.le4.clear()
 
@@ -4341,12 +4684,27 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.memo_repeat_unit.setCurrentIndex(0)
 		self.memo_repeat_unit.setFixedWidth(100)
 
+		self.memo_repeat_until_check = QCheckBox('Repeat until', self)
+		self.memo_repeat_until_check.setChecked(False)
+		self.memo_repeat_until_date = QDateEdit(self)
+		self.memo_repeat_until_date.setCalendarPopup(True)
+		self.memo_repeat_until_date.setDisplayFormat('yyyy-MM-dd')
+		self.memo_repeat_until_date.setDate(QDate.currentDate())
+		self.memo_repeat_until_date.setFixedHeight(20)
+		self.memo_repeat_until_date.setEnabled(False)
+		self.memo_repeat_until_check.toggled.connect(lambda _: self._apply_repeat_until_enable(self.memo_repeat_until_check, self.memo_repeat_until_date))
+
 		memo_length_repeat_row = QHBoxLayout()
 		memo_length_repeat_row.setContentsMargins(0, 0, 0, 0)
 		memo_length_repeat_row.addWidget(self.lm4)
 		memo_length_repeat_row.addWidget(self.memo_length_unit)
 		memo_length_repeat_row.addWidget(self.lm5)
 		memo_length_repeat_row.addWidget(self.memo_repeat_unit)
+
+		memo_until_row = QHBoxLayout()
+		memo_until_row.setContentsMargins(0, 0, 0, 0)
+		memo_until_row.addWidget(self.memo_repeat_until_check)
+		memo_until_row.addWidget(self.memo_repeat_until_date)
 
 		btn_t5 = QPushButton('Copy to Time-sensitive list', self)
 		btn_t5.clicked.connect(self.memo_copy_to_time)
@@ -4363,6 +4721,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		b3.addWidget(self.memo2)
 		b3.addLayout(memo_datetime_row)
 		b3.addLayout(memo_length_repeat_row)
+		b3.addLayout(memo_until_row)
 		b3.addWidget(btn_t5)
 		t3.setLayout(b3)
 
@@ -4626,6 +4985,16 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.collect_repeat_unit.setFixedWidth(100)
 		self.collect_repeat_unit.setFixedHeight(20)
 
+		self.collect_repeat_until_check = QCheckBox('Repeat until', self)
+		self.collect_repeat_until_check.setChecked(False)
+		self.collect_repeat_until_date = QDateEdit(self)
+		self.collect_repeat_until_date.setCalendarPopup(True)
+		self.collect_repeat_until_date.setDisplayFormat('yyyy-MM-dd')
+		self.collect_repeat_until_date.setDate(QDate.currentDate())
+		self.collect_repeat_until_date.setFixedHeight(20)
+		self.collect_repeat_until_date.setEnabled(False)
+		self.collect_repeat_until_check.toggled.connect(lambda _: self._apply_repeat_until_enable(self.collect_repeat_until_check, self.collect_repeat_until_date))
+
 		btn_collect_copy = QPushButton('Copy to Time list', self)
 		btn_collect_copy.clicked.connect(self._collect_copy_to_time)
 		btn_collect_copy.setFixedHeight(20)
@@ -4644,6 +5013,11 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		collect_length_row.addWidget(self.collect_repeat_input)
 		collect_length_row.addWidget(self.collect_repeat_unit)
 		#collect_length_row.addStretch()
+
+		collect_until_row = QHBoxLayout()
+		collect_until_row.setContentsMargins(0, 0, 0, 0)
+		collect_until_row.addWidget(self.collect_repeat_until_check)
+		collect_until_row.addWidget(self.collect_repeat_until_date)
 
 		# self.frame22 = QFrame(self)
 		# self.frame22.setFrameShape(QFrame.Shape.HLine)
@@ -4671,6 +5045,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		mid_bar.addLayout(collect_time_row)
 		mid_bar.addStretch()
 		mid_bar.addLayout(collect_length_row)
+		mid_bar.addLayout(collect_until_row)
 		mid_bar.addStretch()
 		mid_bar.addWidget(btn_collect_copy)
 		#mid_bar.addStretch()
@@ -5252,6 +5627,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 			if repeat_hours is None:
 				QMessageBox.warning(self, 'Invalid repeat', 'Please enter a valid repeat interval.')
 				return
+		repeat_until = self._get_repeat_until_stamp(self.collect_repeat_until_check, self.collect_repeat_until_date)
 		new_row = [
 			item_name,
 			time_text,
@@ -5259,7 +5635,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 			repeat_hours,
 			'UNDONE',
 			'-',
-			'-',
+			repeat_until,
 			'TIME_SNS',
 			stamp_value
 		]
@@ -5292,6 +5668,8 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		self.collect_repeat_input.clear()
 		self.collect_length_unit.setCurrentIndex(self._time_unit_hours_index)
 		self.collect_repeat_unit.setCurrentIndex(0)
+		self.collect_repeat_until_check.setChecked(False)
+		self.collect_repeat_until_date.setDate(QDate.currentDate())
 
 	def memo_click_write(self):
 		ori = [['Item', 'Time', 'Length', 'Repeat', 'Status', 'Target times', 'Progress', 'Type', 'Stamp']]
@@ -5690,7 +6068,7 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 				repeat_hours = repeat_converted
 			sta5_inp = 'UNDONE'
 			tar6_inp = '-'
-			pro7_inp = '-'
+			pro7_inp = self._get_repeat_until_stamp(self.memo_repeat_until_check, self.memo_repeat_until_date)
 			typ8_inp = 'TIME_SNS'
 			sta9_inp = ''
 			if ite1_inp != '' and tim2_inp != '' and self.tableWidget_memo.item(
@@ -5739,6 +6117,8 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 					self.lm5.clear()
 					self.memo_length_unit.setCurrentIndex(self._time_unit_hours_index)
 					self.memo_repeat_unit.setCurrentIndex(0)
+					self.memo_repeat_until_check.setChecked(False)
+					self.memo_repeat_until_date.setDate(QDate.currentDate())
 					self.lm1.setText('-')
 					self.lm1.clear()
 
