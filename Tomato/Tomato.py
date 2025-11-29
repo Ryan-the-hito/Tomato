@@ -10,7 +10,8 @@ from PyQt6.QtWidgets import (QWidget, QPushButton, QApplication,
 							 QSystemTrayIcon, QMenu, QComboBox, QDialog, QMenuBar, QFrame, QFileDialog,
 							 QPlainTextEdit, QTabWidget, QTextEdit, QGraphicsOpacityEffect,
 							 QTableWidget, QTableWidgetItem, QAbstractItemView, QInputDialog,
-							 QMessageBox, QSplitter, QDialogButtonBox, QListWidget, QListWidgetItem, QCheckBox)
+							 QMessageBox, QSplitter, QDialogButtonBox, QListWidget, QListWidgetItem, QCheckBox,
+							 QStackedWidget, QTextBrowser)
 from PyQt6.QtCore import Qt, QRect, QPropertyAnimation, QDate, QTime, QTimer, QObject, QEvent
 from PyQt6.QtGui import QAction, QIcon, QColor, QCursor, QGuiApplication
 import PyQt6.QtGui
@@ -31,6 +32,7 @@ import logging
 import json
 import queue
 import contextlib
+import markdown2
 from dataclasses import dataclass
 from functools import partial
 try:
@@ -660,7 +662,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.2.1', self)
+		lbl1 = QLabel('Version 1.2.2', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1123,7 +1125,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.2.1', self)
+		self.lbl = QLabel('Current Version: v1.2.2', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -1496,6 +1498,13 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 			target = self._diary_viewport_owner.get(obj)
 		if target in self._diary_text_edits and event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.FocusIn):
 			self._refresh_diary_text_widget(target)
+		if obj == getattr(self, 'collection_view_toggle_btn', None):
+			if event.type() == QEvent.Type.Enter:
+				self._collection_toggle_opacity.setOpacity(1.0)
+			elif event.type() == QEvent.Type.Leave:
+				self._collection_toggle_opacity.setOpacity(0.2)
+		if obj == getattr(self, 'collection_view_stack', None) and event.type() == QEvent.Type.Resize:
+			self._position_collection_toggle_button()
 		return super().eventFilter(obj, event)
 
 	def assigntoall(self):
@@ -1802,17 +1811,19 @@ end tell
 		b1_row2.addWidget(self.length_unit)
 		b1_row2.addWidget(self.le4)
 		b1_row2.addWidget(self.repeat_unit)
+		b1_row2.addWidget(self.repeat_until_check)
+		b1_row2.addWidget(self.repeat_until_date)
 
-		b1_row3 = QHBoxLayout()
-		b1_row3.setContentsMargins(0, 0, 0, 0)
-		b1_row3.addWidget(self.repeat_until_check)
-		b1_row3.addWidget(self.repeat_until_date)
+		# b1_row3 = QHBoxLayout()
+		# b1_row3.setContentsMargins(0, 0, 0, 0)
+		# b1_row3.addWidget(self.repeat_until_check)
+		# b1_row3.addWidget(self.repeat_until_date)
 
 		b1 = QVBoxLayout()
 		b1.setContentsMargins(0, 0, 0, 0)
 		b1.addLayout(b1_row1)
 		b1.addLayout(b1_row2)
-		b1.addLayout(b1_row3)
+		# b1.addLayout(b1_row3)
 		t1.setLayout(b1)
 
 		t1_5 = QWidget()
@@ -3627,6 +3638,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 
 		self.freq_repeat_until_check = QCheckBox('Repeat until', self)
 		self.freq_repeat_until_check.setChecked(False)
+		self.freq_repeat_until_check.setFixedWidth(100)
 		self.freq_repeat_until_date = QDateEdit(self)
 		self.freq_repeat_until_date.setCalendarPopup(True)
 		self.freq_repeat_until_date.setDisplayFormat('yyyy-MM-dd')
@@ -4686,6 +4698,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 
 		self.memo_repeat_until_check = QCheckBox('Repeat until', self)
 		self.memo_repeat_until_check.setChecked(False)
+		self.memo_repeat_until_check.setFixedWidth(100)
 		self.memo_repeat_until_date = QDateEdit(self)
 		self.memo_repeat_until_date.setCalendarPopup(True)
 		self.memo_repeat_until_date.setDisplayFormat('yyyy-MM-dd')
@@ -4766,6 +4779,8 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self._collection_loading = False
 		self._collection_table_block = False
 		self._collection_preview_updating = False
+		self._collection_preview_mode = False
+		self._collection_scroll_ratio = 0.0
 		self._collection_last_markdown = ''
 
 		self.collection_table = QTableWidget()
@@ -4781,9 +4796,50 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.collection_md_editor.setReadOnly(True)
 		self.collection_md_editor.textChanged.connect(self._handle_collection_markdown_change)
 
+		self.collection_md_preview = QTextBrowser(self)
+		self.collection_md_preview.setOpenExternalLinks(True)
+		self.collection_md_preview.setReadOnly(True)
+
+		self.collection_view_stack = QStackedWidget(self)
+		self.collection_view_stack.addWidget(self.collection_md_editor)
+		self.collection_view_stack.addWidget(self.collection_md_preview)
+		self.collection_view_stack.setCurrentWidget(self.collection_md_editor)
+
+		self.collection_view_toggle_btn = QPushButton('Preview', self.collection_view_stack)
+		self.collection_view_toggle_btn.setCheckable(True)
+		self.collection_view_toggle_btn.setFixedSize(90, 28)
+		self.collection_view_toggle_btn.setStyleSheet("""
+			QPushButton {
+				border: 1px solid rgba(40, 40, 40, 0.35);
+				background-color: rgba(255, 255, 255, 0.05);
+				color: rgba(20, 20, 20, 0.35);
+				border-radius: 6px;
+			}
+			QPushButton:hover {
+				background-color: #f0f0f0;
+				color: #111111;
+				border: 1px solid #5a5a5a;
+				border-radius: 6px;
+			}
+		""")
+		self.collection_view_toggle_btn.toggled.connect(self._toggle_collection_view_mode)
+		self._collection_toggle_opacity = QGraphicsOpacityEffect(self.collection_view_toggle_btn)
+		self._collection_toggle_opacity.setOpacity(0.2)
+		self.collection_view_toggle_btn.setGraphicsEffect(self._collection_toggle_opacity)
+		self.collection_view_toggle_btn.installEventFilter(self)
+		self.collection_view_stack.installEventFilter(self)
+		self._position_collection_toggle_button()
+
+		right_view_container = QWidget()
+		right_view_layout = QVBoxLayout()
+		right_view_layout.setContentsMargins(0, 0, 0, 0)
+		right_view_layout.setSpacing(4)
+		right_view_layout.addWidget(self.collection_view_stack, 1)
+		right_view_container.setLayout(right_view_layout)
+
 		splitter = QSplitter(Qt.Orientation.Horizontal)
 		splitter.addWidget(self.collection_table)
-		splitter.addWidget(self.collection_md_editor)
+		splitter.addWidget(right_view_container)
 		splitter.setStretchFactor(0, 2)
 		splitter.setStretchFactor(1, 1)
 
@@ -4987,6 +5043,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 
 		self.collect_repeat_until_check = QCheckBox('Repeat until', self)
 		self.collect_repeat_until_check.setChecked(False)
+		self.collect_repeat_until_check.setFixedWidth(100)
 		self.collect_repeat_until_date = QDateEdit(self)
 		self.collect_repeat_until_date.setCalendarPopup(True)
 		self.collect_repeat_until_date.setDisplayFormat('yyyy-MM-dd')
@@ -5549,6 +5606,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 			self.collection_md_editor.setPlainText('Select a row to view its Markdown.')
 			self._collection_preview_updating = False
 			self._collection_last_markdown = self.collection_md_editor.toPlainText()
+			self._update_collection_html_preview()
 			return
 		headers = self._collection_headers()
 		values = []
@@ -5561,6 +5619,18 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.collection_md_editor.setPlainText(text)
 		self._collection_preview_updating = False
 		self._collection_last_markdown = text
+		self._update_collection_html_preview()
+
+	def _update_collection_html_preview(self):
+		markdown_text = self.collection_md_editor.toPlainText()
+		try:
+			html_text = self.md2html(markdown_text)
+			self.collection_md_preview.setHtml(html_text)
+		except Exception:
+			logging.exception("Failed to render collection markdown preview.")
+			self.collection_md_preview.setPlainText(markdown_text)
+		if self._collection_preview_mode:
+			QTimer.singleShot(0, lambda: self._collection_apply_scroll_ratio(self.collection_md_preview, self._collection_scroll_ratio))
 
 	def _handle_collection_markdown_change(self):
 		if self._collection_preview_updating:
@@ -5587,6 +5657,199 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self._collection_table_block = False
 		self._collection_last_markdown = self.collection_md_editor.toPlainText()
 		self._save_collection_file()
+		if self._collection_preview_mode:
+			self._update_collection_html_preview()
+
+	def _toggle_collection_view_mode(self, checked):
+		current_widget = self.collection_view_stack.currentWidget()
+		self._collection_scroll_ratio = self._collection_get_scroll_ratio(current_widget)
+		self._collection_preview_mode = checked
+		if self._collection_preview_mode:
+			self._update_collection_html_preview()
+			self.collection_view_stack.setCurrentWidget(self.collection_md_preview)
+			self.collection_view_toggle_btn.setText('Edit')
+			self._collection_apply_scroll_ratio(self.collection_md_preview, self._collection_scroll_ratio)
+		else:
+			self.collection_view_stack.setCurrentWidget(self.collection_md_editor)
+			self.collection_view_toggle_btn.setText('Preview')
+			self._collection_apply_scroll_ratio(self.collection_md_editor, self._collection_scroll_ratio)
+		self._position_collection_toggle_button()
+		self.collection_view_toggle_btn.raise_()
+
+	def _collection_get_scroll_ratio(self, widget):
+		bar = widget.verticalScrollBar()
+		maximum = bar.maximum()
+		if maximum <= 0:
+			return 0.0
+		return bar.value() / maximum
+
+	def _collection_apply_scroll_ratio(self, widget, ratio):
+		bar = widget.verticalScrollBar()
+		maximum = bar.maximum()
+		if maximum <= 0:
+			return
+		bar.setValue(int(maximum * ratio))
+
+	def _position_collection_toggle_button(self):
+		if not hasattr(self, 'collection_view_toggle_btn') or not hasattr(self, 'collection_view_stack'):
+			return
+		margin = 12
+		btn = self.collection_view_toggle_btn
+		stack = self.collection_view_stack
+		btn.move(stack.width() - btn.width() - margin, stack.height() - btn.height() - margin)
+		btn.raise_()
+
+	def md2html(self, mdstr):
+		extras = ['code-friendly', 'fenced-code-blocks', 'footnotes', 'tables', 'code-color', 'pyshell', 'nofollow',
+				  'cuddled-lists', 'header ids', 'nofollow']
+
+		html = """
+		<html>
+		<head>
+		<meta content="text/html; charset=utf-8" http-equiv="content-type" />
+		<style>
+			.hll { background-color: #ffffcc }
+			.c { color: #0099FF; font-style: italic } /* Comment */
+			.err { color: #AA0000; background-color: #FFAAAA } /* Error */
+			.k { color: #006699; font-weight: bold } /* Keyword */
+			.o { color: #555555 } /* Operator */
+			.ch { color: #0099FF; font-style: italic } /* Comment.Hashbang */
+			.cm { color: #0099FF; font-style: italic } /* Comment.Multiline */
+			.cp { color: #009999 } /* Comment.Preproc */
+			.cpf { color: #0099FF; font-style: italic } /* Comment.PreprocFile */
+			.c1 { color: #0099FF; font-style: italic } /* Comment.Single */
+			.cs { color: #0099FF; font-weight: bold; font-style: italic } /* Comment.Special */
+			.gd { background-color: #FFCCCC; border: 1px solid #CC0000 } /* Generic.Deleted */
+			.ge { font-style: italic } /* Generic.Emph */
+			.gr { color: #FF0000 } /* Generic.Error */
+			.gh { color: #003300; font-weight: bold } /* Generic.Heading */
+			.gi { background-color: #CCFFCC; border: 1px solid #00CC00 } /* Generic.Inserted */
+			.go { color: #AAAAAA } /* Generic.Output */
+			.gp { color: #000099; font-weight: bold } /* Generic.Prompt */
+			.gs { font-weight: bold } /* Generic.Strong */
+			.gu { color: #003300; font-weight: bold } /* Generic.Subheading */
+			.gt { color: #99CC66 } /* Generic.Traceback */
+			.kc { color: #006699; font-weight: bold } /* Keyword.Constant */
+			.kd { color: #006699; font-weight: bold } /* Keyword.Declaration */
+			.kn { color: #006699; font-weight: bold } /* Keyword.Namespace */
+			.kp { color: #006699 } /* Keyword.Pseudo */
+			.kr { color: #006699; font-weight: bold } /* Keyword.Reserved */
+			.kt { color: #007788; font-weight: bold } /* Keyword.Type */
+			.m { color: #FF6600 } /* Literal.Number */
+			.s { color: #CC3300 } /* Literal.String */
+			.na { color: #330099 } /* Name.Attribute */
+			.nb { color: #336666 } /* Name.Builtin */
+			.nc { color: #00AA88; font-weight: bold } /* Name.Class */
+			.no { color: #336600 } /* Name.Constant */
+			.nd { color: #9999FF } /* Name.Decorator */
+			.ni { color: #999999; font-weight: bold } /* Name.Entity */
+			.ne { color: #CC0000; font-weight: bold } /* Name.Exception */
+			.nf { color: #CC00FF } /* Name.Function */
+			.nl { color: #9999FF } /* Name.Label */
+			.nn { color: #00CCFF; font-weight: bold } /* Name.Namespace */
+			.nt { color: #330099; font-weight: bold } /* Name.Tag */
+			.nv { color: #003333 } /* Name.Variable */
+			.ow { color: #000000; font-weight: bold } /* Operator.Word */
+			.w { color: #bbbbbb } /* Text.Whitespace */
+			.mb { color: #FF6600 } /* Literal.Number.Bin */
+			.mf { color: #FF6600 } /* Literal.Number.Float */
+			.mh { color: #FF6600 } /* Literal.Number.Hex */
+			.mi { color: #FF6600 } /* Literal.Number.Integer */
+			.mo { color: #FF6600 } /* Literal.Number.Oct */
+			.sa { color: #CC3300 } /* Literal.String.Affix */
+			.sb { color: #CC3300 } /* Literal.String.Backtick */
+			.sc { color: #CC3300 } /* Literal.String.Char */
+			.dl { color: #CC3300 } /* Literal.String.Delimiter */
+			.sd { color: #CC3300; font-style: italic } /* Literal.String.Doc */
+			.s2 { color: #CC3300 } /* Literal.String.Double */
+			.se { color: #CC3300; font-weight: bold } /* Literal.String.Escape */
+			.sh { color: #CC3300 } /* Literal.String.Heredoc */
+			.si { color: #AA0000 } /* Literal.String.Interpol */
+			.sx { color: #CC3300 } /* Literal.String.Other */
+			.sr { color: #33AAAA } /* Literal.String.Regex */
+			.s1 { color: #CC3300 } /* Literal.String.Single */
+			.ss { color: #FFCC33 } /* Literal.String.Symbol */
+			.bp { color: #336666 } /* Name.Builtin.Pseudo */
+			.fm { color: #CC00FF } /* Name.Function.Magic */
+			.vc { color: #003333 } /* Name.Variable.Class */
+			.vg { color: #003333 } /* Name.Variable.Global */
+			.vi { color: #003333 } /* Name.Variable.Instance */
+			.vm { color: #003333 } /* Name.Variable.Magic */
+			.il { color: #FF6600 } /* Literal.Number.Integer.Long */
+			table {
+					font-family: verdana,arial,sans-serif;
+					font-size:11px;
+					color:#333333;
+					border-width: 1px;
+					border-color: #999999;
+					border-collapse: collapse;
+					}
+			th {
+				background:#b5cfd2 url('cell-blue.jpg');
+				border-width: 1px;
+				padding: 8px;
+				border-style: solid;
+				border-color: #999999;
+				}
+			td {
+				background:#dcddc0 url('cell-grey.jpg');
+				border-width: 1px;
+				padding: 8px;
+				border-style: solid;
+				border-color: #999999;
+				}
+		</style>
+		</head>
+		<body>
+			%s
+		</body>
+		</html>
+		"""
+		clean_one = mdstr.replace('\\(', '$').replace('\\)', '$').replace('\\[', '$').replace('\\]', '$')
+		clean_two = re.sub(r'\$(.*?)\$', lambda m: '$' + re.sub(r'[\n\t ]+', '', m.group(1)) + '$', clean_one,
+						   flags=re.DOTALL)
+		clean_three = re.sub(r'\|(\n(\t)*\n(\t)*)\|', '|\n|', clean_two)
+		ret = markdown2.markdown(clean_three, extras=extras)
+		middlehtml = html % ret
+		html_content = """
+		<!DOCTYPE html>
+		<html lang="en">
+		<head>
+			<style>
+				body {
+					margin-right: 20px;
+					font-size: 14px;
+					padding: 0;
+					background-color: #F3F2EE;
+				}
+			</style>
+			<meta charset="UTF-8">
+			<meta name="viewport" content="width=device-width, initial-scale=1.0">
+			<script
+				src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.1/MathJax.js?config=TeX-MML-AM_CHTML">
+			</script>   
+		</head>
+		<body>
+			%s
+			<script type='text/x-mathjax-config'>
+			MathJax.Hub.Config({
+				displayAlign: 'left',
+				displayIndent: '4em',
+				tex2jax: {
+					inlineMath: [['$','$'], ['\\\\(','\\\\)']],
+					displayMath: [['$$','$$'], ['\\[','\\]']]
+				},
+				TeX:{
+					equationNumbers:{
+						autoNumber:"AMS"
+					}
+				}
+			});
+			</script>
+		</body>
+		</html>
+		""" % middlehtml
+		return html_content
 
 	def _open_collection_dir(self):
 		if os.path.isdir(self.fulldir_collection):
