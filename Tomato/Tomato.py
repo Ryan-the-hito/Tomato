@@ -662,7 +662,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.2.2', self)
+		lbl1 = QLabel('Version 1.2.3', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1125,7 +1125,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.2.2', self)
+		self.lbl = QLabel('Current Version: v1.2.3', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -1628,6 +1628,8 @@ end tell
 				pos = len(self.textii1.toPlainText())  # 获取文本尾部的位置
 				cursor.setPosition(pos)  # 游标位置设置为尾部
 				self.textii1.setTextCursor(cursor)  # 滚动到游标位置
+				self._clear_table_selection(self.tableWidget)
+				self._clear_table_selection(self.tableWidget_record)
 			if index == 1:
 				self.tableWidget_freq.setColumnWidth(0, int(self.openwidth / 16 * 9))
 				self.tableWidget_freq.setColumnWidth(1, 0)
@@ -1648,6 +1650,8 @@ end tell
 				pos = len(self.textii2.toPlainText())  # 获取文本尾部的位置
 				cursor.setPosition(pos)  # 游标位置设置为尾部
 				self.textii2.setTextCursor(cursor)  # 滚动到游标位置
+				self._clear_table_selection(self.tableWidget_freq)
+				self._clear_table_selection(self.tableWidget_record2)
 			if index == 2:
 				self.tableWidget_memo.setColumnWidth(0, int(self.openwidth / 48 * 41))
 				self.tableWidget_memo.setColumnWidth(1, 0)
@@ -1668,6 +1672,7 @@ end tell
 				pos = len(self.textii3.toPlainText())  # 获取文本尾部的位置
 				cursor.setPosition(pos)  # 游标位置设置为尾部
 				self.textii3.setTextCursor(cursor)  # 滚动到游标位置
+				self._clear_table_selection(self.tableWidget_memo)
 			if index == 3:
 				self.textiii1.setText(contm)
 				self.textiii1.ensureCursorVisible()  # 游标可用
@@ -2036,8 +2041,7 @@ end tell
 		cursor.setPosition(pos)  # 游标位置设置为尾部
 		self.textii1.setTextCursor(cursor)  # 滚动到游标位置
 		if self.tableWidget.currentItem() != None and self.tableWidget.item(self.tableWidget.currentRow(), 3).text() != '-':
-			record_name = self.tableWidget.item(self.tableWidget.currentRow(), 0).text() + '.csv'
-			record_file = os.path.join(self.fulldir_rec, record_name)
+			record_file = self._record_file_path(self.tableWidget.item(self.tableWidget.currentRow(), 0).text())
 			if not os.path.exists(record_file):
 				title_list = [['Time', 'Comments']]
 				with open(record_file, 'w', encoding='utf8') as csv_file:
@@ -2240,8 +2244,7 @@ end tell
 				cursor.setPosition(pos)  # 游标位置设置为尾部
 				self.textii1.setTextCursor(cursor)  # 滚动到游标位置
 				if self.tableWidget.item(self.changing_row, 3).text() != '-':
-					record_name = self.tableWidget.item(self.changing_row, 0).text() + '.csv'
-					record_file = os.path.join(self.fulldir_rec, record_name)
+					record_file = self._record_file_path(self.tableWidget.item(self.changing_row, 0).text())
 					out_list = []
 					item_list = []
 					comments = 'No comment'
@@ -2321,6 +2324,16 @@ end tell
 			return []
 		return sorted({index.row() for index in selection.selectedRows() if index.row() >= 0})
 
+	def _warn_selection_required(self, message):
+		QMessageBox.warning(self, 'Error', message)
+	
+	def _clear_table_selection(self, table_widget):
+		if table_widget is None:
+			return
+		table_widget.clearSelection()
+		table_widget.setCurrentItem(None)
+		table_widget.clearFocus()
+
 	def _init_sync_indicator(self):
 		self._sync_counter = 0
 		self.sync_dialog = QDialog(self)
@@ -2377,6 +2390,15 @@ end tell
 		escaped = value.replace('\\', '\\\\')
 		escaped = escaped.replace('"', '\\"')
 		return escaped
+
+	def _sanitize_filename(self, name):
+		safe = re.sub(r'[\\/]+', '_', name or '')
+		safe = re.sub(r'[\\:*?"<>|]', '_', safe)
+		safe = safe.strip('.')
+		return safe or "record"
+
+	def _record_file_path(self, base_name):
+		return os.path.join(self.fulldir_rec, f"{self._sanitize_filename(base_name)}.csv")
 
 	def _write_time_csv_from_table(self):
 		headers = []
@@ -3326,8 +3348,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 
 		repeat_item = self.tableWidget.item(self.changing_row, 3)
 		if repeat_item and repeat_item.text() != '-':
-			record_name = self.tableWidget.item(self.changing_row, 0).text() + '.csv'
-			record_file = os.path.join(self.fulldir_rec, record_name)
+			record_file = self._record_file_path(self.tableWidget.item(self.changing_row, 0).text())
 			out_list = []
 			item_list = []
 			comments = 'No comment'
@@ -3386,6 +3407,9 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		selected_rows = self._get_selected_rows(self.tableWidget)
 		if not selected_rows and self.tableWidget.currentItem() is not None:
 			selected_rows = [self.tableWidget.currentRow()]
+		if not selected_rows:
+			self._warn_selection_required('Please select the items to be completed first, then click save.')
+			return
 		comment_text = self.textw1.toPlainText()
 		processed = False
 		reminder_cmds = []
@@ -3415,15 +3439,13 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		home_dir = str(Path.home())
 		fj = QFileDialog.getExistingDirectory(self, 'Open', home_dir)
 		if fj != '' and self.tableWidget.currentItem() != None:
-			record_name = self.tableWidget.item(self.tableWidget.currentRow(), 0).text() + '.csv'
-			record_file = os.path.join(self.fulldir_rec, record_name)
+			record_file = self._record_file_path(self.tableWidget.item(self.tableWidget.currentRow(), 0).text())
 			if os.path.exists(record_file):
 				shutil.copy(record_file, fj)
 
 	def record_write(self):
 		if self.tableWidget.currentItem() != None:
-			record_name = self.tableWidget.item(self.tableWidget.currentRow(), 0).text() + '.csv'
-			record_file = os.path.join(self.fulldir_rec, record_name)
+			record_file = self._record_file_path(self.tableWidget.item(self.tableWidget.currentRow(), 0).text())
 			title_list = [['Time', 'Comments']]
 			with open(record_file, 'w', encoding='utf8') as csv_file:
 				csv_writer = csv.writer(csv_file)
@@ -3838,8 +3860,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		cursor.setPosition(pos)  # 游标位置设置为尾部
 		self.textii2.setTextCursor(cursor)  # 滚动到游标位置
 		if self.tableWidget_freq.currentItem() != None:
-			record2_name = self.tableWidget_freq.item(self.tableWidget_freq.currentRow(), 0).text() + '.csv'
-			record2_file = os.path.join(self.fulldir_rec, record2_name)
+			record2_file = self._record_file_path(self.tableWidget_freq.item(self.tableWidget_freq.currentRow(), 0).text())
 			if not os.path.exists(record2_file):
 				title_list = [['Time', 'Comments']]
 				with open(record2_file, 'w', encoding='utf8') as csv_file:
@@ -3927,8 +3948,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 					cursor.setPosition(pos)  # 游标位置设置为尾部
 					self.textii2.setTextCursor(cursor)  # 滚动到游标位置
 
-				record_name = self.tableWidget_freq.item(self.freq_changing_row, 0).text() + '.csv'
-				record_file = os.path.join(self.fulldir_rec, record_name)
+				record_file = self._record_file_path(self.tableWidget_freq.item(self.freq_changing_row, 0).text())
 				out_list = []
 				item_list = []
 				comments = 'No comment'
@@ -3998,8 +4018,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 				cursor.setPosition(pos)  # 游标位置设置为尾部
 				self.textii2.setTextCursor(cursor)  # 滚动到游标位置
 
-				record_name = self.tableWidget_freq.item(self.freq_changing_row, 0).text() + '.csv'
-				record_file = os.path.join(self.fulldir_rec, record_name)
+				record_file = self._record_file_path(self.tableWidget_freq.item(self.freq_changing_row, 0).text())
 				out_list = []
 				item_list = []
 				comments = 'No comment'
@@ -4068,6 +4087,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 
 	def freq_index(self, i):
 		self.freq_readlater()
+		self._clear_table_selection(self.tableWidget_freq)
 
 		input_table = pd.read_csv(self.fulldirall)
 		input_table_rows = input_table.shape[0]  # 获取表格行数
@@ -4167,6 +4187,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 				continue
 			m += 1
 			continue
+		self._clear_table_selection(self.tableWidget_freq)
 
 	def freq_delete(self):
 		if self.tableWidget_freq.currentItem() != None:
@@ -4239,8 +4260,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 
 	def freq_record_write(self):
 		if self.tableWidget_freq.currentItem() != None:
-			record2_name = self.tableWidget_freq.item(self.tableWidget_freq.currentRow(), 0).text() + '.csv'
-			record2_file = os.path.join(self.fulldir_rec, record2_name)
+			record2_file = self._record_file_path(self.tableWidget_freq.item(self.tableWidget_freq.currentRow(), 0).text())
 			title_list = [['Time', 'Comments']]
 			with open(record2_file, 'w', encoding='utf8') as csv_file:
 				csv_writer = csv.writer(csv_file)
@@ -4272,9 +4292,27 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 	def _freq_add_time_single(self):
 		if self.tableWidget_freq.currentItem() != None:
 			current_row = self.tableWidget_freq.currentIndex().row()
-			self.freq_target = int(self.tableWidget_freq.item(current_row, 5).text())
+			if current_row < 0:
+				self._warn_selection_required('Please select the frequency items to be summed first.')
+				return
 
-			process_time = int(self.tableWidget_freq.item(current_row, 6).text()) + 1
+			target_item = self.tableWidget_freq.item(current_row, 5)
+			target_text = target_item.text().strip() if target_item else ''
+			if target_text in ('', '-'):
+				self._warn_selection_required('Please fill in the number first.')
+				return
+			try:
+				self.freq_target = int(target_text)
+			except ValueError:
+				self._warn_selection_required('"The target must be a number."')
+				return
+
+			process_item = self.tableWidget_freq.item(current_row, 6)
+			process_text = process_item.text().strip() if process_item else ''
+			try:
+				process_time = int(process_text) + 1
+			except Exception:
+				process_time = 1
 			self.tableWidget_freq.setItem(current_row, 6, QTableWidgetItem(str(process_time)))
 
 			now_target = int(self.tableWidget_freq.item(current_row, 6).text())
@@ -4361,8 +4399,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 				cursor.setPosition(pos)  # 游标位置设置为尾部
 				self.textii2.setTextCursor(cursor)  # 滚动到游标位置
 
-			record_name = self.tableWidget_freq.item(self.freq_changing_row, 0).text() + '.csv'
-			record_file = os.path.join(self.fulldir_rec, record_name)
+			record_file = self._record_file_path(self.tableWidget_freq.item(self.freq_changing_row, 0).text())
 			out_list = []
 			item_list = []
 			comments = 'No comment'
@@ -4426,6 +4463,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		if not selected_rows and self.tableWidget_freq.currentItem() != None:
 			selected_rows = [self.tableWidget_freq.currentRow()]
 		if not selected_rows:
+			self._warn_selection_required('Please select the frequency items to be summed first.')
 			return
 		comment_text = self.textw2.toPlainText()
 		for index, row in enumerate(selected_rows):
@@ -6055,6 +6093,7 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 
 	def memo_index_change(self, i):
 		self.memo_readlater()
+		self._clear_table_selection(self.tableWidget_memo)
 
 		input_table = pd.read_csv(self.fulldirall)
 		input_table_rows = input_table.shape[0]  # 获取表格行数
@@ -6154,6 +6193,7 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 				continue
 			m += 1
 			continue
+		self._clear_table_selection(self.tableWidget_memo)
 
 	def memo_delete(self):
 		if self.tableWidget_memo.currentItem() != None:
@@ -6863,6 +6903,14 @@ style_sheet_ori = '''
 		background-color: #F3F2EE;
 		color: #000000;
 		font: 14pt Times New Roman;
+}
+	QMessageBox QPushButton {
+		min-width: 100px;
+		height: 20px;
+}
+	QInputDialog QPushButton {
+		min-width: 100px;
+		height: 20px;
 }
 '''
 
