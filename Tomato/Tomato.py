@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/ryanshen/Documents/A-workingfilewithp3.11/.venv/bin/python
 # -*- coding: utf-8 -*-
 # -*- encoding:UTF-8 -*-
 # coding=utf-8
@@ -35,10 +35,28 @@ import contextlib
 import markdown2
 from dataclasses import dataclass
 from functools import partial
+import Foundation
 try:
-	from AppKit import NSWorkspace
+	from AppKit import NSWorkspace, NSWorkspaceWillSleepNotification, NSWorkspaceDidWakeNotification
 except ImportError:
 	NSWorkspace = None
+	NSWorkspaceWillSleepNotification = None
+	NSWorkspaceDidWakeNotification = None
+try:
+	from EventKit import EKEventStore, EKEntityTypeReminder, EKAuthorizationStatusAuthorized
+except ImportError:
+	EKEventStore = None
+	EKEntityTypeReminder = None
+	EKAuthorizationStatusAuthorized = 3
+try:
+	from Foundation import NSDate, NSRunLoop, NSCalendar, NSObject
+	import objc
+except Exception:
+	NSDate = None
+	NSRunLoop = None
+	NSCalendar = None
+	NSObject = None
+	objc = None
 import requests
 import html2text
 from bs4 import BeautifulSoup
@@ -100,6 +118,77 @@ file_menu = sysmenu.addMenu("&Actions")
 file_menu.addAction(btna4)
 
 
+class SleepWakeState:
+	def __init__(self):
+		self._sleeping = False
+		self._lock = threading.Lock()
+
+	def set_sleeping(self, val):
+		with self._lock:
+			self._sleeping = bool(val)
+
+	def is_sleeping(self):
+		with self._lock:
+			return self._sleeping
+
+
+if NSObject is not None and objc is not None:
+	class SleepWakeObserver(NSObject):
+		def initWithState_(self, state):
+			self = objc.super(SleepWakeObserver, self).init()
+			if self is None:
+				return None
+			self.state = state
+			return self
+
+		def handleSleep_(self, notification):
+			self.state.set_sleeping(True)
+
+		def handleWake_(self, notification):
+			self.state.set_sleeping(False)
+else:
+	class SleepWakeObserver:
+		pass
+
+
+sleep_wake_state = SleepWakeState()
+_sleep_wake_observer = None
+
+
+def _register_sleep_wake_observer():
+	global _sleep_wake_observer
+	if not (NSWorkspace and NSWorkspaceWillSleepNotification and NSWorkspaceDidWakeNotification and NSObject and objc):
+		return
+	try:
+		_sleep_wake_observer = SleepWakeObserver.alloc().initWithState_(sleep_wake_state)
+		nc = NSWorkspace.sharedWorkspace().notificationCenter()
+		nc.addObserver_selector_name_object_(_sleep_wake_observer, "handleSleep:", NSWorkspaceWillSleepNotification, None)
+		nc.addObserver_selector_name_object_(_sleep_wake_observer, "handleWake:", NSWorkspaceDidWakeNotification, None)
+	except Exception:
+		logging.exception("Failed to register sleep/wake observer; continuing without it.")
+
+
+def _system_active():
+	if sleep_wake_state.is_sleeping():
+		return False
+	if NSWorkspace is None:
+		return True
+	try:
+		active_app = NSWorkspace.sharedWorkspace().activeApplication()
+	except Exception:
+		# If we cannot read active application, do not pause the threads
+		return True
+	if not active_app:
+		return False
+	app_name = active_app.get('NSApplicationName')
+	if not app_name or app_name == 'loginwindow':
+		return False
+	return True
+
+
+_register_sleep_wake_observer()
+
+
 class AutoRecordThread(threading.Thread):
 	def __init__(self, diary_dir):
 		super().__init__(daemon=True)
@@ -108,9 +197,18 @@ class AutoRecordThread(threading.Thread):
 		self._stop_event = threading.Event()
 		self._counter = 5
 		self._last_active_name = None
+		self._paused_logged = False
 
 	def run(self):
 		while not self._stop_event.wait(1):
+			if not _system_active():
+				if not self._paused_logged:
+					logging.info("AutoRecordThread paused (system inactive).")
+					self._paused_logged = True
+				continue
+			if self._paused_logged:
+				logging.info("AutoRecordThread resumed.")
+				self._paused_logged = False
 			self._counter -= 1
 			if self._counter <= 0:
 				try:
@@ -162,6 +260,11 @@ class ReminderSyncThread(threading.Thread):
 		self.output_queue = output_queue
 		self.interval = max(30, int(interval_seconds))
 		self._stop_event = threading.Event()
+		self._paused_logged = False
+		self._event_store = None
+		self._eventkit_warned_missing = False
+		self._eventkit_warned_denied = False
+		self._paused_logged = False
 
 	def stop(self, timeout=2.0):
 		self._stop_event.set()
@@ -170,6 +273,16 @@ class ReminderSyncThread(threading.Thread):
 
 	def run(self):
 		while not self._stop_event.is_set():
+			if not _system_active():
+				if not self._paused_logged:
+					logging.info("ReminderSyncThread paused (system inactive).")
+					self._paused_logged = True
+				if self._stop_event.wait(self.interval):
+					break
+				continue
+			if self._paused_logged:
+				logging.info("ReminderSyncThread resumed.")
+				self._paused_logged = False
 			try:
 				start_time = time.time()
 				snapshot = self._fetch_snapshot()
@@ -184,58 +297,92 @@ class ReminderSyncThread(threading.Thread):
 				break
 
 	def _fetch_snapshot(self):
-		script = r'''
-function run() {
-	var result = {status: "ok", data: []};
-	try {
-		var app = Application("Reminders");
-		var lists = app.lists.whose({name: "Tomato"});
-		if (lists.length === 0) {
-			result.status = "missing";
-			return JSON.stringify(result);
-		}
-		var reminderList = lists[0];
-		var reminders = reminderList.reminders();
-		for (var i = 0; i < reminders.length; i++) {
-			var reminder = reminders[i];
-			var due = reminder.remindMeDate();
-			if (!due) {
-				continue;
-			}
-			result.data.push({
-				id: reminder.id(),
-				name: reminder.name() || "",
-				stamp: Math.floor(due.getTime() / 1000),
-				completed: reminder.completed()
-			});
-		}
-	} catch (err) {
-		result.status = "error";
-		result.message = err.toString();
-	}
-	return JSON.stringify(result);
-}
-'''
-		try:
-			output = subprocess.check_output(
-				['osascript', '-l', 'JavaScript', '-e', script],
-				text=True
-			).strip()
-		except subprocess.CalledProcessError:
-			return None
-		if not output:
-			return None
-		try:
-			payload = json.loads(output)
-		except json.JSONDecodeError:
-			logging.warning("Unable to parse reminder snapshot: %s", output)
-			return None
-		if payload.get('status') != 'ok':
-			if payload.get('status') not in ('missing', 'error'):
-				logging.warning("Unexpected reminder snapshot status: %s", payload.get('status'))
-			return None
-		return payload.get('data', [])
+		return self._fetch_snapshot_eventkit()
 
+	def _fetch_snapshot_eventkit(self):
+		# Fast path using EventKit so we do not wake Reminders.app
+		if not EKEventStore or not NSRunLoop or not NSCalendar:
+			if not self._eventkit_warned_missing:
+				logging.warning("EventKit modules not available; reminder sync disabled (JXA disabled).")
+				self._eventkit_warned_missing = True
+			return None
+		try:
+			if self._event_store is None:
+				self._event_store = EKEventStore.alloc().init()
+			if not self._ensure_eventkit_access():
+				return None
+			calendars = [
+				cal for cal in self._event_store.calendarsForEntityType_(EKEntityTypeReminder)
+				if cal.title() == "Tomato"
+			]
+			if not calendars:
+				return []
+			# Limit window to reduce payload; adjust if you need older/future items
+			start_date = NSDate.dateWithTimeIntervalSinceNow_(-30 * 24 * 60 * 60)
+			end_date = NSDate.dateWithTimeIntervalSinceNow_(365 * 24 * 60 * 60)
+			start_ts = start_date.timeIntervalSince1970()
+			end_ts = end_date.timeIntervalSince1970()
+			# Fetch both completed and incomplete reminders so completions are detected
+			predicate = self._event_store.predicateForRemindersInCalendars_(calendars)
+			raw_reminders = self._fetch_eventkit_reminders(predicate)
+			result = []
+			calendar = NSCalendar.currentCalendar()
+			for rem in raw_reminders:
+				due_components = rem.dueDateComponents()
+				if not due_components:
+					continue
+				due_date = calendar.dateFromComponents_(due_components)
+				if not due_date:
+					continue
+				ts = due_date.timeIntervalSince1970()
+				if ts < start_ts or ts > end_ts:
+					continue
+				result.append({
+					'id': rem.calendarItemIdentifier() or "",
+					'name': rem.title() or "",
+					'stamp': int(ts),
+					'completed': bool(rem.isCompleted())
+				})
+			return result
+		except Exception:
+			logging.exception("EventKit reminder fetch failed.")
+			self._event_store = None
+			return None
+
+	def _ensure_eventkit_access(self):
+		status = EKEventStore.authorizationStatusForEntityType_(EKEntityTypeReminder)
+		if status == EKAuthorizationStatusAuthorized:
+			return True
+		if status not in (0,):  # 0 == NotDetermined
+			if not self._eventkit_warned_denied:
+				logging.warning("EventKit reminders access denied; reminder sync disabled (JXA disabled).")
+				self._eventkit_warned_denied = True
+			return False
+		done = threading.Event()
+		granted_flag = {'val': False}
+
+		def _handler(granted, error):
+			granted_flag['val'] = bool(granted)
+			done.set()
+
+		self._event_store.requestAccessToEntityType_completion_(EKEntityTypeReminder, _handler)
+		while not done.wait(0.1):
+			NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+		return granted_flag['val']
+
+	def _fetch_eventkit_reminders(self, predicate):
+		done = threading.Event()
+		results = []
+
+		def _handler(reminders):
+			if reminders:
+				results.extend(reminders)
+			done.set()
+
+		self._event_store.fetchRemindersMatchingPredicate_completion_(predicate, _handler)
+		while not done.wait(0.1):
+			NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+		return results
 
 class CalendarSyncThread(threading.Thread):
 	def __init__(self, output_queue, interval_seconds=120):
@@ -250,7 +397,19 @@ class CalendarSyncThread(threading.Thread):
 			self.join(timeout)
 
 	def run(self):
+		if not hasattr(self, '_paused_logged'):
+			self._paused_logged = False
 		while not self._stop_event.is_set():
+			if not _system_active():
+				if not self._paused_logged:
+					logging.info("CalendarSyncThread paused (system inactive).")
+					self._paused_logged = True
+				if self._stop_event.wait(self.interval):
+					break
+				continue
+			if self._paused_logged:
+				logging.info("CalendarSyncThread resumed.")
+				self._paused_logged = False
 			try:
 				start_time = time.time()
 				snapshot = self._fetch_snapshot()
@@ -662,7 +821,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.2.3', self)
+		lbl1 = QLabel('Version 1.2.4', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1125,7 +1284,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.2.3', self)
+		self.lbl = QLabel('Current Version: v1.2.4', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -2627,6 +2786,8 @@ end tell
 
 		for key in list(local_entries.keys()):
 			if key in remote_map:
+				continue
+			if local_entries[key].get('status') == 'DONE':
 				continue
 			delete_cmds = self._delete_time_row_by_key(*key)
 			if delete_cmds is not None:
