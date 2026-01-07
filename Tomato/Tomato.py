@@ -67,6 +67,17 @@ app.setQuitOnLastWindowClosed(False)
 BasePath = '/Applications/Tomato.app/Contents/Resources/'
 # BasePath = ''  # test
 
+# Configure logging with file handler for error tracking
+ERROR_LOG_PATH = BasePath + 'tomato_errors.log'
+logging.basicConfig(
+	level=logging.INFO,
+	format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s',
+	handlers=[
+		logging.FileHandler(ERROR_LOG_PATH, encoding='utf-8'),
+		logging.StreamHandler()
+	]
+)
+
 # Create the icon
 icon = QIcon(BasePath + "tmt.icns")
 
@@ -778,6 +789,54 @@ class TimeSensitiveTrayController(QObject):
 			return candidates[0]
 		return None
 
+
+class AutoCloseNotification(QDialog):
+	"""Auto-closing notification dialog for safety check warnings"""
+	def __init__(self, title, message, auto_close_seconds=5):
+		super().__init__()
+		self.auto_close_seconds = auto_close_seconds
+		self.remaining_seconds = auto_close_seconds
+		self.initUI(title, message)
+
+	def initUI(self, title, message):
+		self.setWindowTitle(title)
+		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+		self.setModal(False)  # Non-modal so it doesn't block the main thread
+
+		layout = QVBoxLayout()
+
+		# Message label
+		message_label = QLabel(message)
+		message_label.setWordWrap(True)
+		layout.addWidget(message_label)
+
+		# Countdown label
+		self.countdown_label = QLabel(f"This window will auto-close in {self.remaining_seconds} seconds")
+		self.countdown_label.setStyleSheet("color: gray; font-size: 10px;")
+		layout.addWidget(self.countdown_label)
+
+		# Close button
+		button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+		button_box.rejected.connect(self.accept)
+		layout.addWidget(button_box)
+
+		self.setLayout(layout)
+		self.resize(400, 150)
+
+		# Setup auto-close timer
+		self.timer = QTimer(self)
+		self.timer.timeout.connect(self.update_countdown)
+		self.timer.start(1000)  # Update every second
+
+	def update_countdown(self):
+		self.remaining_seconds -= 1
+		if self.remaining_seconds <= 0:
+			self.timer.stop()
+			self.accept()
+		else:
+			self.countdown_label.setText(f"This window will auto-close in {self.remaining_seconds} seconds")
+
+
 class window_about(QWidget):  # 增加说明页面(About)
 	def __init__(self):
 		super().__init__()
@@ -821,7 +880,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.2.4', self)
+		lbl1 = QLabel('Version 1.2.5', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1284,7 +1343,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.2.4', self)
+		self.lbl = QLabel('Current Version: v1.2.5', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -1484,6 +1543,8 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		self._diary_viewport_owner = {}
 		self._suppress_diary_write = False
 		self._last_local_reminder_change = 0.0
+		self._last_safety_notification_time = {}  # Track last notification time per function
+		self._safety_notification_cooldown = 60  # Cooldown in seconds to prevent spam
 		self.initUI()
 
 	def initUI(self):  # 设置窗口内布局
@@ -2560,24 +2621,31 @@ end tell
 		return os.path.join(self.fulldir_rec, f"{self._sanitize_filename(base_name)}.csv")
 
 	def _write_time_csv_from_table(self):
-		headers = []
-		for col in range(self.tableWidget.columnCount()):
-			header_item = self.tableWidget.horizontalHeaderItem(col)
-			headers.append(header_item.text() if header_item else '')
-		with open(self.fulldirall, 'w', encoding='utf8', newline='') as csv_file:
-			csv_writer = csv.writer(csv_file)
-			csv_writer.writerow(headers)
-			for row in range(self.tableWidget.rowCount()):
-				row_values = []
-				for col in range(self.tableWidget.columnCount()):
-					item = self.tableWidget.item(row, col)
-					if item and item.text() != '':
-						row_values.append(item.text())
-					elif item is None:
-						row_values.append('')
-					else:
-						row_values.append('-')
-				csv_writer.writerow(row_values)
+		if not hasattr(self, 'tableWidget') or self.tableWidget is None:
+			logging.warning("_write_time_csv_from_table: tableWidget not available, skipping")
+			self._show_safety_notification("_write_time_csv_from_table")
+			return
+		try:
+			headers = []
+			for col in range(self.tableWidget.columnCount()):
+				header_item = self.tableWidget.horizontalHeaderItem(col)
+				headers.append(header_item.text() if header_item else '')
+			with open(self.fulldirall, 'w', encoding='utf8', newline='') as csv_file:
+				csv_writer = csv.writer(csv_file)
+				csv_writer.writerow(headers)
+				for row in range(self.tableWidget.rowCount()):
+					row_values = []
+					for col in range(self.tableWidget.columnCount()):
+						item = self.tableWidget.item(row, col)
+						if item and item.text() != '':
+							row_values.append(item.text())
+						elif item is None:
+							row_values.append('')
+						else:
+							row_values.append('-')
+					csv_writer.writerow(row_values)
+		except Exception as e:
+			logging.exception("Error in _write_time_csv_from_table: %s", e)
 
 	def _table_contains_row(self, table, values):
 		col_count = len(values)
@@ -2676,6 +2744,34 @@ end tell
 			if self.reminder_sync_timer.isActive():
 				self.reminder_sync_timer.stop()
 
+	def _show_safety_notification(self, function_name):
+		"""Show auto-closing notification when safety check fails"""
+		try:
+			# Check if we recently showed a notification for this function (cooldown)
+			current_time = time.time()
+			last_time = self._last_safety_notification_time.get(function_name, 0)
+
+			if current_time - last_time < self._safety_notification_cooldown:
+				# Still in cooldown period, don't show notification
+				logging.debug(f"Skipping notification for {function_name} (in cooldown period)")
+				return
+
+			# Update last notification time
+			self._last_safety_notification_time[function_name] = current_time
+
+			# Show the notification
+			notification = AutoCloseNotification(
+				"Safety Check Warning",
+				f"Unable to access table widget in {function_name}.\n\n"
+				f"The operation will be skipped this round and retried in the next sync cycle.\n\n"
+				f"This is a protective measure to prevent crashes.",
+				auto_close_seconds=5
+			)
+			notification.show()
+		except Exception as e:
+			# If we can't even show the notification, just log it
+			logging.exception("Failed to show safety notification: %s", e)
+
 	def _process_sync_messages(self):
 		if self._sync_processing:
 			return
@@ -2683,6 +2779,10 @@ end tell
 		try:
 			self._drain_reminder_queue()
 			self._drain_calendar_queue()
+		except Exception as e:
+			# Catch all exceptions to prevent PyQt6 abort() crash
+			# Skip this round and try again next time
+			logging.exception("Error in _process_sync_messages, skipping this round: %s", e)
 		finally:
 			self._sync_processing = False
 
@@ -2749,147 +2849,177 @@ end tell
 		return message, None
 
 	def _handle_reminder_snapshot(self, snapshot):
+		# Safety check: ensure tableWidget exists
+		if not hasattr(self, 'tableWidget') or self.tableWidget is None:
+			logging.warning("_handle_reminder_snapshot: tableWidget not available, skipping")
+			self._show_safety_notification("_handle_reminder_snapshot")
+			return
+
 		if not isinstance(snapshot, list):
 			return
-		remote_map = {}
-		for entry in snapshot:
-			name = entry.get('name', '').strip()
-			stamp_value = self._normalize_stamp(entry.get('stamp'))
-			if not name or not stamp_value:
-				continue
-			remote_map[(name, stamp_value)] = entry
-		local_entries = self._collect_time_entries()
-		commands = []
-		table_changed = False
 
-		for key, entry in remote_map.items():
-			local_entry = local_entries.get(key)
-			if not local_entry:
-				continue
-			if entry.get('completed') and local_entry.get('status') == 'UNDONE':
-				row = self._find_time_row_by_key(*key)
-				if row is None:
+		try:
+			remote_map = {}
+			for entry in snapshot:
+				name = entry.get('name', '').strip()
+				stamp_value = self._normalize_stamp(entry.get('stamp'))
+				if not name or not stamp_value:
 					continue
-				rcmds, ccmds, row_done = self._complete_time_row(row, '')
-				commands.extend(rcmds + ccmds)
-				if row_done:
+				remote_map[(name, stamp_value)] = entry
+			local_entries = self._collect_time_entries()
+			commands = []
+			table_changed = False
+
+			for key, entry in remote_map.items():
+				local_entry = local_entries.get(key)
+				if not local_entry:
+					continue
+				if entry.get('completed') and local_entry.get('status') == 'UNDONE':
+					row = self._find_time_row_by_key(*key)
+					if row is None:
+						continue
+					rcmds, ccmds, row_done = self._complete_time_row(row, '')
+					commands.extend(rcmds + ccmds)
+					if row_done:
+						table_changed = True
+
+			for key, entry in remote_map.items():
+				if key in local_entries:
+					continue
+				add_cmds = self._add_time_row_from_reminder(entry)
+				if add_cmds is not None:
+					if add_cmds:
+						commands.extend(add_cmds)
 					table_changed = True
 
-		for key, entry in remote_map.items():
-			if key in local_entries:
-				continue
-			add_cmds = self._add_time_row_from_reminder(entry)
-			if add_cmds is not None:
-				if add_cmds:
-					commands.extend(add_cmds)
-				table_changed = True
+			for key in list(local_entries.keys()):
+				if key in remote_map:
+					continue
+				if local_entries[key].get('status') == 'DONE':
+					continue
+				delete_cmds = self._delete_time_row_by_key(*key)
+				if delete_cmds is not None:
+					if delete_cmds:
+						commands.extend(delete_cmds)
+					table_changed = True
 
-		for key in list(local_entries.keys()):
-			if key in remote_map:
-				continue
-			if local_entries[key].get('status') == 'DONE':
-				continue
-			delete_cmds = self._delete_time_row_by_key(*key)
-			if delete_cmds is not None:
-				if delete_cmds:
-					commands.extend(delete_cmds)
-				table_changed = True
-
-		if table_changed:
-			self._refresh_stamp_column()
-			self._write_time_csv_from_table()
-			with contextlib.suppress(Exception):
-				self.tableWidget.sortByColumn(8, Qt.SortOrder.AscendingOrder)
-		if commands:
-			self._run_osascript_batch(commands)
+			if table_changed:
+				self._refresh_stamp_column()
+				self._write_time_csv_from_table()
+				with contextlib.suppress(Exception):
+					self.tableWidget.sortByColumn(8, Qt.SortOrder.AscendingOrder)
+			if commands:
+				self._run_osascript_batch(commands)
+		except Exception as e:
+			logging.exception("Error in _handle_reminder_snapshot: %s", e)
 
 	def _handle_calendar_snapshot(self, snapshot, snapshot_ts=None):
+		# Safety check: ensure tableWidget exists
+		if not hasattr(self, 'tableWidget') or self.tableWidget is None:
+			logging.warning("_handle_calendar_snapshot: tableWidget not available, skipping")
+			self._show_safety_notification("_handle_calendar_snapshot")
+			return
+
 		if not isinstance(snapshot, list):
 			return
 		if snapshot_ts and self._last_reminder_snapshot_ts:
 			if snapshot_ts + 300 < self._last_reminder_snapshot_ts:
 				return
-		calendar_map = {}
-		for entry in snapshot:
-			name = (entry.get('name') or '').strip()
-			stamp_value = self._normalize_stamp(entry.get('stamp'))
-			if not name or not stamp_value:
-				continue
-			calendar_map[(name, stamp_value)] = entry
-		local_entries = self._collect_time_entries()
-		if not local_entries and not calendar_map:
-			return
 
-		commands = []
-		table_changed = False
+		try:
+			calendar_map = {}
+			for entry in snapshot:
+				name = (entry.get('name') or '').strip()
+				stamp_value = self._normalize_stamp(entry.get('stamp'))
+				if not name or not stamp_value:
+					continue
+				calendar_map[(name, stamp_value)] = entry
+			local_entries = self._collect_time_entries()
+			if not local_entries and not calendar_map:
+				return
 
-		# Handle time change (same name, different stamp) when unique
-		name_to_local = {}
-		for (lname, lstamp), info in local_entries.items():
-			name_to_local.setdefault(lname, []).append((lstamp, info))
+			commands = []
+			table_changed = False
 
-		for (cname, cstamp), entry in calendar_map.items():
-			locals_for_name = name_to_local.get(cname, [])
-			if (cname, cstamp) in local_entries:
-				continue
-			if len(locals_for_name) == 1:
-				old_stamp, info = locals_for_name[0]
-				row = info.get('row')
-				if row is not None and self._update_time_row_from_calendar(row, entry):
-					commands.extend(self._build_reminder_update_command(cname, old_stamp, cstamp))
+			# Handle time change (same name, different stamp) when unique
+			name_to_local = {}
+			for (lname, lstamp), info in local_entries.items():
+				name_to_local.setdefault(lname, []).append((lstamp, info))
+
+			for (cname, cstamp), entry in calendar_map.items():
+				locals_for_name = name_to_local.get(cname, [])
+				if (cname, cstamp) in local_entries:
+					continue
+				if len(locals_for_name) == 1:
+					old_stamp, info = locals_for_name[0]
+					row = info.get('row')
+					if row is not None and self._update_time_row_from_calendar(row, entry):
+						commands.extend(self._build_reminder_update_command(cname, old_stamp, cstamp))
+						table_changed = True
+						local_entries.pop((cname, old_stamp), None)
+						local_entries[(cname, cstamp)] = info
+
+			# Additions
+			for key, entry in calendar_map.items():
+				if key in local_entries:
+					continue
+				add_cmds = self._add_time_row_from_calendar(entry)
+				if add_cmds is not None:
+					if add_cmds:
+						commands.extend(add_cmds)
 					table_changed = True
-					local_entries.pop((cname, old_stamp), None)
-					local_entries[(cname, cstamp)] = info
 
-		# Additions
-		for key, entry in calendar_map.items():
-			if key in local_entries:
-				continue
-			add_cmds = self._add_time_row_from_calendar(entry)
-			if add_cmds is not None:
-				if add_cmds:
-					commands.extend(add_cmds)
-				table_changed = True
+			# Deletions
+			for key, info in list(local_entries.items()):
+				if key in calendar_map:
+					continue
+				row = info.get('row')
+				if row is None:
+					continue
+				del_cmds = self._delete_time_row_by_key(key[0], key[1])
+				if del_cmds is not None:
+					if del_cmds:
+						commands.extend(del_cmds)
+					table_changed = True
 
-		# Deletions
-		for key, info in list(local_entries.items()):
-			if key in calendar_map:
-				continue
-			row = info.get('row')
-			if row is None:
-				continue
-			del_cmds = self._delete_time_row_by_key(key[0], key[1])
-			if del_cmds is not None:
-				if del_cmds:
-					commands.extend(del_cmds)
-				table_changed = True
-
-		if table_changed:
-			self._refresh_stamp_column()
-			self._write_time_csv_from_table()
-			with contextlib.suppress(Exception):
-				self.tableWidget.sortByColumn(8, Qt.SortOrder.AscendingOrder)
-		if commands:
-			self._run_osascript_batch(commands)
+			if table_changed:
+				self._refresh_stamp_column()
+				self._write_time_csv_from_table()
+				with contextlib.suppress(Exception):
+					self.tableWidget.sortByColumn(8, Qt.SortOrder.AscendingOrder)
+			if commands:
+				self._run_osascript_batch(commands)
+		except Exception as e:
+			logging.exception("Error in _handle_calendar_snapshot: %s", e)
 
 	def _collect_time_entries(self):
-		entries = {}
-		for row in range(self.tableWidget.rowCount()):
-			type_item = self.tableWidget.item(row, 7)
-			if type_item is None or type_item.text() != 'TIME_SNS':
-				continue
-			name_item = self.tableWidget.item(row, 0)
-			if name_item is None or name_item.text() == '':
-				continue
-			stamp_value = self._stamp_from_items(self.tableWidget.item(row, 8), self.tableWidget.item(row, 1))
-			if not stamp_value:
-				continue
-			status_item = self.tableWidget.item(row, 4)
-			entries[(name_item.text(), stamp_value)] = {
-				'status': status_item.text() if status_item else '',
-				'row': row
-			}
-		return entries
+		# Safety check: ensure tableWidget exists and is valid
+		if not hasattr(self, 'tableWidget') or self.tableWidget is None:
+			logging.warning("_collect_time_entries: tableWidget not available, skipping")
+			self._show_safety_notification("_collect_time_entries")
+			return {}
+
+		try:
+			entries = {}
+			for row in range(self.tableWidget.rowCount()):
+				type_item = self.tableWidget.item(row, 7)
+				if type_item is None or type_item.text() != 'TIME_SNS':
+					continue
+				name_item = self.tableWidget.item(row, 0)
+				if name_item is None or name_item.text() == '':
+					continue
+				stamp_value = self._stamp_from_items(self.tableWidget.item(row, 8), self.tableWidget.item(row, 1))
+				if not stamp_value:
+					continue
+				status_item = self.tableWidget.item(row, 4)
+				entries[(name_item.text(), stamp_value)] = {
+					'status': status_item.text() if status_item else '',
+					'row': row
+				}
+			return entries
+		except Exception as e:
+			logging.exception("Error in _collect_time_entries: %s", e)
+			return {}
 
 	def _normalize_stamp(self, value):
 		if value in (None, ''):
@@ -2912,18 +3042,26 @@ end tell
 		return ''
 
 	def _find_time_row_by_key(self, name, stamp_value):
-		target_stamp = self._normalize_stamp(stamp_value)
-		for row in range(self.tableWidget.rowCount()):
-			type_item = self.tableWidget.item(row, 7)
-			if type_item is None or type_item.text() != 'TIME_SNS':
-				continue
-			name_item = self.tableWidget.item(row, 0)
-			if name_item is None:
-				continue
-			row_stamp = self._stamp_from_items(self.tableWidget.item(row, 8), self.tableWidget.item(row, 1))
-			if name_item.text() == name and row_stamp == target_stamp:
-				return row
-		return None
+		if not hasattr(self, 'tableWidget') or self.tableWidget is None:
+			logging.warning("_find_time_row_by_key: tableWidget not available, skipping")
+			self._show_safety_notification("_find_time_row_by_key")
+			return None
+		try:
+			target_stamp = self._normalize_stamp(stamp_value)
+			for row in range(self.tableWidget.rowCount()):
+				type_item = self.tableWidget.item(row, 7)
+				if type_item is None or type_item.text() != 'TIME_SNS':
+					continue
+				name_item = self.tableWidget.item(row, 0)
+				if name_item is None:
+					continue
+				row_stamp = self._stamp_from_items(self.tableWidget.item(row, 8), self.tableWidget.item(row, 1))
+				if name_item.text() == name and row_stamp == target_stamp:
+					return row
+			return None
+		except Exception as e:
+			logging.exception("Error in _find_time_row_by_key: %s", e)
+			return None
 
 	def _add_time_row_from_reminder(self, entry):
 		name = entry.get('name', '').strip()
@@ -3041,14 +3179,21 @@ end tell""" % (escaped_name, old_time, new_time)
 		return [cmd]
 
 	def _refresh_stamp_column(self):
-		for row in range(self.tableWidget.rowCount()):
-			time_item = self.tableWidget.item(row, 1)
-			if not time_item or time_item.text() == '':
-				continue
-			with contextlib.suppress(Exception):
-				stamp_str = self._normalize_stamp(self.to_stamp(time_item.text()))
-				if stamp_str:
-					self.tableWidget.setItem(row, 8, QTableWidgetItem(stamp_str))
+		if not hasattr(self, 'tableWidget') or self.tableWidget is None:
+			logging.warning("_refresh_stamp_column: tableWidget not available, skipping")
+			self._show_safety_notification("_refresh_stamp_column")
+			return
+		try:
+			for row in range(self.tableWidget.rowCount()):
+				time_item = self.tableWidget.item(row, 1)
+				if not time_item or time_item.text() == '':
+					continue
+				with contextlib.suppress(Exception):
+					stamp_str = self._normalize_stamp(self.to_stamp(time_item.text()))
+					if stamp_str:
+						self.tableWidget.setItem(row, 8, QTableWidgetItem(stamp_str))
+		except Exception as e:
+			logging.exception("Error in _refresh_stamp_column: %s", e)
 
 
 	def refresh(self):
