@@ -3,7 +3,7 @@
 
 block_cipher = None
 
-__version__ = '1.2.5'
+__version__ = '1.2.6'
 
 a = Analysis(
     ['Tomato.py'],

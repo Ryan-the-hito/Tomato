@@ -880,7 +880,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.2.5', self)
+		lbl1 = QLabel('Version 1.2.6', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1343,7 +1343,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.2.5', self)
+		self.lbl = QLabel('Current Version: v1.2.6', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -3627,6 +3627,10 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
 		diary_name = str(theTime) + ".md"
 		diary_file = os.path.join(self.fulldir_dia, diary_name)
+		if not os.path.exists(diary_file):
+			os.makedirs(self.fulldir_dia, exist_ok=True)
+			with open(diary_file, 'a', encoding='utf-8') as f0:
+				f0.write(f'# {theTime}')
 		contm = codecs.open(diary_file, 'r', encoding='utf-8').read()
 		self.textii1.setText(contm)
 		self.textii1.ensureCursorVisible()
