@@ -11,9 +11,9 @@ from PyQt6.QtWidgets import (QWidget, QPushButton, QApplication,
 							 QPlainTextEdit, QTabWidget, QTextEdit, QGraphicsOpacityEffect,
 							 QTableWidget, QTableWidgetItem, QAbstractItemView, QInputDialog,
 							 QMessageBox, QSplitter, QDialogButtonBox, QListWidget, QListWidgetItem, QCheckBox,
-							 QStackedWidget, QTextBrowser)
+							 QStackedWidget, QTextBrowser, QStyledItemDelegate)
 from PyQt6.QtCore import Qt, QRect, QPropertyAnimation, QDate, QTime, QTimer, QObject, QEvent
-from PyQt6.QtGui import QAction, QIcon, QColor, QCursor, QGuiApplication
+from PyQt6.QtGui import QAction, QActionGroup, QIcon, QColor, QCursor, QGuiApplication
 import PyQt6.QtGui
 import sys
 import webbrowser
@@ -104,6 +104,24 @@ action4 = QAction("👀 Auto-record!")
 action4.setCheckable(True)
 menu.addAction(action4)
 
+action_auto_record_startup = QAction("🔄 Auto-record on startup")
+action_auto_record_startup.setCheckable(True)
+menu.addAction(action_auto_record_startup)
+
+# Submenu for repeat pre-generation count
+repeat_pregenerate_menu = menu.addMenu("🔁 Repeat pre-generate count")
+repeat_pregenerate_actions = []
+repeat_pregenerate_action_group = QActionGroup(menu)
+repeat_pregenerate_action_group.setExclusive(True)
+for i in range(1, 16):
+	action = QAction(f"{i}", menu)
+	action.setCheckable(True)
+	action.setActionGroup(repeat_pregenerate_action_group)
+	if i == 10:  # Default value
+		action.setChecked(True)
+	repeat_pregenerate_menu.addAction(action)
+	repeat_pregenerate_actions.append(action)
+
 menu.addSeparator()
 
 action2 = QAction("🆕 Check for Updates")
@@ -192,7 +210,7 @@ def _system_active():
 	if not active_app:
 		return False
 	app_name = active_app.get('NSApplicationName')
-	if not app_name or app_name == 'loginwindow':
+	if not app_name or app_name == 'loginwindow' or app_name == 'Reminders' or app_name == 'Calendar':
 		return False
 	return True
 
@@ -493,6 +511,39 @@ function run() {
 		return payload.get('data', [])
 
 
+class AppleScriptWorkerSignals(QObject):
+	"""Signals for AppleScriptWorker to communicate with main thread"""
+	started = PyQt6.QtCore.pyqtSignal()
+	finished = PyQt6.QtCore.pyqtSignal()
+	error = PyQt6.QtCore.pyqtSignal(str)
+
+
+class AppleScriptWorker(threading.Thread):
+	"""
+	Background thread for executing AppleScript commands.
+	Communicates with main thread via Qt signals.
+	"""
+	def __init__(self, script_chunks, signals):
+		super().__init__(daemon=True)
+		self.script_chunks = script_chunks
+		self.signals = signals
+		self._result = None
+		self._error = None
+
+	def run(self):
+		if not self.script_chunks:
+			self.signals.finished.emit()
+			return
+		script = '\n'.join(self.script_chunks)
+		try:
+			subprocess.call(['osascript', '-e', script])
+		except Exception as e:
+			self._error = str(e)
+			self.signals.error.emit(str(e))
+		finally:
+			self.signals.finished.emit()
+
+
 @dataclass
 class TimeSensitiveTask:
 	task_id: str
@@ -790,6 +841,373 @@ class TimeSensitiveTrayController(QObject):
 		return None
 
 
+class TableEditDelegate(QStyledItemDelegate):
+	"""
+	Custom delegate to detect when table cell editing starts and ends.
+	This allows keyboard-based editing to trigger the same save logic as mouse clicks.
+	"""
+	editing_started = PyQt6.QtCore.pyqtSignal(int, int)  # row, column
+	editing_finished = PyQt6.QtCore.pyqtSignal(int, int)  # row, column
+
+	def __init__(self, parent=None):
+		super().__init__(parent)
+		self._current_edit_index = None
+
+	def createEditor(self, parent, option, index):
+		"""Called when editing begins - emit editing_started signal"""
+		self._current_edit_index = (index.row(), index.column())
+		self.editing_started.emit(index.row(), index.column())
+		return super().createEditor(parent, option, index)
+
+	def destroyEditor(self, editor, index):
+		"""Called when editing ends - emit editing_finished signal"""
+		if self._current_edit_index is not None:
+			row, col = self._current_edit_index
+			self._current_edit_index = None
+			self.editing_finished.emit(row, col)
+		super().destroyEditor(editor, index)
+
+
+class ClockPickerPopup(QWidget):
+	"""A hover-triggered clock picker popup for selecting time"""
+	time_changed = PyQt6.QtCore.pyqtSignal(QTime)
+
+	def __init__(self, parent=None):
+		super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+		self.selected_hour = 12
+		self.selected_minute = 0
+		self.selecting_hour = True
+		self._target_widget = None
+		self._hide_timer = QTimer(self)
+		self._hide_timer.setSingleShot(True)
+		self._hide_timer.timeout.connect(self._check_and_hide)
+		self.initUI()
+
+	def initUI(self):
+		self.setFixedSize(220, 280)
+
+		layout = QVBoxLayout()
+		layout.setContentsMargins(6, 6, 6, 6)
+		layout.setSpacing(4)
+
+		# Time display at top
+		self.time_display = QLabel()
+		self.time_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
+		self.time_display.setStyleSheet("""
+			QLabel {
+				font-size: 22px;
+				font-weight: bold;
+				padding: 5px;
+				background-color: #2196F3;
+				color: white;
+				border-radius: 4px;
+			}
+		""")
+		self.update_time_display()
+		layout.addWidget(self.time_display)
+
+		# Mode toggle buttons
+		mode_layout = QHBoxLayout()
+		mode_layout.setSpacing(4)
+		self.hour_btn = QPushButton('Hour')
+		self.minute_btn = QPushButton('Minute')
+		self.hour_btn.setCheckable(True)
+		self.minute_btn.setCheckable(True)
+		self.hour_btn.setChecked(True)
+		self.hour_btn.setFixedHeight(22)
+		self.minute_btn.setFixedHeight(22)
+		self.hour_btn.clicked.connect(lambda: self.set_mode(True))
+		self.minute_btn.clicked.connect(lambda: self.set_mode(False))
+		mode_layout.addWidget(self.hour_btn)
+		mode_layout.addWidget(self.minute_btn)
+		layout.addLayout(mode_layout)
+
+		# Clock face widget
+		self.clock_widget = ClockFaceWidget(self)
+		self.clock_widget.setFixedSize(200, 200)
+		self.clock_widget.time_selected.connect(self.on_clock_selection)
+		clock_layout = QHBoxLayout()
+		clock_layout.setContentsMargins(0, 0, 0, 0)
+		clock_layout.addStretch()
+		clock_layout.addWidget(self.clock_widget)
+		clock_layout.addStretch()
+		layout.addLayout(clock_layout)
+
+		self.setLayout(layout)
+		self.setStyleSheet("""
+			ClockPickerPopup {
+				background-color: white;
+				border: 1px solid #ccc;
+				border-radius: 6px;
+			}
+		""")
+
+	def set_target_widget(self, widget):
+		self._target_widget = widget
+
+	def set_time(self, time):
+		self.selected_hour = time.hour()
+		self.selected_minute = time.minute()
+		self.update_time_display()
+		self.update_clock()
+
+	def set_mode(self, selecting_hour):
+		self.selecting_hour = selecting_hour
+		self.hour_btn.setChecked(selecting_hour)
+		self.minute_btn.setChecked(not selecting_hour)
+		self.update_clock()
+
+	def update_time_display(self):
+		self.time_display.setText(f'{self.selected_hour:02d}:{self.selected_minute:02d}')
+
+	def update_clock(self):
+		self.clock_widget.set_mode(self.selecting_hour, self.selected_hour, self.selected_minute)
+
+	def on_clock_selection(self, value):
+		if self.selecting_hour:
+			self.selected_hour = value
+			self.set_mode(False)
+		else:
+			self.selected_minute = value
+		self.update_time_display()
+		self.update_clock()
+		self.time_changed.emit(QTime(self.selected_hour, self.selected_minute))
+
+	def get_time(self):
+		return QTime(self.selected_hour, self.selected_minute)
+
+	def showAt(self, global_pos):
+		self.move(global_pos)
+		self.show()
+		self.update_clock()
+
+	def enterEvent(self, event):
+		self._hide_timer.stop()
+		super().enterEvent(event)
+
+	def leaveEvent(self, event):
+		self._hide_timer.start(600)
+		super().leaveEvent(event)
+
+	def _check_and_hide(self):
+		if self._target_widget and self._target_widget.underMouse():
+			return
+		if self.underMouse():
+			return
+		self.hide()
+
+
+class ClockFaceWidget(QWidget):
+	"""Custom widget that draws a clock face for time selection"""
+	time_selected = PyQt6.QtCore.pyqtSignal(int)
+
+	def __init__(self, parent=None):
+		super().__init__(parent)
+		self.selecting_hour = True
+		self.current_hour = 12
+		self.current_minute = 0
+		self.hovered_value = None
+		self.setMouseTracking(True)
+		# Store positions for accurate hit detection
+		self._outer_positions = []  # [(x, y, hour), ...]
+		self._inner_positions = []  # [(x, y, hour), ...]
+		self._minute_positions = []  # [(x, y, minute), ...]
+
+	def set_mode(self, selecting_hour, hour, minute):
+		self.selecting_hour = selecting_hour
+		self.current_hour = hour
+		self.current_minute = minute
+		self.hovered_value = None
+		self.update()
+
+	def paintEvent(self, event):
+		import math
+		painter = PyQt6.QtGui.QPainter(self)
+		painter.setRenderHint(PyQt6.QtGui.QPainter.RenderHint.Antialiasing)
+
+		center_x = self.width() // 2
+		center_y = self.height() // 2
+		radius = min(center_x, center_y) - 3
+
+		# Background circle
+		painter.setBrush(QColor(245, 245, 245))
+		painter.setPen(QColor(220, 220, 220))
+		painter.drawEllipse(center_x - radius, center_y - radius, radius * 2, radius * 2)
+
+		# Clear position caches
+		self._outer_positions = []
+		self._inner_positions = []
+		self._minute_positions = []
+
+		if self.selecting_hour:
+			outer_radius = radius - 18
+			inner_radius = radius - 42
+
+			# Outer ring: 12, 1-11 (12 at top)
+			font = PyQt6.QtGui.QFont()
+			font.setPointSize(11)
+			font.setBold(False)
+			painter.setFont(font)
+
+			for i in range(12):
+				hour = 12 if i == 0 else i
+				angle = math.radians(i * 30 - 90)
+				x = center_x + int(outer_radius * math.cos(angle))
+				y = center_y + int(outer_radius * math.sin(angle))
+				self._outer_positions.append((x, y, hour))
+
+				is_selected = (self.current_hour == hour)
+				is_hovered = (self.hovered_value == hour)
+
+				if is_selected:
+					painter.setBrush(QColor(33, 150, 243))
+					painter.setPen(Qt.PenStyle.NoPen)
+					painter.drawEllipse(x - 13, y - 13, 26, 26)
+					painter.setPen(QColor(255, 255, 255))
+				elif is_hovered:
+					painter.setBrush(QColor(200, 220, 240))
+					painter.setPen(Qt.PenStyle.NoPen)
+					painter.drawEllipse(x - 13, y - 13, 26, 26)
+					painter.setPen(QColor(0, 0, 0))
+				else:
+					painter.setPen(QColor(0, 0, 0))
+
+				rect = PyQt6.QtCore.QRect(x - 13, y - 8, 26, 16)
+				painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(hour))
+
+			# Inner ring: 0, 13-23 (0 at top)
+			font.setPointSize(9)
+			painter.setFont(font)
+
+			for i in range(12):
+				hour = 0 if i == 0 else i + 12
+				angle = math.radians(i * 30 - 90)
+				x = center_x + int(inner_radius * math.cos(angle))
+				y = center_y + int(inner_radius * math.sin(angle))
+				self._inner_positions.append((x, y, hour))
+
+				is_selected = (self.current_hour == hour)
+				is_hovered = (self.hovered_value == hour)
+
+				if is_selected:
+					painter.setBrush(QColor(33, 150, 243))
+					painter.setPen(Qt.PenStyle.NoPen)
+					painter.drawEllipse(x - 11, y - 11, 22, 22)
+					painter.setPen(QColor(255, 255, 255))
+				elif is_hovered:
+					painter.setBrush(QColor(200, 220, 240))
+					painter.setPen(Qt.PenStyle.NoPen)
+					painter.drawEllipse(x - 11, y - 11, 22, 22)
+					painter.setPen(QColor(80, 80, 80))
+				else:
+					painter.setPen(QColor(80, 80, 80))
+
+				rect = PyQt6.QtCore.QRect(x - 11, y - 7, 22, 14)
+				painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(hour))
+
+			# Draw hand
+			if self.current_hour == 0 or self.current_hour > 12:
+				hand_radius = inner_radius
+				hour_for_angle = 0 if self.current_hour == 0 else self.current_hour - 12
+			else:
+				hand_radius = outer_radius
+				hour_for_angle = self.current_hour
+			angle = math.radians(hour_for_angle * 30 - 90)
+			hand_x = center_x + int(hand_radius * math.cos(angle))
+			hand_y = center_y + int(hand_radius * math.sin(angle))
+
+		else:
+			# Minutes
+			num_radius = radius - 18
+			font = PyQt6.QtGui.QFont()
+			font.setPointSize(11)
+			painter.setFont(font)
+
+			for i in range(12):
+				minute = i * 5
+				angle = math.radians(i * 30 - 90)
+				x = center_x + int(num_radius * math.cos(angle))
+				y = center_y + int(num_radius * math.sin(angle))
+				self._minute_positions.append((x, y, minute))
+
+				is_selected = (self.current_minute == minute)
+				is_hovered = (self.hovered_value == minute)
+
+				if is_selected:
+					painter.setBrush(QColor(33, 150, 243))
+					painter.setPen(Qt.PenStyle.NoPen)
+					painter.drawEllipse(x - 13, y - 13, 26, 26)
+					painter.setPen(QColor(255, 255, 255))
+				elif is_hovered:
+					painter.setBrush(QColor(200, 220, 240))
+					painter.setPen(Qt.PenStyle.NoPen)
+					painter.drawEllipse(x - 13, y - 13, 26, 26)
+					painter.setPen(QColor(0, 0, 0))
+				else:
+					painter.setPen(QColor(0, 0, 0))
+
+				rect = PyQt6.QtCore.QRect(x - 13, y - 8, 26, 16)
+				painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(minute).zfill(2))
+
+			# Draw hand for minutes
+			angle = math.radians(self.current_minute * 6 - 90)
+			hand_radius = num_radius
+			hand_x = center_x + int(hand_radius * math.cos(angle))
+			hand_y = center_y + int(hand_radius * math.sin(angle))
+
+		# Draw center dot
+		painter.setBrush(QColor(33, 150, 243))
+		painter.setPen(Qt.PenStyle.NoPen)
+		painter.drawEllipse(center_x - 4, center_y - 4, 8, 8)
+
+		# Draw hand line
+		painter.setPen(PyQt6.QtGui.QPen(QColor(33, 150, 243), 2))
+		painter.drawLine(center_x, center_y, hand_x, hand_y)
+
+	def mouseMoveEvent(self, event):
+		value = self._get_value_at_pos(event.position())
+		if value != self.hovered_value:
+			self.hovered_value = value
+			self.update()
+
+	def mousePressEvent(self, event):
+		value = self._get_value_at_pos(event.position())
+		if value is not None:
+			self.time_selected.emit(value)
+
+	def leaveEvent(self, event):
+		self.hovered_value = None
+		self.update()
+		super().leaveEvent(event)
+
+	def _get_value_at_pos(self, pos):
+		"""Find which number was clicked/hovered using stored positions"""
+		import math
+		px, py = pos.x(), pos.y()
+
+		if self.selecting_hour:
+			# Check inner ring first (smaller hit area, higher priority)
+			for x, y, hour in self._inner_positions:
+				dist = math.sqrt((px - x) ** 2 + (py - y) ** 2)
+				if dist <= 14:
+					return hour
+
+			# Check outer ring
+			for x, y, hour in self._outer_positions:
+				dist = math.sqrt((px - x) ** 2 + (py - y) ** 2)
+				if dist <= 16:
+					return hour
+		else:
+			# Check minute positions
+			for x, y, minute in self._minute_positions:
+				dist = math.sqrt((px - x) ** 2 + (py - y) ** 2)
+				if dist <= 16:
+					return minute
+
+		return None
+
+
 class AutoCloseNotification(QDialog):
 	"""Auto-closing notification dialog for safety check warnings"""
 	def __init__(self, title, message, auto_close_seconds=5):
@@ -880,7 +1298,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.2.6', self)
+		lbl1 = QLabel('Version 1.2.7', self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1343,7 +1761,7 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 
 	def initUI(self):  # 说明页面内信息
 
-		self.lbl = QLabel('Current Version: v1.2.6', self)
+		self.lbl = QLabel('Current Version: v1.2.7', self)
 		self.lbl.move(30, 45)
 
 		lbl0 = QLabel('Download Update:', self)
@@ -1569,6 +1987,9 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		self.fulldir_collection = os.path.join(fulldir1, tarname_collection)
 		if not os.path.exists(self.fulldir_collection):
 			os.mkdir(self.fulldir_collection)
+		# Settings file for app preferences
+		self.settings_file = os.path.join(fulldir1, 'app_settings.json')
+		self._load_app_settings()
 		self.setUpMainWindow()
 		MOST_WEIGHT = int(self.screen().availableGeometry().width() * 0.75)
 		HALF_WEIGHT = int(self.screen().availableGeometry().width() / 2)
@@ -1725,7 +2146,48 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 				self._collection_toggle_opacity.setOpacity(0.2)
 		if obj == getattr(self, 'collection_view_stack', None) and event.type() == QEvent.Type.Resize:
 			self._position_collection_toggle_button()
+		# Handle time_edit hover for clock picker (all time edits)
+		time_edit_popup_map = self._get_time_edit_popup_map()
+		if obj in time_edit_popup_map:
+			popup = time_edit_popup_map[obj]
+			if event.type() == QEvent.Type.Enter:
+				# Use a timer to delay showing the popup
+				if not hasattr(self, '_clock_hover_timers'):
+					self._clock_hover_timers = {}
+				if obj not in self._clock_hover_timers:
+					timer = QTimer(self)
+					timer.setSingleShot(True)
+					timer.timeout.connect(lambda te=obj, p=popup: self._show_clock_picker_for(te, p))
+					self._clock_hover_timers[obj] = timer
+				self._clock_hover_timers[obj].start(200)
+			elif event.type() == QEvent.Type.Leave:
+				if hasattr(self, '_clock_hover_timers') and obj in self._clock_hover_timers:
+					self._clock_hover_timers[obj].stop()
+				if popup.isVisible():
+					popup._hide_timer.start(600)
 		return super().eventFilter(obj, event)
+
+	def _get_time_edit_popup_map(self):
+		"""Return a mapping of time_edit widgets to their clock picker popups"""
+		mapping = {}
+		if hasattr(self, 'time_edit') and hasattr(self, 'clock_picker_popup'):
+			mapping[self.time_edit] = self.clock_picker_popup
+		if hasattr(self, 'freq_time_edit') and hasattr(self, 'freq_clock_picker_popup'):
+			mapping[self.freq_time_edit] = self.freq_clock_picker_popup
+		if hasattr(self, 'memo_time_edit') and hasattr(self, 'memo_clock_picker_popup'):
+			mapping[self.memo_time_edit] = self.memo_clock_picker_popup
+		if hasattr(self, 'collect_time_edit') and hasattr(self, 'collect_clock_picker_popup'):
+			mapping[self.collect_time_edit] = self.collect_clock_picker_popup
+		return mapping
+
+	def _show_clock_picker_for(self, time_edit, popup):
+		"""Show the clock picker popup above the time_edit widget"""
+		popup.set_time(time_edit.time())
+		popup.set_mode(True)  # Start with hour selection
+		# Position above the time_edit (subtract popup height from top-left position)
+		top_left = time_edit.mapToGlobal(time_edit.rect().topLeft())
+		global_pos = PyQt6.QtCore.QPoint(top_left.x(), top_left.y() - popup.height())
+		popup.showAt(global_pos)
 
 	def assigntoall(self):
 		cmd = """osascript -e '''on run
@@ -1960,6 +2422,12 @@ end tell
 
 		self.tableWidget.itemClicked.connect(self.write_table_time)
 		self.tableWidget.itemDoubleClicked.connect(self.change_write)
+
+		# Setup delegate for keyboard-based editing detection
+		self._table_delegate = TableEditDelegate(self.tableWidget)
+		self.tableWidget.setItemDelegate(self._table_delegate)
+		self._table_delegate.editing_started.connect(self._on_table_edit_started)
+		self._table_delegate.editing_finished.connect(self._on_table_edit_finished)
 		#self.tableWidget.setFixedHeight(int(self.height() * 2 / 3))
 
 		t1 = QWidget()
@@ -1978,7 +2446,13 @@ end tell
 		self.time_edit.setDisplayFormat('HH:mm')
 		self.time_edit.setTime(QTime.currentTime())
 		self.time_edit.setFixedHeight(20)
-		self.time_edit.setToolTip('Choose Time')
+		self.time_edit.setToolTip('Hover to open clock picker')
+		self.time_edit.installEventFilter(self)
+
+		# Clock picker popup (hover triggered)
+		self.clock_picker_popup = ClockPickerPopup()
+		self.clock_picker_popup.set_target_widget(self.time_edit)
+		self.clock_picker_popup.time_changed.connect(lambda t: self.time_edit.setTime(t))
 
 		self._time_unit_items = [
 			('None', None),
@@ -2150,6 +2624,12 @@ end tell
 		self.tableWidget_record = QTableWidget()
 		self.tableWidget_record.setObjectName("small")
 		self.tableWidget_record.itemClicked.connect(self.record_write)
+
+		# # Setup delegate for keyboard-based editing detection
+		# self._table_record_delegate = TableEditDelegate(self.tableWidget_record)
+		# self.tableWidget_record.setItemDelegate(self._table_record_delegate)
+		# self._table_record_delegate.editing_finished.connect(self._on_record_edit_finished)
+
 		input_table = pd.read_csv(BasePath + 'Record.csv')
 		input_table_rows = input_table.shape[0]  # 获取表格行数
 		input_table_colunms = input_table.shape[1]  # 获取表格列数
@@ -2261,6 +2741,8 @@ end tell
 		cursor.setPosition(pos)  # 游标位置设置为尾部
 		self.textii1.setTextCursor(cursor)  # 滚动到游标位置
 		if self.tableWidget.currentItem() != None and self.tableWidget.item(self.tableWidget.currentRow(), 3).text() != '-':
+			# Has repeat - show history records and enable editing
+			self.tableWidget_record.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed | QAbstractItemView.EditTrigger.AnyKeyPressed)
 			record_file = self._record_file_path(self.tableWidget.item(self.tableWidget.currentRow(), 0).text())
 			if not os.path.exists(record_file):
 				title_list = [['Time', 'Comments']]
@@ -2306,6 +2788,18 @@ end tell
 				leng_small = self.tableWidget_record.width()
 				self.tableWidget_record.setColumnWidth(0, int(leng_small / 2))
 				self.tableWidget_record.setColumnWidth(1, int(leng_small / 2))
+		else:
+			# No repeat - show placeholder message and disable editing
+			self.tableWidget_record.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+			self.tableWidget_record.setColumnCount(1)
+			self.tableWidget_record.setRowCount(1)
+			self.tableWidget_record.setHorizontalHeaderLabels(['History'])
+			self.tableWidget_record.verticalHeader().setVisible(False)
+			placeholder_item = QTableWidgetItem('No history records available\n(This item has no repeat)')
+			placeholder_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+			placeholder_item.setFlags(placeholder_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+			self.tableWidget_record.setItem(0, 0, placeholder_item)
+			self.tableWidget_record.setColumnWidth(0, self.tableWidget_record.width())
 		if self.changing_bool == 1:
 			if (self.changing_column == 0 or self.changing_column == 1 or self.changing_column == 2) and self.tableWidget.item(self.changing_row, 4).text() == 'UNDONE':
 				old_text = self.changing_text
@@ -2316,7 +2810,7 @@ end tell
 				escaped_old_text = self._escape_applescript_string(old_text)
 				cmd = """tell application "Reminders"
 					set mylist to list "Tomato"
-					set reminderName to "%s" 
+					set reminderName to "%s"
 					tell mylist
 						delete (reminders whose (name is reminderName) and (remind me date is date "%s"))
 					end tell
@@ -2348,8 +2842,23 @@ end tell
 				  end tell
 				end tell""" % (escaped_new_text, otherStyleTime, otherStyleTime, new_leng)
 				self._run_osascript_batch([cmd, cmd2])
-			if self.changing_column == 3:
-				pass
+				# Sync name change to all related repeat tasks (if this is a repeat task and name changed)
+				if self.changing_column == 0 and hasattr(self, 'changing_repeat') and self.changing_repeat not in ('', '-'):
+					if old_text != new_text:
+						sync_cmds = self._sync_repeat_task_changes(
+							old_text, self.changing_repeat, self.changing_progress,
+							new_text, self.changing_repeat)
+						for del_rem, del_cal, add_rem, add_cal in sync_cmds:
+							self._run_osascript_batch([del_rem, del_cal, add_rem, add_cal])
+			if self.changing_column == 3 and hasattr(self, 'changing_repeat'):
+				# Sync repeat interval change to all related repeat tasks
+				new_repeat = self.tableWidget.item(self.changing_row, 3).text() if self.tableWidget.item(self.changing_row, 3) else '-'
+				if self.changing_repeat not in ('', '-') and new_repeat not in ('', '-') and self.changing_repeat != new_repeat:
+					sync_cmds = self._sync_repeat_task_changes(
+						self.changing_text, self.changing_repeat, self.changing_progress,
+						self.changing_text, new_repeat)
+					for del_rem, del_cal, add_rem, add_cal in sync_cmds:
+						self._run_osascript_batch([del_rem, del_cal, add_rem, add_cal])
 			if self.changing_column == 4 and self.tableWidget.item(self.changing_row, 4).text() == 'UNDONE' and self.to_done == 2:
 				new1_text = self.changing_text
 				escaped_new1_text = self._escape_applescript_string(new1_text)
@@ -2532,12 +3041,47 @@ end tell
 		self.changing_text = self.tableWidget.item(self.changing_row, 0).text()
 		self.changing_date = self.tableWidget.item(self.changing_row, 1).text()
 		self.changing_length = self.tableWidget.item(self.changing_row, 2).text()
+		repeat_item = self.tableWidget.item(self.changing_row, 3)
+		self.changing_repeat = repeat_item.text() if repeat_item else '-'
+		progress_item = self.tableWidget.item(self.changing_row, 6)
+		self.changing_progress = progress_item.text() if progress_item else '-'
 		self.changing_done = self.tableWidget.item(self.changing_row, 4).text()
 		if self.changing_done == 'UNDONE':
 			self.to_done = 1
 		if self.changing_done == 'DONE':
 			self.to_done = 2
-	
+
+	def _on_table_edit_started(self, row, column):
+		"""Called when a cell in tableWidget starts being edited (keyboard or mouse)"""
+		# Same logic as change_write - record original values
+		if row < 0 or row >= self.tableWidget.rowCount():
+			return
+		self.changing_bool = 1
+		self.changing_row = row
+		self.changing_column = column
+		item0 = self.tableWidget.item(row, 0)
+		item1 = self.tableWidget.item(row, 1)
+		item2 = self.tableWidget.item(row, 2)
+		item3 = self.tableWidget.item(row, 3)
+		item4 = self.tableWidget.item(row, 4)
+		item6 = self.tableWidget.item(row, 6)
+		self.changing_text = item0.text() if item0 else ''
+		self.changing_date = item1.text() if item1 else ''
+		self.changing_length = item2.text() if item2 else ''
+		self.changing_repeat = item3.text() if item3 else '-'
+		self.changing_progress = item6.text() if item6 else '-'
+		self.changing_done = item4.text() if item4 else ''
+		if self.changing_done == 'UNDONE':
+			self.to_done = 1
+		if self.changing_done == 'DONE':
+			self.to_done = 2
+
+	def _on_table_edit_finished(self, row, column):
+		"""Called when a cell in tableWidget finishes being edited (keyboard or mouse)"""
+		# Same logic as write_table_time - save changes
+		if self.changing_bool == 1:
+			self.write_table_time()
+
 	def _get_selected_rows(self, table_widget):
 		selection = table_widget.selectionModel()
 		if selection is None:
@@ -2556,6 +3100,9 @@ end tell
 
 	def _init_sync_indicator(self):
 		self._sync_counter = 0
+		self._active_workers = []  # Track active AppleScript workers
+		self._applescript_signals = AppleScriptWorkerSignals()
+		self._applescript_signals.finished.connect(self._on_applescript_finished)
 		self.sync_dialog = QDialog(self)
 		self.sync_dialog.setWindowTitle('Syncing...')
 		self.sync_dialog.setModal(False)
@@ -2573,6 +3120,8 @@ end tell
 	def _show_sync_indicator(self):
 		self._sync_counter += 1
 		if self._sync_counter == 1:
+			# Lock all tables to prevent editing during sync
+			self._lock_all_tables()
 			parent_geom = self.frameGeometry()
 			dialog_size = self.sync_dialog.size()
 			target_x = parent_geom.center().x() - dialog_size.width() // 2
@@ -2587,19 +3136,57 @@ end tell
 		if self._sync_counter <= 0:
 			self._sync_counter = 0
 			self.sync_dialog.hide()
+			# Unlock all tables when sync is complete
+			self._unlock_all_tables()
+
+	def _lock_all_tables(self):
+		"""Disable editing on all tables during sync operations"""
+		tables = [
+			('tableWidget', getattr(self, 'tableWidget', None)),
+			('tableWidget_freq', getattr(self, 'tableWidget_freq', None)),
+			('tableWidget_memo', getattr(self, 'tableWidget_memo', None)),
+			('tableWidget_record', getattr(self, 'tableWidget_record', None)),
+			('tableWidget_record2', getattr(self, 'tableWidget_record2', None)),
+			('tableWidget_collect', getattr(self, 'tableWidget_collect', None)),
+		]
+		# Store original edit triggers to restore later
+		if not hasattr(self, '_original_edit_triggers'):
+			self._original_edit_triggers = {}
+		for name, table in tables:
+			if table is not None:
+				self._original_edit_triggers[name] = table.editTriggers()
+				table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+
+	def _unlock_all_tables(self):
+		"""Re-enable editing on all tables after sync operations"""
+		tables = [
+			('tableWidget', getattr(self, 'tableWidget', None)),
+			('tableWidget_freq', getattr(self, 'tableWidget_freq', None)),
+			('tableWidget_memo', getattr(self, 'tableWidget_memo', None)),
+			('tableWidget_record', getattr(self, 'tableWidget_record', None)),
+			('tableWidget_record2', getattr(self, 'tableWidget_record2', None)),
+			('tableWidget_collect', getattr(self, 'tableWidget_collect', None)),
+		]
+		if hasattr(self, '_original_edit_triggers'):
+			for name, table in tables:
+				if table is not None and name in self._original_edit_triggers:
+					table.setEditTriggers(self._original_edit_triggers[name])
+
+	def _on_applescript_finished(self):
+		"""Called when an AppleScript worker finishes"""
+		self._mark_local_reminder_change()
+		self._hide_sync_indicator()
+		# Clean up finished workers
+		self._active_workers = [w for w in self._active_workers if w.is_alive()]
 
 	def _run_osascript_batch(self, script_chunks):
+		"""Execute AppleScript commands in a background thread"""
 		if not script_chunks:
 			return
-		script = '\n'.join(script_chunks)
 		self._show_sync_indicator()
-		try:
-			subprocess.call(['osascript', '-e', script])
-			self._mark_local_reminder_change()
-		except Exception:
-			pass
-		finally:
-			self._hide_sync_indicator()
+		worker = AppleScriptWorker(script_chunks, self._applescript_signals)
+		self._active_workers.append(worker)
+		worker.start()
 
 	def _mark_local_reminder_change(self):
 		self._last_local_reminder_change = time.time()
@@ -2669,6 +3256,183 @@ end tell
 			item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
 			self.tableWidget.setItem(new_row, col, item)
 		return new_row
+
+	def _find_related_repeat_tasks(self, task_name, repeat_interval, repeat_until_stamp):
+		"""
+		Find all rows in the table that are related repeat tasks.
+		Related tasks share the same name, repeat interval, and repeat_until_stamp.
+		Returns a list of (row_index, stamp) tuples sorted by stamp.
+		"""
+		related = []
+		for row in range(self.tableWidget.rowCount()):
+			name_item = self.tableWidget.item(row, 0)
+			repeat_item = self.tableWidget.item(row, 3)
+			progress_item = self.tableWidget.item(row, 6)
+			stamp_item = self.tableWidget.item(row, 8)
+			if name_item is None or repeat_item is None:
+				continue
+			row_name = name_item.text()
+			row_repeat = repeat_item.text()
+			row_progress = progress_item.text() if progress_item else '-'
+			row_stamp = float(stamp_item.text()) if stamp_item and stamp_item.text() else 0
+			# Check if this row matches the criteria
+			if row_name == task_name and row_repeat == repeat_interval and row_progress == repeat_until_stamp:
+				related.append((row, row_stamp))
+		# Sort by stamp (chronological order)
+		related.sort(key=lambda x: x[1])
+		return related
+
+	def _count_future_undone_occurrences(self, task_name, repeat_interval, repeat_until_stamp, current_stamp):
+		"""
+		Count how many UNDONE occurrences exist in the future (stamp > current_stamp).
+		"""
+		count = 0
+		for row in range(self.tableWidget.rowCount()):
+			name_item = self.tableWidget.item(row, 0)
+			repeat_item = self.tableWidget.item(row, 3)
+			progress_item = self.tableWidget.item(row, 6)
+			status_item = self.tableWidget.item(row, 4)
+			stamp_item = self.tableWidget.item(row, 8)
+			if name_item is None or repeat_item is None or status_item is None:
+				continue
+			row_name = name_item.text()
+			row_repeat = repeat_item.text()
+			row_progress = progress_item.text() if progress_item else '-'
+			row_status = status_item.text()
+			row_stamp = float(stamp_item.text()) if stamp_item and stamp_item.text() else 0
+			if (row_name == task_name and row_repeat == repeat_interval and
+				row_progress == repeat_until_stamp and row_status == 'UNDONE' and
+				row_stamp > current_stamp):
+				count += 1
+		return count
+
+	def _get_latest_stamp_for_repeat(self, task_name, repeat_interval, repeat_until_stamp):
+		"""
+		Get the latest (highest) stamp among all related repeat tasks.
+		"""
+		latest_stamp = 0
+		for row in range(self.tableWidget.rowCount()):
+			name_item = self.tableWidget.item(row, 0)
+			repeat_item = self.tableWidget.item(row, 3)
+			progress_item = self.tableWidget.item(row, 6)
+			stamp_item = self.tableWidget.item(row, 8)
+			if name_item is None or repeat_item is None:
+				continue
+			row_name = name_item.text()
+			row_repeat = repeat_item.text()
+			row_progress = progress_item.text() if progress_item else '-'
+			row_stamp = float(stamp_item.text()) if stamp_item and stamp_item.text() else 0
+			if row_name == task_name and row_repeat == repeat_interval and row_progress == repeat_until_stamp:
+				if row_stamp > latest_stamp:
+					latest_stamp = row_stamp
+		return latest_stamp
+
+	def _generate_repeat_occurrences(self, base_values, count, start_stamp, repeat_hours, repeat_end_stamp):
+		"""
+		Generate up to 'count' new repeat occurrences starting from start_stamp.
+		Returns list of (row_values, reminder_cmd, calendar_cmd) tuples.
+		"""
+		occurrences = []
+		current_stamp = start_stamp
+		for _ in range(count):
+			new_stamp = current_stamp + 3600 * repeat_hours
+			# Check if we've exceeded the repeat_until limit
+			if repeat_end_stamp is not None and new_stamp > repeat_end_stamp:
+				break
+			# Check if this stamp already exists in the table
+			next_time_array = time.localtime(new_stamp)
+			new_time = time.strftime("%Y-%m-%d %H:%M", next_time_array)
+			otherStyleTime = time.strftime("%m/%d/%Y %H:%M", next_time_array)
+			new_row_values = [
+				base_values[0],  # Item name
+				new_time,        # Time
+				base_values[2],  # Length
+				base_values[3],  # Repeat
+				'UNDONE',        # Status
+				'-',             # Target times
+				base_values[6],  # Progress (repeat_until_stamp)
+				'TIME_SNS',      # Type
+				str(new_stamp)   # Stamp
+			]
+			if not self._table_contains_row(self.tableWidget, new_row_values):
+				escaped_text = self._escape_applescript_string(base_values[0])
+				reminder_cmd = """tell application "Reminders"
+	set eachLine to "%s"
+	set mylist to list "Tomato"
+	tell mylist
+		make new reminder at end with properties {name:eachLine, remind me date:date "%s"}
+	end tell
+end tell""" % (escaped_text, otherStyleTime)
+				calendar_cmd = """tell application "Calendar"
+  tell calendar "Tomato"
+	make new event at end with properties {summary:"%s", start date:date "%s", end date:date "%s" + (%s * hours)}
+  end tell
+end tell""" % (escaped_text, otherStyleTime, otherStyleTime, base_values[2])
+				occurrences.append((new_row_values, reminder_cmd, calendar_cmd))
+			current_stamp = new_stamp
+		return occurrences
+
+	def _sync_repeat_task_changes(self, old_name, old_repeat, repeat_until_stamp, new_name, new_repeat):
+		"""
+		When name or repeat interval changes, update all related UNDONE tasks.
+		Returns list of (reminder_cmd, calendar_cmd) tuples for updates.
+		"""
+		commands = []
+		for row in range(self.tableWidget.rowCount()):
+			name_item = self.tableWidget.item(row, 0)
+			repeat_item = self.tableWidget.item(row, 3)
+			progress_item = self.tableWidget.item(row, 6)
+			status_item = self.tableWidget.item(row, 4)
+			time_item = self.tableWidget.item(row, 1)
+			length_item = self.tableWidget.item(row, 2)
+			if name_item is None or repeat_item is None or status_item is None:
+				continue
+			row_name = name_item.text()
+			row_repeat = repeat_item.text()
+			row_progress = progress_item.text() if progress_item else '-'
+			row_status = status_item.text()
+			# Only update UNDONE tasks that match the old criteria
+			if (row_name == old_name and row_repeat == old_repeat and
+				row_progress == repeat_until_stamp and row_status == 'UNDONE'):
+				old_time = time_item.text() if time_item else ''
+				old_length = length_item.text() if length_item else '1'
+				if old_time:
+					# Delete old reminder and calendar event
+					stamp_item = self.to_stamp(old_time)
+					timeArray = time.localtime(float(stamp_item))
+					otherStyleTime = time.strftime("%m/%d/%Y %H:%M", timeArray)
+					escaped_old = self._escape_applescript_string(old_name)
+					escaped_new = self._escape_applescript_string(new_name)
+					# Delete old
+					del_reminder = """tell application "Reminders"
+	set mylist to list "Tomato"
+	tell mylist
+		delete (reminders whose (name is "%s") and (remind me date is date "%s"))
+	end tell
+end tell""" % (escaped_old, otherStyleTime)
+					del_calendar = """tell application "Calendar"
+	tell calendar "Tomato"
+		delete (events whose (start date is date "%s") and (summary is "%s"))
+	end tell
+end tell""" % (otherStyleTime, escaped_old)
+					# Create new
+					add_reminder = """tell application "Reminders"
+	set eachLine to "%s"
+	set mylist to list "Tomato"
+	tell mylist
+		make new reminder at end with properties {name:eachLine, remind me date:date "%s"}
+	end tell
+end tell""" % (escaped_new, otherStyleTime)
+					add_calendar = """tell application "Calendar"
+  tell calendar "Tomato"
+	make new event at end with properties {summary:"%s", start date:date "%s", end date:date "%s" + (%s * hours)}
+  end tell
+end tell""" % (escaped_new, otherStyleTime, otherStyleTime, old_length)
+					commands.append((del_reminder, del_calendar, add_reminder, add_calendar))
+				# Update the table
+				name_item.setText(new_name)
+				repeat_item.setText(new_repeat)
+		return commands
 
 	def _format_hours(self, hours):
 		if isinstance(hours, float):
@@ -3369,6 +4133,43 @@ end tell""" % (escaped_item, otherStyleTime, escaped_notes)
   end tell
 end tell""" % (escaped_item, otherStyleTime, otherStyleTime, length_hours)
 				self._run_osascript_batch([cmd, cmd2])
+
+				# If this is a repeat task, pre-generate future occurrences based on setting
+				if repeat_hours != '-':
+					try:
+						repeat_hours_float = float(repeat_hours)
+						repeat_end_stamp = None
+						if pro7_inp not in ('', '-'):
+							try:
+								repeat_end_stamp = float(pro7_inp)
+							except ValueError:
+								pass
+						base_stamp = float(sta9_inp)
+						# Prepare base values for generation
+						base_values = [ite1_inp, '', length_hours, repeat_hours, 'UNDONE', '-', pro7_inp, 'TIME_SNS', '']
+						# Generate N-1 more occurrences (we already have the first one)
+						pregenerate_count = self._get_repeat_pregenerate_count()
+						occurrences = self._generate_repeat_occurrences(
+							base_values, pregenerate_count - 1, base_stamp, repeat_hours_float, repeat_end_stamp)
+						# Add each occurrence to CSV and create reminders/calendar events
+						additional_rows = []
+						additional_cmds = []
+						for row_values, rem_cmd, cal_cmd in occurrences:
+							additional_rows.append(row_values)
+							additional_cmds.extend([rem_cmd, cal_cmd])
+						if additional_rows:
+							with open(self.fulldirall, 'r', encoding='utf8') as csv_file:
+								csv_reader = csv.reader(csv_file)
+								lines = list(csv_reader)
+								lines = lines + additional_rows
+							with open(self.fulldirall, 'w', encoding='utf8') as csv_file:
+								csv_writer = csv.writer(csv_file)
+								csv_writer.writerows(lines)
+							if additional_cmds:
+								self._run_osascript_batch(additional_cmds)
+					except (ValueError, TypeError):
+						pass
+
 				self.le1.clear()
 				self.le3.clear()
 				self.le4.setText("-")
@@ -3584,44 +4385,36 @@ end tell
 				new1_text = self.tableWidget.item(self.changing_row, 0).text()
 				new_time = self.tableWidget.item(self.changing_row, 1).text()
 				repeat_end_stamp = self._read_repeat_until_from_row(self.changing_row)
-				new_stamp = None
+				new3_leng = self.tableWidget.item(self.changing_row, 2).text()
+				new4_rep = repeat_item.text()
+				new7_pro = self.tableWidget.item(self.changing_row, 6).text() if self.tableWidget.item(self.changing_row, 6) else '-'
 				try:
-					base_stamp = float(self.to_stamp(new_time))
+					current_stamp = float(self.to_stamp(new_time))
 				except Exception:
-					base_stamp = None
-				if base_stamp is not None:
-					new_stamp = base_stamp + 3600 * repeat_hours
-					if repeat_end_stamp is not None and new_stamp > repeat_end_stamp:
-						new_stamp = None
-				if new_stamp is not None:
-					next_time_array = time.localtime(new_stamp)
-					otherStyleTime_new = time.strftime("%m/%d/%Y %H:%M", next_time_array)
-					new2_time = time.strftime("%Y-%m-%d %H:%M", next_time_array)
-					new3_leng = self.tableWidget.item(self.changing_row, 2).text()
-					new4_rep = repeat_item.text()
-					new5_sta = 'UNDONE'
-					new6_tar = '-'
-					new7_pro = self.tableWidget.item(self.changing_row, 6).text() if self.tableWidget.item(self.changing_row, 6) else '-'
-					new8_typ = 'TIME_SNS'
-					new9_sta = str(new_stamp)
-					new_row_values = [new1_text, new2_time, new3_leng, new4_rep,
-									  new5_sta, new6_tar, new7_pro, new8_typ, new9_sta]
-					if not self._table_contains_row(self.tableWidget, new_row_values):
-						new_row_index = self._append_time_row_to_table(new_row_values)
-						self.tableWidget.setRowHidden(new_row_index, False)
-					escaped_new1_text = self._escape_applescript_string(new1_text)
-					reminder_cmds.append("""tell application "Reminders"
-	set eachLine to "%s"
-	set mylist to list "Tomato"
-	tell mylist
-		make new reminder at end with properties {name:eachLine, remind me date:date "%s"}
-	end tell
-end tell""" % (escaped_new1_text, otherStyleTime_new))
-					calendar_cmds.append("""tell application "Calendar"
-  tell calendar "Tomato"
-	make new event at end with properties {summary:"%s", start date:date "%s", end date:date "%s" + (%s * hours)}
-  end tell
-end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_leng))
+					current_stamp = None
+				if current_stamp is not None:
+					# Count how many UNDONE future occurrences exist
+					future_count = self._count_future_undone_occurrences(
+						new1_text, new4_rep, new7_pro, current_stamp)
+					# Calculate how many new occurrences we need to create based on setting
+					pregenerate_count = self._get_repeat_pregenerate_count()
+					needed_count = max(0, pregenerate_count - future_count)
+					if needed_count > 0:
+						# Get the latest stamp to start generating from
+						latest_stamp = self._get_latest_stamp_for_repeat(new1_text, new4_rep, new7_pro)
+						if latest_stamp < current_stamp:
+							latest_stamp = current_stamp
+						# Prepare base values for generation
+						base_values = [new1_text, '', new3_leng, new4_rep, 'UNDONE', '-', new7_pro, 'TIME_SNS', '']
+						# Generate the needed occurrences
+						occurrences = self._generate_repeat_occurrences(
+							base_values, needed_count, latest_stamp, repeat_hours, repeat_end_stamp)
+						# Add each occurrence to the table and collect commands
+						for row_values, rem_cmd, cal_cmd in occurrences:
+							new_row_index = self._append_time_row_to_table(row_values)
+							self.tableWidget.setRowHidden(new_row_index, False)
+							reminder_cmds.append(rem_cmd)
+							calendar_cmds.append(cal_cmd)
 
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
@@ -3784,6 +4577,10 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 				t += 1
 				continue
 
+	# def _on_record_edit_finished(self, row, column):
+	# 	"""Called when a cell in tableWidget_record finishes being edited (keyboard or mouse)"""
+	# 	self.record_write()
+
 	def artTab(self):
 		self.tableWidget_freq = QTableWidget()
 		self.tableWidget_freq.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -3838,6 +4635,12 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 
 		self.tableWidget_freq.itemClicked.connect(self.freq_write_time)
 		self.tableWidget_freq.itemDoubleClicked.connect(self.freq_double_write)
+
+		# Setup delegate for keyboard-based editing detection
+		self._table_freq_delegate = TableEditDelegate(self.tableWidget_freq)
+		self.tableWidget_freq.setItemDelegate(self._table_freq_delegate)
+		self._table_freq_delegate.editing_started.connect(self._on_freq_edit_started)
+		self._table_freq_delegate.editing_finished.connect(self._on_freq_edit_finished)
 		#self.tableWidget_freq.setFixedHeight(int(self.tableWidget_freq.width()))
 
 		t1 = QWidget()
@@ -3946,7 +4749,12 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.freq_time_edit.setDisplayFormat('HH:mm')
 		self.freq_time_edit.setTime(QTime.currentTime())
 		self.freq_time_edit.setFixedHeight(20)
-		self.freq_time_edit.setToolTip('Choose Time')
+		self.freq_time_edit.setToolTip('Hover to open clock picker')
+		self.freq_time_edit.installEventFilter(self)
+
+		self.freq_clock_picker_popup = ClockPickerPopup()
+		self.freq_clock_picker_popup.set_target_widget(self.freq_time_edit)
+		self.freq_clock_picker_popup.time_changed.connect(lambda t: self.freq_time_edit.setTime(t))
 
 		self.lf4 = QLineEdit(self)
 		self.lf4.setPlaceholderText('Length')
@@ -4029,6 +4837,12 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.tableWidget_record2 = QTableWidget()
 		self.tableWidget_record2.setObjectName("small")
 		self.tableWidget_record2.itemClicked.connect(self.freq_record_write)
+
+		# # Setup delegate for keyboard-based editing detection
+		# self._table_record2_delegate = TableEditDelegate(self.tableWidget_record2)
+		# self.tableWidget_record2.setItemDelegate(self._table_record2_delegate)
+		# self._table_record2_delegate.editing_finished.connect(self._on_record2_edit_finished)
+
 		input_table = pd.read_csv(BasePath + 'Record.csv')
 		input_table_rows = input_table.shape[0]  # 获取表格行数
 		input_table_colunms = input_table.shape[1]  # 获取表格列数
@@ -4170,6 +4984,8 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		cursor.setPosition(pos)  # 游标位置设置为尾部
 		self.textii2.setTextCursor(cursor)  # 滚动到游标位置
 		if self.tableWidget_freq.currentItem() != None:
+			# Has selected item - show history records and enable editing
+			self.tableWidget_record2.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked | QAbstractItemView.EditTrigger.EditKeyPressed | QAbstractItemView.EditTrigger.AnyKeyPressed)
 			record2_file = self._record_file_path(self.tableWidget_freq.item(self.tableWidget_freq.currentRow(), 0).text())
 			if not os.path.exists(record2_file):
 				title_list = [['Time', 'Comments']]
@@ -4214,6 +5030,18 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 				leng_small = self.tableWidget_record2.width()
 				self.tableWidget_record2.setColumnWidth(0, int(leng_small / 2))
 				self.tableWidget_record2.setColumnWidth(1, int(leng_small / 2))
+		else:
+			# No selected item - show placeholder message and disable editing
+			self.tableWidget_record2.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+			self.tableWidget_record2.setColumnCount(1)
+			self.tableWidget_record2.setRowCount(1)
+			self.tableWidget_record2.setHorizontalHeaderLabels(['History'])
+			self.tableWidget_record2.verticalHeader().setVisible(False)
+			placeholder_item = QTableWidgetItem('No history records available\n(Please select a frequency item)')
+			placeholder_item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+			placeholder_item.setFlags(placeholder_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+			self.tableWidget_record2.setItem(0, 0, placeholder_item)
+			self.tableWidget_record2.setColumnWidth(0, self.tableWidget_record2.width())
 		if self.freq_double == 1:
 			if (self.freq_changing_column == 0 or 5) and self.tableWidget_freq.item(self.freq_changing_row, 4).text() == 'UNDONE':
 				pass
@@ -4394,6 +5222,24 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.freq_changing_row = self.tableWidget_freq.currentIndex().row()
 		self.freq_changing_column = self.tableWidget_freq.currentIndex().column()
 		self.freq_target = int(self.tableWidget_freq.item(self.freq_changing_row, 5).text())
+
+	def _on_freq_edit_started(self, row, column):
+		"""Called when a cell in tableWidget_freq starts being edited (keyboard or mouse)"""
+		if row < 0 or row >= self.tableWidget_freq.rowCount():
+			return
+		self.freq_double = 1
+		self.freq_changing_row = row
+		self.freq_changing_column = column
+		item5 = self.tableWidget_freq.item(row, 5)
+		try:
+			self.freq_target = int(item5.text()) if item5 else 0
+		except ValueError:
+			self.freq_target = 0
+
+	def _on_freq_edit_finished(self, row, column):
+		"""Called when a cell in tableWidget_freq finishes being edited (keyboard or mouse)"""
+		if self.freq_double == 1:
+			self.freq_write_time()
 
 	def freq_index(self, i):
 		self.freq_readlater()
@@ -4598,6 +5444,10 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 					csv_writer.writerows(outrow)
 				t += 1
 				continue
+
+	# def _on_record2_edit_finished(self, row, column):
+	# 	"""Called when a cell in tableWidget_record2 finishes being edited (keyboard or mouse)"""
+	# 	self.freq_record_write()
 
 	def _freq_add_time_single(self):
 		if self.tableWidget_freq.currentItem() != None:
@@ -4918,6 +5768,12 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 
 		self.tableWidget_memo.itemClicked.connect(self.memo_click_write)
 		self.tableWidget_memo.itemDoubleClicked.connect(self.memo_double)
+
+		# Setup delegate for keyboard-based editing detection
+		self._table_memo_delegate = TableEditDelegate(self.tableWidget_memo)
+		self.tableWidget_memo.setItemDelegate(self._table_memo_delegate)
+		self._table_memo_delegate.editing_started.connect(self._on_memo_edit_started)
+		self._table_memo_delegate.editing_finished.connect(self._on_memo_edit_finished)
 		#self.tableWidget_memo.setFixedHeight(int(self.tableWidget_memo.width()))
 
 		t1 = QWidget()
@@ -5022,7 +5878,12 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.memo_time_edit.setDisplayFormat('HH:mm')
 		self.memo_time_edit.setTime(QTime.currentTime())
 		self.memo_time_edit.setFixedHeight(20)
-		self.memo_time_edit.setToolTip('Choose Time')
+		self.memo_time_edit.setToolTip('Hover to open clock picker')
+		self.memo_time_edit.installEventFilter(self)
+
+		self.memo_clock_picker_popup = ClockPickerPopup()
+		self.memo_clock_picker_popup.set_target_widget(self.memo_time_edit)
+		self.memo_clock_picker_popup.time_changed.connect(lambda t: self.memo_time_edit.setTime(t))
 
 		self.lm4 = QLineEdit(self)
 		self.lm4.setPlaceholderText('Length')
@@ -5365,7 +6226,12 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.collect_time_edit.setDisplayFormat('HH:mm')
 		self.collect_time_edit.setTime(QTime.currentTime())
 		self.collect_time_edit.setFixedHeight(20)
-		self.collect_time_edit.setToolTip('Choose Time')
+		self.collect_time_edit.setToolTip('Hover to open clock picker')
+		self.collect_time_edit.installEventFilter(self)
+
+		self.collect_clock_picker_popup = ClockPickerPopup()
+		self.collect_clock_picker_popup.set_target_widget(self.collect_time_edit)
+		self.collect_clock_picker_popup.time_changed.connect(lambda t: self.collect_time_edit.setTime(t))
 
 		self.collect_length_input = QLineEdit(self)
 		self.collect_length_input.setPlaceholderText('Length')
@@ -5400,7 +6266,7 @@ end tell""" % (escaped_new1_text, otherStyleTime_new, otherStyleTime_new, new3_l
 		self.collect_repeat_until_date.setEnabled(False)
 		self.collect_repeat_until_check.toggled.connect(lambda _: self._apply_repeat_until_enable(self.collect_repeat_until_check, self.collect_repeat_until_date))
 
-		btn_collect_copy = QPushButton('Copy to Time list', self)
+		btn_collect_copy = QPushButton('Copy to Time-sensitive list', self)
 		btn_collect_copy.clicked.connect(self._collect_copy_to_time)
 		btn_collect_copy.setFixedHeight(20)
 
@@ -6366,6 +7232,23 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		if self.memo_changing_done == 'UNDONE':
 			self.memo_to_done = 1
 
+	def _on_memo_edit_started(self, row, column):
+		"""Called when a cell in tableWidget_memo starts being edited (keyboard or mouse)"""
+		if row < 0 or row >= self.tableWidget_memo.rowCount():
+			return
+		self.memo_dou = 1
+		self.memo_changing_row = row
+		self.memo_changing_column = column
+		item4 = self.tableWidget_memo.item(row, 4)
+		self.memo_changing_done = item4.text() if item4 else ''
+		if self.memo_changing_done == 'UNDONE':
+			self.memo_to_done = 1
+
+	def _on_memo_edit_finished(self, row, column):
+		"""Called when a cell in tableWidget_memo finishes being edited (keyboard or mouse)"""
+		if self.memo_dou == 1:
+			self.memo_click_write()
+
 	def memo_add(self):
 		if self.lm1.text() != '':
 			new_time_sns = []
@@ -6743,6 +7626,26 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		target_x = 0
 		target_y = self.pos().y()
 		if self.i % 2 == 1: # show
+			# Update all date and time edits to current date/time
+			current_date = QDate.currentDate()
+			current_time = QTime.currentTime()
+			if hasattr(self, 'date_edit'):
+				self.date_edit.setDate(current_date)
+			if hasattr(self, 'time_edit'):
+				self.time_edit.setTime(current_time)
+			if hasattr(self, 'freq_date_edit'):
+				self.freq_date_edit.setDate(current_date)
+			if hasattr(self, 'freq_time_edit'):
+				self.freq_time_edit.setTime(current_time)
+			if hasattr(self, 'memo_date_edit'):
+				self.memo_date_edit.setDate(current_date)
+			if hasattr(self, 'memo_time_edit'):
+				self.memo_time_edit.setTime(current_time)
+			if hasattr(self, 'collect_date_edit'):
+				self.collect_date_edit.setDate(current_date)
+			if hasattr(self, 'collect_time_edit'):
+				self.collect_time_edit.setTime(current_time)
+
 			target_width = int(screen_geom.width() / 2)
 			btna4.setChecked(True)
 			self.btn_00.setStyleSheet('''
@@ -6915,6 +7818,26 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		target_x = 0
 		target_y = self.pos().y()
 		if self.i % 2 == 1:
+			# Update all date and time edits to current date/time
+			current_date = QDate.currentDate()
+			current_time = QTime.currentTime()
+			if hasattr(self, 'date_edit'):
+				self.date_edit.setDate(current_date)
+			if hasattr(self, 'time_edit'):
+				self.time_edit.setTime(current_time)
+			if hasattr(self, 'freq_date_edit'):
+				self.freq_date_edit.setDate(current_date)
+			if hasattr(self, 'freq_time_edit'):
+				self.freq_time_edit.setTime(current_time)
+			if hasattr(self, 'memo_date_edit'):
+				self.memo_date_edit.setDate(current_date)
+			if hasattr(self, 'memo_time_edit'):
+				self.memo_time_edit.setTime(current_time)
+			if hasattr(self, 'collect_date_edit'):
+				self.collect_date_edit.setDate(current_date)
+			if hasattr(self, 'collect_time_edit'):
+				self.collect_time_edit.setTime(current_time)
+
 			target_width = int(screen_geom.width() / 2)
 			btna4.setChecked(True)
 			self.btn_00.setStyleSheet('''
@@ -7106,6 +8029,50 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 				self.auto_record_thread.stop()
 				self.auto_record_thread = None
 
+	def _load_app_settings(self):
+		"""Load application settings from JSON file"""
+		self._app_settings = {'auto_record_on_startup': False, 'repeat_pregenerate_count': 10}
+		if os.path.exists(self.settings_file):
+			try:
+				with open(self.settings_file, 'r', encoding='utf-8') as f:
+					self._app_settings.update(json.load(f))
+			except Exception:
+				logging.exception("Failed to load app settings.")
+		# Apply the auto-record on startup setting to the menu item
+		action_auto_record_startup.setChecked(self._app_settings.get('auto_record_on_startup', False))
+		# Apply the repeat pregenerate count setting to the menu
+		pregenerate_count = self._app_settings.get('repeat_pregenerate_count', 10)
+		if 1 <= pregenerate_count <= 15:
+			repeat_pregenerate_actions[pregenerate_count - 1].setChecked(True)
+
+	def _save_app_settings(self):
+		"""Save application settings to JSON file"""
+		try:
+			with open(self.settings_file, 'w', encoding='utf-8') as f:
+				json.dump(self._app_settings, f, ensure_ascii=False, indent=2)
+		except Exception:
+			logging.exception("Failed to save app settings.")
+
+	def _toggle_auto_record_startup(self, checked):
+		"""Toggle the auto-record on startup setting"""
+		self._app_settings['auto_record_on_startup'] = checked
+		self._save_app_settings()
+
+	def _set_repeat_pregenerate_count(self, count):
+		"""Set the repeat pregenerate count setting"""
+		self._app_settings['repeat_pregenerate_count'] = count
+		self._save_app_settings()
+
+	def _get_repeat_pregenerate_count(self):
+		"""Get the current repeat pregenerate count setting"""
+		return self._app_settings.get('repeat_pregenerate_count', 10)
+
+	def _start_auto_record_if_enabled(self):
+		"""Start auto-record if the setting is enabled (called on startup)"""
+		if self._app_settings.get('auto_record_on_startup', False):
+			action4.setChecked(True)
+			self.auto_record(True)
+
 	def totalquit(self):
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
@@ -7243,8 +8210,14 @@ action1.triggered.connect(w1.activate)
 action2.triggered.connect(w2.activate)
 action3.triggered.connect(w3.pin_a_tab)
 action4.triggered.connect(w3.auto_record)
+action_auto_record_startup.triggered.connect(w3._toggle_auto_record_startup)
+# Connect repeat pregenerate count menu actions
+for i, action in enumerate(repeat_pregenerate_actions):
+	action.triggered.connect(lambda checked, count=i+1: w3._set_repeat_pregenerate_count(count))
 # tray.activated.connect(w3.activate)
 btna4.triggered.connect(w3.pin_a_tab2)
 quit.triggered.connect(w3.totalquit)
 app.setStyleSheet(style_sheet_ori)
+# Start auto-record if the setting is enabled
+w3._start_auto_record_if_enabled()
 app.exec()
