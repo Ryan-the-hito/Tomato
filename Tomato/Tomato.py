@@ -11,9 +11,9 @@ from PyQt6.QtWidgets import (QWidget, QPushButton, QApplication,
 							 QPlainTextEdit, QTabWidget, QTextEdit, QGraphicsOpacityEffect,
 							 QTableWidget, QTableWidgetItem, QAbstractItemView, QInputDialog,
 							 QMessageBox, QSplitter, QDialogButtonBox, QListWidget, QListWidgetItem, QCheckBox,
-							 QStackedWidget, QTextBrowser, QStyledItemDelegate)
-from PyQt6.QtCore import Qt, QRect, QPropertyAnimation, QDate, QTime, QTimer, QObject, QEvent
-from PyQt6.QtGui import QAction, QActionGroup, QIcon, QColor, QCursor, QGuiApplication
+							 QStackedWidget, QTextBrowser, QStyledItemDelegate, QGraphicsDropShadowEffect)
+from PyQt6.QtCore import Qt, QRect, QPropertyAnimation, QDate, QTime, QTimer, QObject, QEvent, QPoint, QRectF, pyqtSignal, QThread, pyqtSlot, QEventLoop
+from PyQt6.QtGui import QAction, QActionGroup, QIcon, QColor, QCursor, QGuiApplication, QPainterPath, QPainter, QPalette, QSurfaceFormat, QPen, QPixmap, QFont
 import PyQt6.QtGui
 import sys
 import webbrowser
@@ -37,11 +37,12 @@ from dataclasses import dataclass
 from functools import partial
 import Foundation
 try:
-	from AppKit import NSWorkspace, NSWorkspaceWillSleepNotification, NSWorkspaceDidWakeNotification
+	from AppKit import NSWorkspace, NSWorkspaceWillSleepNotification, NSWorkspaceDidWakeNotification, NSColor
 except ImportError:
 	NSWorkspace = None
 	NSWorkspaceWillSleepNotification = None
 	NSWorkspaceDidWakeNotification = None
+	NSColor = None
 try:
 	from EventKit import EKEventStore, EKEntityTypeReminder, EKAuthorizationStatusAuthorized
 except ImportError:
@@ -49,7 +50,7 @@ except ImportError:
 	EKEntityTypeReminder = None
 	EKAuthorizationStatusAuthorized = 3
 try:
-	from Foundation import NSDate, NSRunLoop, NSCalendar, NSObject
+	from Foundation import NSDate, NSRunLoop, NSCalendar, NSObject, NSUserDefaults, NSSelectorFromString, NSDistributedNotificationCenter
 	import objc
 except Exception:
 	NSDate = None
@@ -66,6 +67,15 @@ app.setQuitOnLastWindowClosed(False)
 
 BasePath = '/Applications/Tomato.app/Contents/Resources/'
 # BasePath = ''  # test
+
+VERSION = "1.2.8"
+NAME = 'Tomato'
+
+os.environ["QT_QUICK_BACKEND"] = "metal"
+
+fmt = QSurfaceFormat()
+fmt.setSamples(8)  # 打开 MSAA 多重采样抗锯齿
+QSurfaceFormat.setDefaultFormat(fmt)
 
 # Configure logging with file handler for error tracking
 ERROR_LOG_PATH = BasePath + 'tomato_errors.log'
@@ -147,6 +157,77 @@ file_menu = sysmenu.addMenu("&Actions")
 file_menu.addAction(btna4)
 
 
+def is_dark_theme(app):
+	defaults = NSUserDefaults.standardUserDefaults()
+	style = defaults.stringForKey_("AppleInterfaceStyle")
+	return style == "Dark"
+
+def get_accent_color_hex():
+	try:
+		accent = NSColor.controlAccentColor()
+		rgb = accent.colorUsingColorSpaceName_("NSCalibratedRGBColorSpace")
+		if rgb:
+			r = int(rgb.redComponent() * 255)
+			g = int(rgb.greenComponent() * 255)
+			b = int(rgb.blueComponent() * 255)
+			return f"#{r:02X}{g:02X}{b:02X}"
+	except Exception:
+		pass
+	return "#0A84FF"
+
+def set_light_palette(app):
+	palette = QPalette()
+	palette.setColor(QPalette.ColorRole.Window, QColor(255, 255, 255))
+	palette.setColor(QPalette.ColorRole.WindowText, QColor(0, 0, 0))
+	palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255))
+	palette.setColor(QPalette.ColorRole.Text, QColor(0, 0, 0))
+	palette.setColor(QPalette.ColorRole.Button, QColor(240, 240, 240))
+	palette.setColor(QPalette.ColorRole.ButtonText, QColor(0, 0, 0))
+	app.setPalette(palette)
+
+def set_dark_palette(app):
+	palette = QPalette()
+	palette.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
+	palette.setColor(QPalette.ColorRole.WindowText, QColor(220, 220, 220))
+	palette.setColor(QPalette.ColorRole.Base, QColor(40, 40, 40))
+	palette.setColor(QPalette.ColorRole.Text, QColor(220, 220, 220))
+	palette.setColor(QPalette.ColorRole.Button, QColor(50, 50, 50))
+	palette.setColor(QPalette.ColorRole.ButtonText, QColor(220, 220, 220))
+	app.setPalette(palette)
+
+
+class ThemeObserver(NSObject):
+	def initWithApp_(self, app):
+		self = objc.super(ThemeObserver, self).init()
+		self.app = app
+		return self
+
+	def themeChanged_(self, notification):
+		# 主题变更时自动切换 palette + stylesheet
+		apply_theme(self.app)
+
+
+def install_theme_observer(app):
+	observer = ThemeObserver.alloc().initWithApp_(app)
+	center = NSDistributedNotificationCenter.defaultCenter()
+	center.addObserver_selector_name_object_(
+		observer,
+		NSSelectorFromString("themeChanged:"),
+		"AppleInterfaceThemeChangedNotification",
+		None
+	)
+	return observer
+
+#app = QApplication(sys.argv)
+
+if is_dark_theme(app):
+	set_dark_palette(app)
+else:
+	set_light_palette(app)
+
+theme_observer = install_theme_observer(app)
+
+
 class SleepWakeState:
 	def __init__(self):
 		self._sleeping = False
@@ -215,7 +296,54 @@ def _system_active():
 	return True
 
 
+def is_newer_version(latest: str, current: str) -> bool:
+	# 'v0.0.12' vs 'v0.0.11'
+	def parse(v: str):
+		return [int(x) for x in v.lstrip('vV').split('.')]
+	try:
+		return parse(latest) > parse(current)
+	except Exception:
+		return False
+
+
 _register_sleep_wake_observer()
+
+
+class UpdateCheckWorker(QThread):
+	update_available = pyqtSignal(str)  # latest version, e.g., 'v0.0.13'
+	checked_ok = pyqtSignal(str)		# latest version (even if not newer),用于日志或状态
+	checked_error = pyqtSignal(str)	 # error message
+
+	def __init__(self, current_version: str, interval_seconds: int = 86400, parent=None):
+		super().__init__(parent)
+		self._running = True
+		self.current_version = current_version  # e.g., 'v0.0.12'
+		self.interval_seconds = interval_seconds
+
+	def stop(self):
+		self._running = False
+
+	def run(self):
+		# 循环：只要应用在运行，就每隔 interval 检查一次
+		while self._running:
+			try:
+				text = WindowUpdate.fetch_latest_version_text()
+				latest = WindowUpdate.extract_latest_tag(text) if text else None
+				if latest:
+					self.checked_ok.emit(latest)
+					if is_newer_version(latest, 'v' + VERSION):
+						# 通知主线程有新版本
+						self.update_available.emit(latest)
+				else:
+					self.checked_error.emit("No version tag found")
+			except Exception as e:
+				self.checked_error.emit(str(e))
+
+			# 可中断的“休眠”24小时
+			for _ in range(self.interval_seconds):
+				if not self._running:
+					return
+				self.msleep(1000)
 
 
 class AutoRecordThread(threading.Thread):
@@ -1255,23 +1383,276 @@ class AutoCloseNotification(QDialog):
 			self.countdown_label.setText(f"This window will auto-close in {self.remaining_seconds} seconds")
 
 
-class window_about(QWidget):  # 增加说明页面(About)
+class WhiteButton(QPushButton):
+	def __init__(self, text):
+		super().__init__(text)
+		self.setFixedHeight(30)
+		self.setStyleSheet("""
+		QPushButton {
+			background-color: white;
+			color: #444;
+			border: none;
+			border-radius: 15px;
+			font-size: 13px;
+			padding: 5px 20px;
+		}
+		QPushButton:hover {
+			background-color: #f5f5f5;
+		}
+		""")
+
+		shadow = QGraphicsDropShadowEffect(self)
+		shadow.setBlurRadius(40)
+		shadow.setXOffset(0)
+		shadow.setYOffset(0)
+		shadow.setColor(QColor(0, 0, 0, 40))  # 半透明黑色阴影
+		self.setGraphicsEffect(shadow)
+
+
+class MacWindowButton(QPushButton):
+	def __init__(self, color, symbol, parent=None):
+		super().__init__(parent)
+		self.setFixedSize(16,16)
+		self.base_color = QColor(color)
+		self.symbol = symbol  # "x", "-", "+"
+		self.hovered = False
+		self.setStyleSheet("border: none; background: transparent;")
+
+	def enterEvent(self, event):
+		self.hovered = True
+		self.update()
+		super().enterEvent(event)
+
+	def leaveEvent(self, event):
+		self.hovered = False
+		self.update()
+		super().leaveEvent(event)
+
+	def paintEvent(self, event):
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+		painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+		# # 1. 选择底色
+		# if self.hovered:
+		#	 # hover 时用更深的颜色
+		#	 if self.symbol == "x":
+		#		 color = QColor("#BF4943")
+		#	 elif self.symbol == "-":
+		#		 color = QColor("#B29B32")
+		#	 elif self.symbol == "+":
+		#		 color = QColor("#24912D")
+		#	 else:
+		#		 color = self.base_color
+		# else:
+		#	 color = self.base_color
+		# Draw circle
+		painter.setBrush(self.base_color)
+		painter.setPen(Qt.PenStyle.NoPen)
+		painter.drawEllipse(0, 0, self.width(), self.height())
+		# Draw symbol if hovered
+		if self.hovered:
+			pen = QPen(QColor("black"))
+			pen.setWidth(2)
+			painter.setPen(pen)
+			margin = 5  # 增大 margin，叉号更小
+			if self.symbol == "x":
+				painter.drawLine(margin, margin, self.width()-margin, self.height()-margin)
+				painter.drawLine(self.width()-margin, margin, margin, self.height()-margin)
+			elif self.symbol == "-":
+				painter.drawLine(margin, self.height()//2, self.width()-margin, self.height()//2)
+			elif self.symbol == "+":
+				painter.drawLine(self.width()//2, margin, self.width()//2, self.height()-margin)
+				painter.drawLine(margin, self.height()//2, self.width()-margin, self.height()//2)
+
+
+class CustomMessageBox(QWidget):
+	def __init__(self, text, parent=None, icon=None, buttons=("OK",), default=0):
+		super().__init__(parent)
+		self.radius = 16
+		self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
+		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+		self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+		self.setFixedSize(400, 200)
+		self.result = None
+
+		# 拖动支持
+		self.drag_pos = None
+
+		# 关闭按钮
+		self.close_button = MacWindowButton("#FF605C", "x", self)
+		self.close_button.move(10, 10)
+		self.close_button.clicked.connect(self.close)
+
+		# 主内容
+		layout = QVBoxLayout()
+		layout.setContentsMargins(32, 40, 32, 32)
+		layout.setSpacing(16)
+
+		# 图标
+		if icon:
+			icon_label = QLabel()
+			icon_label.setPixmap(icon.pixmap(48, 48))
+			icon_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+			layout.addWidget(icon_label)
+
+		# 文本
+		label = QLabel(text)
+		label.setWordWrap(True)
+		label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+		# label.setStyleSheet("font-size: 16px;")
+		label.setStyleSheet("""
+			font-size: 16px;
+			background-color: rgba(255,255,255,0);
+			border-radius: 8px;
+			padding: 8px;
+		""")
+		layout.addWidget(label, stretch=1)
+
+		# 按钮
+		btn_layout = QHBoxLayout()
+		btn_layout.addStretch()
+		self.btns = []
+		for i, btn_text in enumerate(buttons):
+			btn = WhiteButton(btn_text)
+			btn.setFixedWidth(150)
+			# btn.setFixedHeight(32)
+			# btn.setStyleSheet("""
+			#	 QPushButton {
+			#		 background: #F2F2F2;
+			#		 border-radius: 8px;
+			#		 border: 1px solid #E0E0E0;
+			#		 min-width: 80px;
+			#		 font-size: 15px;
+			#	 }
+			#	 QPushButton:hover {
+			#		 background: #E0E0E0;
+			#	 }
+			# """)
+			btn.clicked.connect(lambda checked, idx=i: self._on_btn(idx))
+			btn_layout.addWidget(btn)
+			self.btns.append(btn)
+		btn_layout.addStretch()
+		layout.addLayout(btn_layout)
+
+		self.setLayout(layout)
+		self.btns[default].setFocus()
+
+	def _on_btn(self, idx):
+		self.result = idx
+		self.accept()
+
+	def accept(self):
+		self.close()
+
+	def paintEvent(self, event):
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+		rect = QRectF(self.rect())
+		path = QPainterPath()
+		path.addRoundedRect(rect, self.radius, self.radius)
+		painter.setClipPath(path)
+		if is_dark_theme(self):
+			painter.fillPath(path, QColor(30, 30, 30, 245))
+		else:
+			painter.fillPath(path, QColor(255, 255, 255, 245))
+
+	def mousePressEvent(self, event):
+		if event.button() == Qt.MouseButton.LeftButton:
+			self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+			event.accept()
+
+	def mouseMoveEvent(self, event):
+		if event.buttons() == Qt.MouseButton.LeftButton and self.drag_pos is not None:
+			self.move(event.globalPosition().toPoint() - self.drag_pos)
+			event.accept()
+
+	def exec(self):
+		self.setWindowModality(Qt.WindowModality.ApplicationModal)
+		self.show()
+		loop = QEventLoop()
+		self.destroyed.connect(loop.quit)
+		loop.exec()
+		return self.result
+
+
+class WindowAbout(QWidget):  # 增加说明页面(About)
 	def __init__(self):
 		super().__init__()
-		self.initUI()
+		self.radius = 16  # 圆角半径，可按 macOS 15 或 26 设置为 16~26
 
-	def initUI(self):  # 说明页面内信息
+		self.setWindowFlags(
+			Qt.WindowType.FramelessWindowHint |
+			Qt.WindowType.Window |
+			Qt.WindowType.WindowStaysOnTopHint
+		)
+		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+		self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+
+		self.init_ui()
+
+	def init_ui(self):
 		self.setUpMainWindow()
-		self.resize(400, 410)
+		self.setFixedSize(400, 600)
 		self.center()
-		self.setWindowTitle('About')
 		self.setFocus()
-		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
+
+	def paintEvent(self, event):
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+		painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+		rect = QRectF(self.rect())
+		path = QPainterPath()
+		path.addRoundedRect(rect, self.radius, self.radius)
+
+		painter.setClipPath(path)
+		bg_color = self.palette().color(QPalette.ColorRole.Window)
+		painter.fillPath(path, bg_color)
+
+	# 让无边框窗口可拖动
+	def mousePressEvent(self, event):
+		if event.button() == Qt.MouseButton.LeftButton:
+			self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+			event.accept()
+
+	def mouseMoveEvent(self, event):
+		if event.buttons() == Qt.MouseButton.LeftButton:
+			self.move(event.globalPosition().toPoint() - self.drag_pos)
+			event.accept()
 
 	def setUpMainWindow(self):
+		# 添加关闭按钮（仿 macOS 左上角红色圆点）
+		# self.close_button = QPushButton(self)
+		# self.close_button.setFixedSize(12, 12)
+		# self.close_button.move(10, 10)
+		# self.close_button.setStyleSheet("""
+		#	 QPushButton {
+		#		 background-color: #FF5F57;
+		#		 border-radius: 6px;
+		#		 border: none;
+		#	 }
+		#	 QPushButton:hover {
+		#		 background-color: #BF4943;
+		#	 }
+		# """)
+		# self.close_button.clicked.connect(self.close)
+		# 三个按钮
+		##FF5F57
+		self.close_button = MacWindowButton("#FF605C", "x", self)
+		self.close_button.move(10, 10)
+		self.close_button.clicked.connect(self.close)
+		##FFBD2E
+		# self.min_button = MacWindowButton("#FFBD44", "-", self)
+		# self.min_button.move(30, 10)
+		# self.min_button.clicked.connect(self.showMinimized)
+		##28C940
+		# self.max_button = MacWindowButton("#00CA4E", "+", self)
+		# self.max_button.move(50, 10)
+		# self.max_button.clicked.connect(self.showMaximized)
+
 		widg1 = QWidget()
 		l1 = QLabel(self)
-		png = PyQt6.QtGui.QPixmap(BasePath + 'tmt.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
+		png = QPixmap(BasePath + 'tmt.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
 		l1.setPixmap(png)  # 在l1里面，调用setPixmap命令，建立一个图像存放框，并将之前的图像png存放在这个框框里。
 		l1.setMaximumWidth(100)
 		l1.setMaximumHeight(100)
@@ -1284,8 +1665,8 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg1.setLayout(blay1)
 
 		widg2 = QWidget()
-		lbl0 = QLabel('Tomato', self)
-		font = PyQt6.QtGui.QFont()
+		lbl0 = QLabel(NAME, self)
+		font = QFont()
 		font.setFamily("Arial")
 		font.setBold(True)
 		font.setPointSize(20)
@@ -1298,7 +1679,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel('Version 1.2.7', self)
+		lbl1 = QLabel(self.tr(f'Version %n').replace('%n', VERSION), self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1307,7 +1688,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg3.setLayout(blay3)
 
 		widg4 = QWidget()
-		lbl2 = QLabel('Thanks for your love🤟.', self)
+		lbl2 = QLabel(self.tr('Thanks for your love🤟.'), self)
 		blay4 = QHBoxLayout()
 		blay4.setContentsMargins(0, 0, 0, 0)
 		blay4.addStretch()
@@ -1316,7 +1697,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg4.setLayout(blay4)
 
 		widg5 = QWidget()
-		lbl3 = QLabel('感谢您的喜爱！', self)
+		lbl3 = QLabel(self.tr('For more of my works, please visit the homepage🥰.'), self)
 		blay5 = QHBoxLayout()
 		blay5.setContentsMargins(0, 0, 0, 0)
 		blay5.addStretch()
@@ -1325,7 +1706,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg5.setLayout(blay5)
 
 		widg6 = QWidget()
-		lbl4 = QLabel('♥‿♥', self)
+		lbl4 = QLabel(self.tr('Special thanks to ut.code(); of the University of Tokyo❤️.'), self)
 		blay6 = QHBoxLayout()
 		blay6.setContentsMargins(0, 0, 0, 0)
 		blay6.addStretch()
@@ -1334,7 +1715,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg6.setLayout(blay6)
 
 		widg7 = QWidget()
-		lbl5 = QLabel('※\(^o^)/※', self)
+		lbl5 = QLabel(self.tr('This app is under the protection of GPL-3.0 license.'), self)
 		blay7 = QHBoxLayout()
 		blay7.setContentsMargins(0, 0, 0, 0)
 		blay7.addStretch()
@@ -1343,12 +1724,11 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg7.setLayout(blay7)
 
 		widg8 = QWidget()
-		bt1 = QPushButton('The Author', self)
-		bt1.setMaximumHeight(20)
+		widg8.setFixedHeight(50)
+		bt1 = WhiteButton(self.tr('The Author'))
 		bt1.setMinimumWidth(100)
 		bt1.clicked.connect(self.intro)
-		bt2 = QPushButton('Github Page', self)
-		bt2.setMaximumHeight(20)
+		bt2 = WhiteButton(self.tr('Github Page'))
 		bt2.setMinimumWidth(100)
 		bt2.clicked.connect(self.homepage)
 		blay8 = QHBoxLayout()
@@ -1359,12 +1739,11 @@ class window_about(QWidget):  # 增加说明页面(About)
 		blay8.addStretch()
 		widg8.setLayout(blay8)
 
-		bt7 = QPushButton('Buy me a cup of coffee☕', self)
-		bt7.setMaximumHeight(20)
+		bt7 = WhiteButton(self.tr('Buy me a cup of coffee☕'))
 		bt7.setMinimumWidth(215)
 		bt7.clicked.connect(self.coffee)
-
 		widg8_5 = QWidget()
+		widg8_5.setFixedHeight(50)
 		blay8_5 = QHBoxLayout()
 		blay8_5.setContentsMargins(0, 0, 0, 0)
 		blay8_5.addStretch()
@@ -1373,22 +1752,23 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg8_5.setLayout(blay8_5)
 
 		widg9 = QWidget()
-		bt3 = QPushButton('🍪\n¥5', self)
+		widg9.setFixedHeight(70)
+		bt3 = WhiteButton('🍪\n¥5')
 		bt3.setMaximumHeight(50)
 		bt3.setMinimumHeight(50)
 		bt3.setMinimumWidth(50)
 		bt3.clicked.connect(self.donate)
-		bt4 = QPushButton('🥪\n¥10', self)
+		bt4 = WhiteButton('🥪\n¥10')
 		bt4.setMaximumHeight(50)
 		bt4.setMinimumHeight(50)
 		bt4.setMinimumWidth(50)
 		bt4.clicked.connect(self.donate2)
-		bt5 = QPushButton('🍜\n¥20', self)
+		bt5 = WhiteButton('🍜\n¥20')
 		bt5.setMaximumHeight(50)
 		bt5.setMinimumHeight(50)
 		bt5.setMinimumWidth(50)
 		bt5.clicked.connect(self.donate3)
-		bt6 = QPushButton('🍕\n¥50', self)
+		bt6 = WhiteButton('🍕\n¥50')
 		bt6.setMaximumHeight(50)
 		bt6.setMinimumHeight(50)
 		bt6.setMinimumWidth(50)
@@ -1404,7 +1784,7 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg9.setLayout(blay9)
 
 		widg10 = QWidget()
-		lbl6 = QLabel('© 2023-2024 Ryan-the-hito. All rights reserved.', self)
+		lbl6 = QLabel('© 2023 Yixiang SHEN. All rights reserved.', self)
 		blay10 = QHBoxLayout()
 		blay10.setContentsMargins(0, 0, 0, 0)
 		blay10.addStretch()
@@ -1413,18 +1793,27 @@ class window_about(QWidget):  # 增加说明页面(About)
 		widg10.setLayout(blay10)
 
 		main_h_box = QVBoxLayout()
+		main_h_box.setContentsMargins(20, 40, 20, 20)  # 重要，用来保证关闭按钮的位置。
+		main_h_box.addSpacing(10)
 		main_h_box.addWidget(widg1)
 		main_h_box.addWidget(widg2)
+		main_h_box.addSpacing(5)
 		main_h_box.addWidget(widg3)
+		main_h_box.addSpacing(5)
 		main_h_box.addWidget(widg4)
+		main_h_box.addSpacing(5)
 		main_h_box.addWidget(widg5)
+		main_h_box.addSpacing(5)
 		main_h_box.addWidget(widg6)
+		main_h_box.addSpacing(5)
 		main_h_box.addWidget(widg7)
+		main_h_box.addStretch()
 		main_h_box.addWidget(widg8)
 		main_h_box.addWidget(widg8_5)
 		main_h_box.addWidget(widg9)
 		main_h_box.addWidget(widg10)
 		main_h_box.addStretch()
+		main_h_box.addSpacing(10)
 		self.setLayout(main_h_box)
 
 	def intro(self):
@@ -1469,21 +1858,21 @@ class CustomDialog(QDialog):  # (About1)
 
 	def initUI(self):
 		self.setUpMainWindow()
-		self.setWindowTitle("Thank you for your support!")
+		self.setWindowTitle(self.tr("Thank you for your support!"))
 		self.center()
-		self.resize(400, 390)
+		self.resize(440, 390)
 		self.setFocus()
 		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
 	def setUpMainWindow(self):
 		widge_all = QWidget()
 		l1 = QLabel(self)
-		png = PyQt6.QtGui.QPixmap(BasePath + 'wechat5.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
+		png = QPixmap(BasePath + 'wechat5.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
 		l1.setPixmap(png)  # 在l1里面，调用setPixmap命令，建立一个图像存放框，并将之前的图像png存放在这个框框里。
 		l1.setMaximumSize(160, 240)
 		l1.setScaledContents(True)
 		l2 = QLabel(self)
-		png = PyQt6.QtGui.QPixmap(BasePath + 'alipay5.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
+		png = QPixmap(BasePath + 'alipay5.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
 		l2.setPixmap(png)  # 在l2里面，调用setPixmap命令，建立一个图像存放框，并将之前的图像png存放在这个框框里。
 		l2.setMaximumSize(160, 240)
 		l2.setScaledContents(True)
@@ -1493,16 +1882,17 @@ class CustomDialog(QDialog):  # (About1)
 		bk.addWidget(l2)
 		widge_all.setLayout(bk)
 
-		m1 = QLabel('Thank you for your kind support! 😊', self)
-		m2 = QLabel('I will write more interesting apps! 🥳', self)
+		m1 = QLabel(self.tr('Thank you for your kind support! 😊'), self)
+		m2 = QLabel(self.tr('I will write more interesting apps! 🥳'), self)
 
 		widg_c = QWidget()
-		bt1 = QPushButton('Thank you!', self)
-		bt1.setMaximumHeight(20)
+		widg_c.setFixedHeight(50)
+		bt1 = WhiteButton(self.tr('Thank you!'))
+		#bt1.setMaximumHeight(20)
 		bt1.setMinimumWidth(100)
 		bt1.clicked.connect(self.cancel)
-		bt2 = QPushButton('Neither one above? Buy me a coffee~', self)
-		bt2.setMaximumHeight(20)
+		bt2 = WhiteButton(self.tr('Neither one above? Buy me a coffee~'))
+		#bt2.setMaximumHeight(20)
 		bt2.setMinimumWidth(260)
 		bt2.clicked.connect(self.coffee)
 		blay8 = QHBoxLayout()
@@ -1542,21 +1932,21 @@ class CustomDialog2(QDialog):  # (About2)
 
 	def initUI(self):
 		self.setUpMainWindow()
-		self.setWindowTitle("Thank you for your support!")
+		self.setWindowTitle(self.tr("Thank you for your support!"))
 		self.center()
-		self.resize(400, 390)
+		self.resize(440, 390)
 		self.setFocus()
 		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
 	def setUpMainWindow(self):
 		widge_all = QWidget()
 		l1 = QLabel(self)
-		png = PyQt6.QtGui.QPixmap(BasePath + 'wechat10.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
+		png = QPixmap(BasePath + 'wechat10.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
 		l1.setPixmap(png)  # 在l1里面，调用setPixmap命令，建立一个图像存放框，并将之前的图像png存放在这个框框里。
 		l1.setMaximumSize(160, 240)
 		l1.setScaledContents(True)
 		l2 = QLabel(self)
-		png = PyQt6.QtGui.QPixmap(BasePath + 'alipay10.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
+		png = QPixmap(BasePath + 'alipay10.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
 		l2.setPixmap(png)  # 在l2里面，调用setPixmap命令，建立一个图像存放框，并将之前的图像png存放在这个框框里。
 		l2.setMaximumSize(160, 240)
 		l2.setScaledContents(True)
@@ -1566,16 +1956,17 @@ class CustomDialog2(QDialog):  # (About2)
 		bk.addWidget(l2)
 		widge_all.setLayout(bk)
 
-		m1 = QLabel('Thank you for your kind support! 😊', self)
-		m2 = QLabel('I will write more interesting apps! 🥳', self)
+		m1 = QLabel(self.tr('Thank you for your kind support! 😊'), self)
+		m2 = QLabel(self.tr('I will write more interesting apps! 🥳'), self)
 
 		widg_c = QWidget()
-		bt1 = QPushButton('Thank you!', self)
-		bt1.setMaximumHeight(20)
+		widg_c.setFixedHeight(50)
+		bt1 = WhiteButton(self.tr('Thank you!'))
+		#bt1.setMaximumHeight(20)
 		bt1.setMinimumWidth(100)
 		bt1.clicked.connect(self.cancel)
-		bt2 = QPushButton('Neither one above? Buy me a coffee~', self)
-		bt2.setMaximumHeight(20)
+		bt2 = WhiteButton(self.tr('Neither one above? Buy me a coffee~'))
+		#bt2.setMaximumHeight(20)
 		bt2.setMinimumWidth(260)
 		bt2.clicked.connect(self.coffee)
 		blay8 = QHBoxLayout()
@@ -1615,21 +2006,21 @@ class CustomDialog3(QDialog):  # (About3)
 
 	def initUI(self):
 		self.setUpMainWindow()
-		self.setWindowTitle("Thank you for your support!")
+		self.setWindowTitle(self.tr("Thank you for your support!"))
 		self.center()
-		self.resize(400, 390)
+		self.resize(440, 390)
 		self.setFocus()
 		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
 	def setUpMainWindow(self):
 		widge_all = QWidget()
 		l1 = QLabel(self)
-		png = PyQt6.QtGui.QPixmap(BasePath + 'wechat20.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
+		png = QPixmap(BasePath + 'wechat20.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
 		l1.setPixmap(png)  # 在l1里面，调用setPixmap命令，建立一个图像存放框，并将之前的图像png存放在这个框框里。
 		l1.setMaximumSize(160, 240)
 		l1.setScaledContents(True)
 		l2 = QLabel(self)
-		png = PyQt6.QtGui.QPixmap(BasePath + 'alipay20.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
+		png = QPixmap(BasePath + 'alipay20.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
 		l2.setPixmap(png)  # 在l2里面，调用setPixmap命令，建立一个图像存放框，并将之前的图像png存放在这个框框里。
 		l2.setMaximumSize(160, 240)
 		l2.setScaledContents(True)
@@ -1639,16 +2030,17 @@ class CustomDialog3(QDialog):  # (About3)
 		bk.addWidget(l2)
 		widge_all.setLayout(bk)
 
-		m1 = QLabel('Thank you for your kind support! 😊', self)
-		m2 = QLabel('I will write more interesting apps! 🥳', self)
+		m1 = QLabel(self.tr('Thank you for your kind support! 😊'), self)
+		m2 = QLabel(self.tr('I will write more interesting apps! 🥳'), self)
 
 		widg_c = QWidget()
-		bt1 = QPushButton('Thank you!', self)
-		bt1.setMaximumHeight(20)
+		widg_c.setFixedHeight(50)
+		bt1 = WhiteButton(self.tr('Thank you!'))
+		#bt1.setMaximumHeight(20)
 		bt1.setMinimumWidth(100)
 		bt1.clicked.connect(self.cancel)
-		bt2 = QPushButton('Neither one above? Buy me a coffee~', self)
-		bt2.setMaximumHeight(20)
+		bt2 = WhiteButton(self.tr('Neither one above? Buy me a coffee~'))
+		#bt2.setMaximumHeight(20)
 		bt2.setMinimumWidth(260)
 		bt2.clicked.connect(self.coffee)
 		blay8 = QHBoxLayout()
@@ -1688,21 +2080,21 @@ class CustomDialog4(QDialog):  # (About4)
 
 	def initUI(self):
 		self.setUpMainWindow()
-		self.setWindowTitle("Thank you for your support!")
+		self.setWindowTitle(self.tr("Thank you for your support!"))
 		self.center()
-		self.resize(400, 390)
+		self.resize(440, 390)
 		self.setFocus()
 		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
 	def setUpMainWindow(self):
 		widge_all = QWidget()
 		l1 = QLabel(self)
-		png = PyQt6.QtGui.QPixmap(BasePath + 'wechat50.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
+		png = QPixmap(BasePath + 'wechat50.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
 		l1.setPixmap(png)  # 在l1里面，调用setPixmap命令，建立一个图像存放框，并将之前的图像png存放在这个框框里。
 		l1.setMaximumSize(160, 240)
 		l1.setScaledContents(True)
 		l2 = QLabel(self)
-		png = PyQt6.QtGui.QPixmap(BasePath + 'alipay50.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
+		png = QPixmap(BasePath + 'alipay50.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
 		l2.setPixmap(png)  # 在l2里面，调用setPixmap命令，建立一个图像存放框，并将之前的图像png存放在这个框框里。
 		l2.setMaximumSize(160, 240)
 		l2.setScaledContents(True)
@@ -1712,16 +2104,17 @@ class CustomDialog4(QDialog):  # (About4)
 		bk.addWidget(l2)
 		widge_all.setLayout(bk)
 
-		m1 = QLabel('Thank you for your kind support! 😊', self)
-		m2 = QLabel('I will write more interesting apps! 🥳', self)
+		m1 = QLabel(self.tr('Thank you for your kind support! 😊'), self)
+		m2 = QLabel(self.tr('I will write more interesting apps! 🥳'), self)
 
 		widg_c = QWidget()
-		bt1 = QPushButton('Thank you!', self)
-		bt1.setMaximumHeight(20)
+		widg_c.setFixedHeight(50)
+		bt1 = WhiteButton(self.tr('Thank you!'))
+		#bt1.setMaximumHeight(20)
 		bt1.setMinimumWidth(100)
 		bt1.clicked.connect(self.cancel)
-		bt2 = QPushButton('Neither one above? Buy me a coffee~', self)
-		bt2.setMaximumHeight(20)
+		bt2 = WhiteButton(self.tr('Neither one above? Buy me a coffee~'))
+		#bt2.setMaximumHeight(20)
 		bt2.setMinimumWidth(260)
 		bt2.clicked.connect(self.coffee)
 		blay8 = QHBoxLayout()
@@ -1754,46 +2147,119 @@ class CustomDialog4(QDialog):  # (About4)
 		self.close()
 
 
-class window_update(QWidget):  # 增加更新页面（Check for Updates）
+class WindowUpdate(QWidget):  # 增加更新页面（Check for Updates）
 	def __init__(self):
 		super().__init__()
-		self.initUI()
+		self.radius = 16  # 圆角半径，可按 macOS 15 或 26 设置为 16~26
 
-	def initUI(self):  # 说明页面内信息
+		self.setWindowFlags(
+			Qt.WindowType.FramelessWindowHint |
+			Qt.WindowType.Window |
+			Qt.WindowType.WindowStaysOnTopHint
+		)
+		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+		self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
 
-		self.lbl = QLabel('Current Version: v1.2.7', self)
-		self.lbl.move(30, 45)
+		self.init_ui()
 
-		lbl0 = QLabel('Download Update:', self)
-		lbl0.move(30, 75)
-
-		lbl1 = QLabel('Latest Version:', self)
-		lbl1.move(30, 15)
-
-		self.lbl2 = QLabel('', self)
-		self.lbl2.move(122, 15)
-
-		bt1 = QPushButton('Google Drive', self)
-		bt1.setFixedWidth(120)
-		bt1.clicked.connect(self.upd)
-		bt1.move(150, 75)
-
-		bt2 = QPushButton('Baidu Netdisk', self)
-		bt2.setFixedWidth(120)
-		bt2.clicked.connect(self.upd2)
-		bt2.move(150, 105)
-
-		self.resize(300, 150)
+	def init_ui(self):
+		self.setUpMainWindow()
+		self.setFixedSize(280, 220)
 		self.center()
-		self.setWindowTitle('Tomato Updates')
 		self.setFocus()
-		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
+
+	def paintEvent(self, event):
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+		painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+		rect = QRectF(self.rect())
+		path = QPainterPath()
+		path.addRoundedRect(rect, self.radius, self.radius)
+
+		painter.setClipPath(path)
+		bg_color = self.palette().color(QPalette.ColorRole.Window)
+		painter.fillPath(path, bg_color)
+
+	# 让无边框窗口可拖动
+	def mousePressEvent(self, event):
+		if event.button() == Qt.MouseButton.LeftButton:
+			self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+			event.accept()
+
+	def mouseMoveEvent(self, event):
+		if event.buttons() == Qt.MouseButton.LeftButton:
+			self.move(event.globalPosition().toPoint() - self.drag_pos)
+			event.accept()
+
+	def setUpMainWindow(self):
+		# 添加关闭按钮（仿 macOS 左上角红色圆点）
+		# self.close_button = QPushButton(self)
+		# self.close_button.setFixedSize(12, 12)
+		# self.close_button.move(10, 10)
+		# self.close_button.setStyleSheet("""
+		#	 QPushButton {
+		#		 background-color: #FF5F57;
+		#		 border-radius: 6px;
+		#		 border: none;
+		#	 }
+		#	 QPushButton:hover {
+		#		 background-color: #BF4943;
+		#	 }
+		# """)
+		# self.close_button.clicked.connect(self.close)
+		self.close_button = MacWindowButton("#FF605C", "x", self)
+		self.close_button.move(10, 10)
+		self.close_button.clicked.connect(self.close)
+
+		title = QLabel(self.tr("<h2>Tomato Update</h2>"))
+		title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+		widg5 = QWidget()
+		lbl1 = QLabel(self.tr('Latest version:'), self)
+		self.lbl2 = QLabel('', self)
+		blay5 = QHBoxLayout()
+		blay5.setContentsMargins(0, 0, 0, 0)
+		# blay5.addStretch()
+		blay5.addWidget(lbl1)
+		blay5.addWidget(self.lbl2)
+		blay5.addStretch()
+		widg5.setLayout(blay5)
+
+		widg3 = QWidget()
+		self.lbl = QLabel(self.tr(f'Current version: v%n').replace('%n', VERSION), self)
+		blay3 = QHBoxLayout()
+		blay3.setContentsMargins(0, 0, 0, 0)
+		# blay3.addStretch()
+		blay3.addWidget(self.lbl)
+		blay3.addStretch()
+		widg3.setLayout(blay3)
+
+		widg4 = QWidget()
+		widg4.setFixedHeight(50)
+		lbl0 = QLabel(self.tr('Check release:'), self)
+		bt1 = WhiteButton('Github')
+		bt1.clicked.connect(self.upd)
+		blay4 = QHBoxLayout()
+		blay4.setContentsMargins(0, 0, 0, 0)
+		# blay4.addStretch()
+		blay4.addWidget(lbl0)
+		blay4.addWidget(bt1)
+		blay4.addStretch()
+		widg4.setLayout(blay4)
+
+		main_h_box = QVBoxLayout()
+		main_h_box.setContentsMargins(20, 40, 20, 20)  # 重要，用来保证关闭按钮的位置。
+		main_h_box.addWidget(title)
+		main_h_box.addSpacing(5)
+		main_h_box.addWidget(widg5)
+		main_h_box.addSpacing(5)
+		main_h_box.addWidget(widg3)
+		main_h_box.addWidget(widg4)
+		self.setLayout(main_h_box)
 
 	def upd(self):
-		webbrowser.open('https://drive.google.com/drive/folders/1OFbVRi5nCUwG12VCUYpTzxA12W5uRoec?usp=sharing')
-
-	def upd2(self):
-		webbrowser.open('https://pan.baidu.com/s/1wqtKv2G8fP4uHeh6P0kuNw?pwd=rkuu')
+		webbrowser.open('https://github.com/Ryan-the-hito/Tomato/releases')
 
 	def center(self):  # 设置窗口居中
 		qr = self.frameGeometry()
@@ -1838,19 +2304,62 @@ class window_update(QWidget):  # 增加更新页面（Check for Updates）
 			pattern2 = re.compile(r'(v\d+\.\d+\.\d+)\sLatest')
 			result = pattern2.findall(plain_text_utf8)
 			result = ''.join(result)
-			nowversion = self.lbl.text().replace('Current Version: ', '')
+			nowversion = 'v' + VERSION
 			if result == nowversion:
-				alertupdate = result + '. You are up to date!'
+				alertupdate = result + self.tr(' (up-to-date)')
 				self.lbl2.setText(alertupdate)
 				self.lbl2.adjustSize()
 			else:
-				alertupdate = result + ' is ready!'
+				alertupdate = result + self.tr(' is ready!')
 				self.lbl2.setText(alertupdate)
 				self.lbl2.adjustSize()
 		except:
-			alertupdate = 'No Intrenet'
+			alertupdate = self.tr('No Intrenet')
 			self.lbl2.setText(alertupdate)
 			self.lbl2.adjustSize()
+
+	@staticmethod
+	def fetch_latest_version_text():
+		# 返回页面纯文本，或直接返回最新版本字符串
+		targetURL = 'https://github.com/Ryan-the-hito/Tomato/releases'
+		try:
+			urllib3.disable_warnings()
+			logging.captureWarnings(True)
+			s = requests.session()
+			s.keep_alive = False
+			response = s.get(targetURL, verify=False, timeout=15)
+			response.encoding = 'utf-8'
+			html_content = response.text
+
+			soup = BeautifulSoup(html_content, "html.parser")
+			for img in soup.find_all("img"):
+				img.decompose()
+			text_maker = html2text.HTML2Text()
+			text_maker.ignore_links = True
+			text_maker.ignore_images = True
+			plain_text = text_maker.handle(str(soup))
+			plain_text_utf8 = plain_text.encode(response.encoding).decode("utf-8")
+
+			for _ in range(10):
+				plain_text_utf8 = (plain_text_utf8
+								   .replace('\n\n\n\n', '\n\n')
+								   .replace('\n\n\n', '\n\n')
+								   .replace('   ', ' ')
+								   .replace('  ', ' '))
+			return plain_text_utf8
+		except Exception:
+			return None
+
+	@staticmethod
+	def extract_latest_tag(plain_text_utf8: str) -> str | None:
+		# 返回类似 'v0.0.12' 的字符串
+		if not plain_text_utf8:
+			return None
+		pattern2 = re.compile(r'(v\d+\.\d+\.\d+)\sLatest')
+		result = pattern2.findall(plain_text_utf8)
+		if result:
+			return result[0]
+		return None
 
 
 class CustomDialog_warn(QDialog):  # 提醒检查路径
@@ -1956,6 +2465,7 @@ class CustomDialog_warn(QDialog):  # 提醒检查路径
 class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 	def __init__(self):
 		super().__init__()
+		self.radius = 16
 		self.dragPosition = self.pos()
 		self._diary_text_edits = []
 		self._diary_viewport_owner = {}
@@ -2009,7 +2519,10 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		self.tab_bar.setVisible(False)
 		self.new_width = 10
 		self.setFixedSize(self.new_width, 120)
-		app.setStyleSheet(style_sheet_ori)
+		if is_dark_theme(app):
+			app.setStyleSheet(style_sheet_dark)
+		else:
+			app.setStyleSheet(style_sheet_ori)
 		self.assigntoall()
 		self.auto_record_thread = None
 		self.reminder_sync_thread = None
@@ -2025,6 +2538,13 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		self.reminder_sync_timer.start()
 		self._start_reminder_sync_worker()
 		self._start_calendar_sync_worker()
+
+		# 启动自动更新线程（24h = 86400秒）
+		self.update_check_worker = UpdateCheckWorker(current_version='v' + VERSION, interval_seconds=86400)
+		self.update_check_worker.update_available.connect(self.on_update_available)  # 主线程槽
+		self.update_check_worker.checked_ok.connect(self.on_update_checked_ok)  # 可选：日志或无感刷新
+		self.update_check_worker.checked_error.connect(self.on_update_checked_error)  # 可选：日志
+		self.update_check_worker.start()
 
 	def setUpMainWindow(self):
 		self.tab_bar = QTabWidget()
@@ -2842,23 +3362,57 @@ end tell
 				  end tell
 				end tell""" % (escaped_new_text, otherStyleTime, otherStyleTime, new_leng)
 				self._run_osascript_batch([cmd, cmd2])
-				# Sync name change to all related repeat tasks (if this is a repeat task and name changed)
-				if self.changing_column == 0 and hasattr(self, 'changing_repeat') and self.changing_repeat not in ('', '-'):
-					if old_text != new_text:
+				# Sync changes to all related repeat tasks (if this is a repeat task)
+				self._repeat_sync_in_progress = True
+				_repeat_sync_done = False
+				if hasattr(self, 'changing_repeat') and self.changing_repeat not in ('', '-'):
+					self._mark_local_reminder_change()
+					# Sync name change (column 0)
+					if self.changing_column == 0 and old_text != new_text:
 						sync_cmds = self._sync_repeat_task_changes(
 							old_text, self.changing_repeat, self.changing_progress,
 							new_text, self.changing_repeat)
 						for del_rem, del_cal, add_rem, add_cal in sync_cmds:
 							self._run_osascript_batch([del_rem, del_cal, add_rem, add_cal])
+						_repeat_sync_done = True
+					# Sync time change (column 1)
+					if self.changing_column == 1:
+						new_time = self.tableWidget.item(self.changing_row, 1).text()
+						old_stamp_val = self.to_stamp(self.changing_date)
+						new_stamp_val = self.to_stamp(new_time)
+						if abs(float(new_stamp_val) - float(old_stamp_val)) >= 1:
+							sync_cmds = self._sync_repeat_task_time_changes(
+								self.changing_text, self.changing_repeat, self.changing_progress,
+								old_stamp_val, new_stamp_val, self.changing_row)
+							for del_rem, del_cal, add_rem, add_cal in sync_cmds:
+								self._run_osascript_batch([del_rem, del_cal, add_rem, add_cal])
+							_repeat_sync_done = True
+					# Sync length change (column 2)
+					if self.changing_column == 2:
+						new_length = self.tableWidget.item(self.changing_row, 2).text()
+						if self.changing_length != new_length:
+							sync_cmds = self._sync_repeat_task_length_changes(
+								self.changing_text, self.changing_repeat, self.changing_progress,
+								new_length, self.changing_row)
+							for del_cal, add_cal in sync_cmds:
+								self._run_osascript_batch([del_cal, add_cal])
+							_repeat_sync_done = True
+				if _repeat_sync_done:
+					self._write_time_csv_from_table()
+				self._repeat_sync_in_progress = False
 			if self.changing_column == 3 and hasattr(self, 'changing_repeat'):
-				# Sync repeat interval change to all related repeat tasks
+				# Sync repeat interval change: delete future UNDONE tasks and regenerate with new interval
 				new_repeat = self.tableWidget.item(self.changing_row, 3).text() if self.tableWidget.item(self.changing_row, 3) else '-'
 				if self.changing_repeat not in ('', '-') and new_repeat not in ('', '-') and self.changing_repeat != new_repeat:
-					sync_cmds = self._sync_repeat_task_changes(
+					self._repeat_sync_in_progress = True
+					self._mark_local_reminder_change()
+					sync_cmds = self._resync_repeat_interval_change(
 						self.changing_text, self.changing_repeat, self.changing_progress,
-						self.changing_text, new_repeat)
-					for del_rem, del_cal, add_rem, add_cal in sync_cmds:
-						self._run_osascript_batch([del_rem, del_cal, add_rem, add_cal])
+						new_repeat, self.changing_row)
+					if sync_cmds:
+						self._run_osascript_batch(sync_cmds)
+					self._write_time_csv_from_table()
+					self._repeat_sync_in_progress = False
 			if self.changing_column == 4 and self.tableWidget.item(self.changing_row, 4).text() == 'UNDONE' and self.to_done == 2:
 				new1_text = self.changing_text
 				escaped_new1_text = self._escape_applescript_string(new1_text)
@@ -3434,6 +3988,219 @@ end tell""" % (escaped_new, otherStyleTime, otherStyleTime, old_length)
 				repeat_item.setText(new_repeat)
 		return commands
 
+	def _sync_repeat_task_time_changes(self, task_name, repeat_interval, repeat_until_stamp, old_stamp, new_stamp, current_row):
+		"""
+		When time changes on a repeat task, shift all future UNDONE related tasks by the same delta.
+		Returns list of (del_reminder, del_calendar, add_reminder, add_calendar) tuples.
+		"""
+		delta = float(new_stamp) - float(old_stamp)
+		if abs(delta) < 1:
+			return []
+		commands = []
+		for row in range(self.tableWidget.rowCount()):
+			if row == current_row:
+				continue
+			name_item = self.tableWidget.item(row, 0)
+			time_item = self.tableWidget.item(row, 1)
+			length_item = self.tableWidget.item(row, 2)
+			repeat_item = self.tableWidget.item(row, 3)
+			status_item = self.tableWidget.item(row, 4)
+			progress_item = self.tableWidget.item(row, 6)
+			stamp_item = self.tableWidget.item(row, 8)
+			if name_item is None or repeat_item is None or status_item is None or time_item is None or stamp_item is None:
+				continue
+			row_name = name_item.text()
+			row_repeat = repeat_item.text()
+			row_progress = progress_item.text() if progress_item else '-'
+			row_status = status_item.text()
+			row_stamp = float(stamp_item.text()) if stamp_item.text() else 0
+			row_length = length_item.text() if length_item else '1'
+			if (row_name == task_name and row_repeat == repeat_interval and
+				row_progress == repeat_until_stamp and row_status == 'UNDONE'):
+				old_time_array = time.localtime(row_stamp)
+				old_other_style = time.strftime("%m/%d/%Y %H:%M", old_time_array)
+				escaped_name = self._escape_applescript_string(task_name)
+				del_reminder = """tell application "Reminders"
+	set mylist to list "Tomato"
+	tell mylist
+		delete (reminders whose (name is "%s") and (remind me date is date "%s"))
+	end tell
+end tell""" % (escaped_name, old_other_style)
+				del_calendar = """tell application "Calendar"
+	tell calendar "Tomato"
+		delete (events whose (start date is date "%s") and (summary is "%s"))
+	end tell
+end tell""" % (old_other_style, escaped_name)
+				new_row_stamp = row_stamp + delta
+				new_time_array = time.localtime(new_row_stamp)
+				new_time_str = time.strftime("%Y-%m-%d %H:%M", new_time_array)
+				new_other_style = time.strftime("%m/%d/%Y %H:%M", new_time_array)
+				add_reminder = """tell application "Reminders"
+	set eachLine to "%s"
+	set mylist to list "Tomato"
+	tell mylist
+		make new reminder at end with properties {name:eachLine, remind me date:date "%s"}
+	end tell
+end tell""" % (escaped_name, new_other_style)
+				add_calendar = """tell application "Calendar"
+  tell calendar "Tomato"
+	make new event at end with properties {summary:"%s", start date:date "%s", end date:date "%s" + (%s * hours)}
+  end tell
+end tell""" % (escaped_name, new_other_style, new_other_style, row_length)
+				commands.append((del_reminder, del_calendar, add_reminder, add_calendar))
+				time_item.setText(new_time_str)
+				stamp_item.setText(str(new_row_stamp))
+		return commands
+
+	def _sync_repeat_task_length_changes(self, task_name, repeat_interval, repeat_until_stamp, new_length, current_row):
+		"""
+		When length changes on a repeat task, update length on all future UNDONE related tasks.
+		Returns list of (del_calendar, add_calendar) tuples (reminders have no duration).
+		"""
+		commands = []
+		for row in range(self.tableWidget.rowCount()):
+			if row == current_row:
+				continue
+			name_item = self.tableWidget.item(row, 0)
+			time_item = self.tableWidget.item(row, 1)
+			length_item = self.tableWidget.item(row, 2)
+			repeat_item = self.tableWidget.item(row, 3)
+			status_item = self.tableWidget.item(row, 4)
+			progress_item = self.tableWidget.item(row, 6)
+			if name_item is None or repeat_item is None or status_item is None or length_item is None:
+				continue
+			row_name = name_item.text()
+			row_repeat = repeat_item.text()
+			row_progress = progress_item.text() if progress_item else '-'
+			row_status = status_item.text()
+			row_time = time_item.text() if time_item else ''
+			if (row_name == task_name and row_repeat == repeat_interval and
+				row_progress == repeat_until_stamp and row_status == 'UNDONE'):
+				old_length = length_item.text()
+				if old_length == new_length:
+					continue
+				if row_time:
+					stamp_val = self.to_stamp(row_time)
+					time_array = time.localtime(float(stamp_val))
+					other_style_time = time.strftime("%m/%d/%Y %H:%M", time_array)
+					escaped_name = self._escape_applescript_string(task_name)
+					del_calendar = """tell application "Calendar"
+	tell calendar "Tomato"
+		delete (events whose (start date is date "%s") and (summary is "%s"))
+	end tell
+end tell""" % (other_style_time, escaped_name)
+					add_calendar = """tell application "Calendar"
+  tell calendar "Tomato"
+	make new event at end with properties {summary:"%s", start date:date "%s", end date:date "%s" + (%s * hours)}
+  end tell
+end tell""" % (escaped_name, other_style_time, other_style_time, new_length)
+					commands.append((del_calendar, add_calendar))
+				length_item.setText(new_length)
+		return commands
+
+	def _resync_repeat_interval_change(self, task_name, old_repeat, repeat_until_stamp, new_repeat, current_row):
+		"""
+		When repeat interval changes, delete all future UNDONE occurrences and regenerate them
+		with the new interval from the edited task's time.
+		Returns a flat list of AppleScript commands: all deletes first, then all creates.
+		This ensures sequential execution in a single osascript call to avoid
+		race conditions between delete and create operations for overlapping times.
+		"""
+		delete_commands = []
+		create_commands = []
+		# Step 1: Delete all future UNDONE related tasks (matching old criteria)
+		rows_to_delete = []
+		for row in range(self.tableWidget.rowCount()):
+			if row == current_row:
+				continue
+			name_item = self.tableWidget.item(row, 0)
+			repeat_item = self.tableWidget.item(row, 3)
+			status_item = self.tableWidget.item(row, 4)
+			progress_item = self.tableWidget.item(row, 6)
+			time_item = self.tableWidget.item(row, 1)
+			if name_item is None or repeat_item is None or status_item is None:
+				continue
+			row_name = name_item.text()
+			row_repeat = repeat_item.text()
+			row_progress = progress_item.text() if progress_item else '-'
+			row_status = status_item.text()
+			if (row_name == task_name and row_repeat == old_repeat and
+				row_progress == repeat_until_stamp and row_status == 'UNDONE'):
+				row_time = time_item.text() if time_item else ''
+				if row_time:
+					stamp_val = self.to_stamp(row_time)
+					time_array = time.localtime(float(stamp_val))
+					other_style = time.strftime("%m/%d/%Y %H:%M", time_array)
+					escaped_name = self._escape_applescript_string(task_name)
+					del_rem = """tell application "Reminders"
+	set mylist to list "Tomato"
+	tell mylist
+		delete (reminders whose (name is "%s") and (remind me date is date "%s"))
+	end tell
+end tell""" % (escaped_name, other_style)
+					del_cal = """tell application "Calendar"
+	tell calendar "Tomato"
+		delete (events whose (start date is date "%s") and (summary is "%s"))
+	end tell
+end tell""" % (other_style, escaped_name)
+					delete_commands.append(del_rem)
+					delete_commands.append(del_cal)
+				rows_to_delete.append(row)
+		# Delete rows from table (in reverse order to preserve indices)
+		for row in sorted(rows_to_delete, reverse=True):
+			self.tableWidget.removeRow(row)
+		# Step 2: Regenerate future occurrences with new interval
+		# Find the edited row again (its index may have changed after deletions)
+		edited_row = -1
+		for row in range(self.tableWidget.rowCount()):
+			name_item = self.tableWidget.item(row, 0)
+			repeat_item = self.tableWidget.item(row, 3)
+			progress_item = self.tableWidget.item(row, 6)
+			stamp_item = self.tableWidget.item(row, 8)
+			if name_item is None or repeat_item is None:
+				continue
+			if (name_item.text() == task_name and repeat_item.text() == new_repeat and
+				(progress_item.text() if progress_item else '-') == repeat_until_stamp):
+				edited_row = row
+				break
+		if edited_row >= 0:
+			try:
+				new_repeat_hours = float(new_repeat)
+			except (ValueError, TypeError):
+				return delete_commands + create_commands
+			stamp_item = self.tableWidget.item(edited_row, 8)
+			length_item = self.tableWidget.item(edited_row, 2)
+			base_stamp = float(stamp_item.text()) if stamp_item and stamp_item.text() else 0
+			base_length = length_item.text() if length_item else '1'
+			repeat_end_stamp = None
+			if repeat_until_stamp not in ('-', ''):
+				try:
+					repeat_end_stamp = float(repeat_until_stamp)
+				except (ValueError, TypeError):
+					pass
+			base_values = [task_name, '', base_length, new_repeat, 'UNDONE', '-', repeat_until_stamp, 'TIME_SNS', '']
+			pregenerate_count = self._get_repeat_pregenerate_count()
+			# Count existing UNDONE occurrences (including the edited row)
+			existing_undone = 0
+			for row in range(self.tableWidget.rowCount()):
+				ni = self.tableWidget.item(row, 0)
+				ri = self.tableWidget.item(row, 3)
+				pi = self.tableWidget.item(row, 6)
+				si = self.tableWidget.item(row, 4)
+				if ni and ri and si:
+					if (ni.text() == task_name and ri.text() == new_repeat and
+						(pi.text() if pi else '-') == repeat_until_stamp and si.text() == 'UNDONE'):
+						existing_undone += 1
+			needed = max(0, pregenerate_count - existing_undone)
+			if needed > 0:
+				occurrences = self._generate_repeat_occurrences(
+					base_values, needed, base_stamp, new_repeat_hours, repeat_end_stamp)
+				for row_values, reminder_cmd, calendar_cmd in occurrences:
+					self._append_time_row_to_table(row_values)
+					create_commands.append(reminder_cmd)
+					create_commands.append(calendar_cmd)
+		return delete_commands + create_commands
+
 	def _format_hours(self, hours):
 		if isinstance(hours, float):
 			hours = round(hours, 6)
@@ -3553,6 +4320,10 @@ end tell""" % (escaped_new, otherStyleTime, otherStyleTime, old_length)
 	def _drain_reminder_queue(self):
 		if not self.reminder_sync_queue:
 			return
+		if getattr(self, '_sync_counter', 0) > 0:
+			return
+		if getattr(self, '_repeat_sync_in_progress', False):
+			return
 		while True:
 			try:
 				message = self.reminder_sync_queue.get_nowait()
@@ -3568,10 +4339,16 @@ end tell""" % (escaped_new, otherStyleTime, otherStyleTime, old_length)
 				if snapshot_timestamp < last_change:
 					continue
 				self._last_reminder_snapshot_ts = snapshot_timestamp
+			elif last_change > 0 and time.time() - last_change < 5:
+				continue
 			self._handle_reminder_snapshot(snapshot)
 
 	def _drain_calendar_queue(self):
 		if not self.calendar_sync_queue:
+			return
+		if getattr(self, '_sync_counter', 0) > 0:
+			return
+		if getattr(self, '_repeat_sync_in_progress', False):
 			return
 		while True:
 			try:
@@ -3588,6 +4365,8 @@ end tell""" % (escaped_new, otherStyleTime, otherStyleTime, old_length)
 				if snapshot_timestamp < last_change:
 					continue
 				self._last_calendar_snapshot_ts = snapshot_timestamp
+			elif last_change > 0 and time.time() - last_change < 5:
+				continue
 			self._handle_calendar_snapshot(snapshot, snapshot_timestamp)
 
 	def _parse_reminder_sync_message(self, message):
@@ -4245,6 +5024,8 @@ end tell""" % (escaped_item, otherStyleTime, otherStyleTime, length_hours)
 			delete (events whose (start date is date "%s") and (summary is "%s"))
 		end tell
 	end tell""" % (otherStyleTime, escaped_find_item)
+			self._mark_local_reminder_change()
+			self.tableWidget.removeRow(find_row)
 			self._run_osascript_batch([cmd, cmd2])
 			self.le4.setText('-')
 			self.le4.setText('')
@@ -6913,9 +7694,9 @@ end tell
 		btn.move(stack.width() - btn.width() - margin, stack.height() - btn.height() - margin)
 		btn.raise_()
 
-	def md2html(self, mdstr):
+	def md2html(self, mdstr, pre_rendered_html=None):
 		extras = ['code-friendly', 'fenced-code-blocks', 'footnotes', 'tables', 'code-color', 'pyshell', 'nofollow',
-				  'cuddled-lists', 'header ids', 'nofollow']
+				  'cuddled-lists', 'header ids', 'strike', 'task_list', 'nofollow']
 
 		html = """
 		<html>
@@ -7019,11 +7800,14 @@ end tell
 		</body>
 		</html>
 		"""
-		clean_one = mdstr.replace('\\(', '$').replace('\\)', '$').replace('\\[', '$').replace('\\]', '$')
-		clean_two = re.sub(r'\$(.*?)\$', lambda m: '$' + re.sub(r'[\n\t ]+', '', m.group(1)) + '$', clean_one,
-						   flags=re.DOTALL)
-		clean_three = re.sub(r'\|(\n(\t)*\n(\t)*)\|', '|\n|', clean_two)
-		ret = markdown2.markdown(clean_three, extras=extras)
+		if pre_rendered_html is None:
+			clean_one = mdstr.replace('\\(', '$').replace('\\)', '$').replace('\\[', '$').replace('\\]', '$')
+			clean_two = re.sub(r'\$(.*?)\$', lambda m: '$' + re.sub(r'[\n\t ]+', '', m.group(1)) + '$', clean_one,
+							   flags=re.DOTALL)
+			clean_three = re.sub(r'\|(\n(\t)*\n(\t)*)\|', '|\n|', clean_two)
+			ret = markdown2.markdown(clean_three, extras=extras)
+		else:
+			ret = pre_rendered_html
 		middlehtml = html % ret
 		html_content = """
 		<!DOCTYPE html>
@@ -7648,9 +8432,10 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 
 			target_width = int(screen_geom.width() / 2)
 			btna4.setChecked(True)
-			self.btn_00.setStyleSheet('''
+			accent = get_accent_color_hex()
+			self.btn_00.setStyleSheet(f'''
 						border: 1px outset grey;
-						background-color: #0085FF;
+						background-color: {accent};
 						border-radius: 4px;
 						padding: 1px;
 						color: #FFFFFF''')
@@ -7840,9 +8625,10 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 
 			target_width = int(screen_geom.width() / 2)
 			btna4.setChecked(True)
-			self.btn_00.setStyleSheet('''
+			accent = get_accent_color_hex()
+			self.btn_00.setStyleSheet(f'''
 						border: 1px outset grey;
-						background-color: #0085FF;
+						background-color: {accent};
 						border-radius: 4px;
 						padding: 1px;
 						color: #FFFFFF''')
@@ -8073,6 +8859,35 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 			action4.setChecked(True)
 			self.auto_record(True)
 
+	@pyqtSlot(str)
+	def on_update_available(self, latest: str):
+		# 这里只在主线程里创建窗口或弹窗
+		# 你可以复用已有的 WindowUpdate 或者弹一个你的自定义对话框
+		# 例：用你已有的 RestartMessageBox/CustomMessageBox 风格
+		msg = CustomMessageBox(
+			self.tr(f"New version %n is available. Open release note page?").replace('%n', latest),
+			parent=self,
+			buttons=(self.tr("Open"), self.tr("Later"))
+		)
+		res = msg.exec()
+		if res == 0:
+			webbrowser.open('https://github.com/Ryan-the-hito/Tomato/releases')
+
+	# 或者你也可以这样：仅在有更新时展示现有的 WindowUpdate 小窗
+	# self.win_update.show()  # 它会 show() 并 checkupdate()，但建议只 show，然后把 latest 显示出来
+
+	@pyqtSlot(str)
+	def on_update_checked_ok(self, latest: str):
+		# 可选：比如在日志里记录或更新某个状态标签（主线程里的标签）
+		# print(f"Checked latest: {latest}")
+		pass
+
+	@pyqtSlot(str)
+	def on_update_checked_error(self, err: str):
+		# 可选：记录错误，不弹框打扰用户
+		# print(f"Check update error: {err}")
+		pass
+
 	def totalquit(self):
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
@@ -8118,6 +8933,18 @@ style_sheet_ori = '''
 		border: 1px solid #ECECEC;
 		background: #ECECEC;
 		border-radius: 9px;
+}
+	QTabBar::tab {
+		background: #C8C8C8;
+		color: #000000;
+		padding: 6px 12px;
+		border: none;
+		border-top-left-radius: 6px;
+		border-top-right-radius: 6px;
+		margin-right: 2px;
+}
+	QTabBar::tab:selected {
+		background: #ECECEC;
 }
 	QTableWidget{
 		border: 1px solid grey;  
@@ -8191,14 +9018,123 @@ style_sheet_ori = '''
 }
 '''
 
+style_sheet_dark = '''
+	QTabWidget::pane {
+		border: 1px solid #2D2D2D;
+		background: #2D2D2D;
+		border-radius: 9px;
+}
+	QTabBar::tab {
+		background: #141414;
+		color: #FFFFFF;
+		padding: 6px 12px;
+		border: none;
+		border-top-left-radius: 6px;
+		border-top-right-radius: 6px;
+		margin-right: 2px;
+}
+	QTabBar::tab:selected {
+		background: #2D2D2D;
+}
+	QTableWidget{
+		border: 1px solid grey;
+		border-radius:4px;
+		background-clip: border;
+		background-color: #3A3A3A;
+		color: #FFFFFF;
+		font: 14pt Helvetica;
+}
+	QPushButton{
+		border: 1px outset grey;
+		background-color: #3A3A3A;
+		border-radius: 4px;
+		padding: 1px;
+		color: #FFFFFF
+}
+	QPushButton:pressed{
+		border: 1px outset grey;
+		background-color: #0085FF;
+		border-radius: 4px;
+		padding: 1px;
+		color: #FFFFFF
+}
+	QPlainTextEdit{
+		border: 1px solid grey;
+		border-radius:4px;
+		padding: 1px 5px 1px 3px;
+		background-clip: border;
+		background-color: #3A3A3A;
+		color: #FFFFFF;
+		font: 14pt Times New Roman;
+}
+	QPlainTextEdit#edit{
+		border: 1px solid grey;
+		border-radius:4px;
+		padding: 1px 5px 1px 3px;
+		background-clip: border;
+		background-color: #3A3A3A;
+		color: #CCCCCC;
+		font: 14pt Helvetica;
+}
+	QTableWidget#small{
+		border: 1px solid grey;
+		border-radius:4px;
+		background-clip: border;
+		background-color: #3A3A3A;
+		color: #FFFFFF;
+		font: 14pt Times New Roman;
+}
+	QLineEdit{
+		border-radius:4px;
+		border: 1px solid gray;
+		background-color: #3A3A3A;
+		color: #FFFFFF;
+}
+	QTextEdit{
+		border: 1px solid grey;
+		border-radius:4px;
+		padding: 1px 5px 1px 3px;
+		background-clip: border;
+		background-color: #3A3A3A;
+		color: #FFFFFF;
+		font: 14pt Times New Roman;
+}
+	QListWidget{
+		border: 1px grey;
+		border-radius:4px;
+		padding: 1px 5px 1px 3px;
+		background-clip: border;
+		background-color: #3A3A3A;
+		color: #FFFFFF;
+		font: 14pt;
+}
+	QLabel{
+		color: #FFFFFF;
+}
+	QMessageBox QPushButton {
+		min-width: 100px;
+		height: 20px;
+}
+	QInputDialog QPushButton {
+		min-width: 100px;
+		height: 20px;
+}
+'''
 
-w1 = window_about()  # about
-w2 = window_update()  # update
+def apply_theme(app):
+	if is_dark_theme(app):
+		set_dark_palette(app)
+		app.setStyleSheet(style_sheet_dark)
+	else:
+		set_light_palette(app)
+		app.setStyleSheet(style_sheet_ori)
+	for widget in app.topLevelWidgets():
+		widget.update()
+
+
+w1 = WindowAbout()  # about
+w2 = WindowUpdate()  # update
 w3 = window3()  # main1
-w3.setAutoFillBackground(True)
-p = w3.palette()
-p.setColor(w3.backgroundRole(), QColor('#ECECEC'))
-w3.setPalette(p)
 tray_time_controller = TimeSensitiveTrayController(
 	menu,
 	time_sensitive_menu,
@@ -8217,7 +9153,7 @@ for i, action in enumerate(repeat_pregenerate_actions):
 # tray.activated.connect(w3.activate)
 btna4.triggered.connect(w3.pin_a_tab2)
 quit.triggered.connect(w3.totalquit)
-app.setStyleSheet(style_sheet_ori)
+apply_theme(app)
 # Start auto-record if the setting is enabled
 w3._start_auto_record_if_enabled()
 app.exec()
