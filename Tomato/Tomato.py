@@ -4,6 +4,13 @@
 # coding=utf-8
 # coding:utf-8
 
+import sys
+# Started by another AI app as its MCP server (shared/APP_MCP_SPEC.md): no window, only the bridge that
+# forwards to the tools of the family's apps on this Mac. Before anything else, so stdout stays clean.
+if '--mcp-stdio' in sys.argv[1:]:
+	import app_mcp_host
+	sys.exit(app_mcp_host.main())
+
 import codecs
 from PyQt6.QtWidgets import (QWidget, QPushButton, QApplication,
 							 QLabel, QHBoxLayout, QVBoxLayout, QLineEdit, QDateEdit, QTimeEdit,
@@ -11,9 +18,9 @@ from PyQt6.QtWidgets import (QWidget, QPushButton, QApplication,
 							 QPlainTextEdit, QTabWidget, QTextEdit, QGraphicsOpacityEffect,
 							 QTableWidget, QTableWidgetItem, QAbstractItemView, QInputDialog,
 							 QMessageBox, QSplitter, QDialogButtonBox, QListWidget, QListWidgetItem, QCheckBox,
-							 QStackedWidget, QTextBrowser, QStyledItemDelegate, QGraphicsDropShadowEffect)
-from PyQt6.QtCore import Qt, QRect, QPropertyAnimation, QDate, QTime, QTimer, QObject, QEvent, QPoint, QRectF, pyqtSignal, QThread, pyqtSlot, QEventLoop
-from PyQt6.QtGui import QAction, QActionGroup, QIcon, QColor, QCursor, QGuiApplication, QPainterPath, QPainter, QPalette, QSurfaceFormat, QPen, QPixmap, QFont
+							 QStackedWidget, QTextBrowser, QStyledItemDelegate, QGraphicsDropShadowEffect, QSizePolicy)
+from PyQt6.QtCore import Qt, QRect, QSize, QPropertyAnimation, QDate, QTime, QTimer, QObject, QEvent, QPoint, QRectF, pyqtSignal, QThread, pyqtSlot, QEventLoop, QMimeData
+from PyQt6.QtGui import QAction, QActionGroup, QIcon, QColor, QCursor, QGuiApplication, QPainterPath, QPainter, QPalette, QSurfaceFormat, QPen, QPixmap, QFont, QTextCursor, QDrag
 import PyQt6.QtGui
 import sys
 import webbrowser
@@ -32,6 +39,10 @@ import logging
 import json
 import queue
 import contextlib
+import atexit
+import hashlib
+import plistlib
+import tempfile
 import markdown2
 from dataclasses import dataclass
 from functools import partial
@@ -43,12 +54,6 @@ except ImportError:
 	NSWorkspaceWillSleepNotification = None
 	NSWorkspaceDidWakeNotification = None
 	NSColor = None
-try:
-	from EventKit import EKEventStore, EKEntityTypeReminder, EKAuthorizationStatusAuthorized
-except ImportError:
-	EKEventStore = None
-	EKEntityTypeReminder = None
-	EKAuthorizationStatusAuthorized = 3
 try:
 	from Foundation import NSDate, NSRunLoop, NSCalendar, NSObject, NSUserDefaults, NSSelectorFromString, NSDistributedNotificationCenter
 	import objc
@@ -62,13 +67,35 @@ import requests
 import html2text
 from bs4 import BeautifulSoup
 
+# UI STYLE BOOK: /Users/ryanshen/Documents/A-workingfilewithp3.11/UI_STYLEBOOK_macOS27.md
+# The system's NEW design (Liquid Glass) for everything macOS draws in this program — the window traffic
+# lights, menus, alerts (style book 5.7.2). macOS picks new vs old design from the SDK the main executable
+# was built with; Python 3.11 and the packaged launcher both say 12.1, so this registration-domain default
+# (this process only, nothing written to the user's settings) has to be set before the QApplication exists.
+if sys.platform == 'darwin' and NSUserDefaults is not None:
+	try:
+		NSUserDefaults.standardUserDefaults().registerDefaults_(
+			{'com.apple.SwiftUI.IgnoreSolariumLinkedOnCheck': True})
+	except Exception:
+		pass
+
+# The Collection page's preview is a web page (2026-11-20, tomato_preview.py): the web engine has to be
+# imported before the QApplication exists. The two flags are the workaround Broccoli / Watermelon use on
+# macOS + Qt 6 (Chromium calls QAccessible::uniqueId with a null pointer while a page loads, and crashes).
+_existing_flags = os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')
+for _flag in ('--disable-blink-features=AccessibilityObjectModel', '--disable-renderer-accessibility'):
+	if _flag not in _existing_flags:
+		_existing_flags = (_existing_flags + ' ' + _flag).strip()
+os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = _existing_flags
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+
 app = QApplication(sys.argv)
 app.setQuitOnLastWindowClosed(False)
 
 BasePath = '/Applications/Tomato.app/Contents/Resources/'
 # BasePath = ''  # test
 
-VERSION = "1.2.8"
+VERSION = "1.2.12"
 NAME = 'Tomato'
 
 os.environ["QT_QUICK_BACKEND"] = "metal"
@@ -77,8 +104,20 @@ fmt = QSurfaceFormat()
 fmt.setSamples(8)  # 打开 MSAA 多重采样抗锯齿
 QSurfaceFormat.setDefaultFormat(fmt)
 
-# Configure logging with file handler for error tracking
-ERROR_LOG_PATH = BasePath + 'tomato_errors.log'
+# The app's identifier and its folders (2026-11-17, Ryan: "当然要改" — the same scheme as Broccoli's and
+# Strawberry's): the bundle id is com.ryanthehito.tomato (was "Tomato"), and what Tomato writes lives under
+#   ~/Library/Application Support/com.ryanthehito.tomato/   TomatoAppPath (the data) + tomato_errors.log
+# Pictures, Record.csv and the translations are still read from the app (BasePath).
+TOMATO_BUNDLE_ID = 'com.ryanthehito.tomato'
+LEGACY_TOMATO_BUNDLE_ID = 'Tomato'
+LEGACY_TOMATO_DATA_DIR = os.path.join(str(Path.home()), 'TomatoAppPath')
+TOMATO_APPLICATION_SUPPORT_DIR = os.path.join(str(Path.home()), 'Library', 'Application Support', TOMATO_BUNDLE_ID)
+TOMATO_DATA_DIR = os.path.join(TOMATO_APPLICATION_SUPPORT_DIR, 'TomatoAppPath')
+os.makedirs(TOMATO_APPLICATION_SUPPORT_DIR, exist_ok=True)
+
+# Configure logging with file handler for error tracking (beside the data folder, not inside the app:
+# the app's own folder is replaced by every update and must not be written to)
+ERROR_LOG_PATH = os.path.join(TOMATO_APPLICATION_SUPPORT_DIR, 'tomato_errors.log')
 logging.basicConfig(
 	level=logging.INFO,
 	format='%(asctime)s - %(levelname)s - %(threadName)s - %(message)s',
@@ -88,8 +127,173 @@ logging.basicConfig(
 	]
 )
 
+# ══ Liquid Glass UI (2026-11-15, style book UI_STYLEBOOK_macOS27.md section 5.12) ══════════════════════
+# The glass kit (glass_kit.py, copied from Broccoli via Strawberry) and Tomato's own parts built on it
+# (tomato_ui.py) live next to this file; both need the QApplication to exist.
+# - main window body: the solid smooth panel Broccoli's main window has (white / #2D2D2D, 36 smooth);
+# - every page: its table fills the page (content, never glass) and the edit part floats on its lower
+#   part as ONE Liquid Glass panel that can be pushed in like a drawer (Ryan 2026-11-15: "表格整个在底下，
+#   然后编辑的部分使用液态玻璃的浮窗浮在上面"; "底部一整块"; "浮窗可以收起");
+# - tab bar: the glass PillNavBar (5.6), never QTabWidget;
+# - buttons: the main action of a block = glass white capsule, the other clustered buttons = grey normal
+#   button; drop-downs = compact grey drop-down with the system menu; inputs = normal single-line input;
+# - date / time boxes = normal inputs, their calendar / clock = small glass pop-ups (5.4.1);
+# - light and dark follow the system live (5.8); every visible text goes through _tr (1.6).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import glass_kit
+import tomato_ui
+import markdown_preview
+import tomato_preview
+# formulas are typeset by Tomato's own MathJax (MathJax-2.7.9/, the trimmed copy; no network. 2026-11-25: up from 2.7.1, which let \unicode put script into the page)
+TOMATO_MATHJAX_DIR = markdown_preview.set_mathjax_folders(
+	os.path.join(BasePath, 'MathJax-2.7.9'), os.path.join(os.path.dirname(os.path.abspath(__file__)), 'MathJax-2.7.9'))
+import tomato_sync
+import tomato_eventkit
+import tomato_broccoli
+import tomato_broccoli_ui
+from glass_kit import (_tr, is_dark_theme, on_theme_changed, install_theme_observer, MacNormalButton,
+					   WhiteButton, StrawberryDropdown, keep_scroll_bar_knob, install_window_liquid_glass,
+					   add_search_glyph, NATIVE_TITLEBAR_HEIGHT)
+from tomato_ui import (GlassTabWidget, FloatPanelStage, edit_panel, panel_line, style_table,
+					   style_date_time_field, glass_calendar_popup, make_native_glass_window,
+					   make_glass_dialog, install_glass_dialog_class, install_native_glass_window_class,
+					   tomato_alert, tomato_confirm, tomato_choice, ask_text, GlassFormDialog, CheckRowDelegate,
+					   apply_tomato_theme, MAIN_ROW_HEIGHT, GREY_ROW_HEIGHT, EndTimeLink, end_time_boxes,
+					   QuickEditCard, ShortcutDialog)
+import tomato_hotkey
+import tomato_diary
+import tomato_tools
+import tomato_feed
+import tomato_report
+import tomato_report_ui
+import share_picture
+
+COLLECTION_ROW_MIME = 'application/x-tomato-collection-row'
+import app_mcp_host
+
+# The interface language (English / 简体中文 / 日本語): chosen in the menu-bar menu, kept with the data,
+# applied at the next launch (the same scheme as Strawberry's and Broccoli's).
+#
+# Where the data lives (2026-11-17, Ryan: "把路径迁移到它应该在的那个路径上…学习 broccoli 的写法…主动地去迁移"):
+#   ~/Library/Application Support/com.ryanthehito.tomato/TomatoAppPath     (was ~/TomatoAppPath)
+# the same layout as Broccoli's and Strawberry's (folder named by the bundle id). The first start with this version moves the old folder
+# there as it is (one rename: every file, the sync marker of a syncing tool included, keeps its place inside).
+# (the constants are above, with the log)
+
+
+def _data_folder_entries(folder: str) -> list:
+	try:
+		return [name for name in os.listdir(folder) if name != '.DS_Store']
+	except OSError:
+		return []
+
+
+def _real_folder(path: str) -> bool:
+	return os.path.isdir(path) and not os.path.islink(path)
+
+
+def _other_tomato_running() -> bool:
+	"""Another Tomato is open right now (an older one still writes to ~/TomatoAppPath)."""
+	try:
+		from AppKit import NSRunningApplication
+		mine = os.getpid()
+		return any(int(running.processIdentifier()) != mine
+				   for bundle_id in (LEGACY_TOMATO_BUNDLE_ID, TOMATO_BUNDLE_ID)
+				   for running in NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle_id))
+	except Exception:
+		return False
+
+
+def _move_legacy_data_folder() -> str:
+	"""'latest' (nothing at the old place) / 'moved' / 'busy' (another Tomato is open and still writes to the
+	old folder: it is used this time, moved on a later start) / 'linked' (~/TomatoAppPath is a link the user
+	made: used as it is) / 'set_aside' (a folder made at the old place again after the move — by an older
+	Tomato: put into the data folder's Backups, never merged back) / 'error' (the old folder is used this
+	time, tried again next start)."""
+	global TOMATO_DATA_DIR
+	old_data, new_data = LEGACY_TOMATO_DATA_DIR, TOMATO_DATA_DIR
+	if os.path.islink(old_data):
+		if not _data_folder_entries(new_data):
+			TOMATO_DATA_DIR = old_data
+			return 'linked'
+		return 'latest'
+	if not _real_folder(old_data):
+		return 'latest'
+	if _other_tomato_running():
+		TOMATO_DATA_DIR = old_data
+		return 'busy'
+	try:
+		if _data_folder_entries(new_data):
+			aside = os.path.join(new_data, 'Backups', 'TomatoAppPath-' + time.strftime('%Y%m%d-%H%M%S'))
+			os.makedirs(os.path.dirname(aside), exist_ok=True)
+			os.rename(old_data, aside)
+			logging.warning('A data folder was made at %s again; it was put into %s.', old_data, aside)
+			return 'set_aside'
+		os.makedirs(os.path.dirname(new_data), exist_ok=True)
+		if os.path.isdir(new_data):
+			shutil.rmtree(new_data)   # empty (at most Finder's .DS_Store)
+		os.rename(old_data, new_data)
+		return 'moved'
+	except OSError:
+		logging.exception('Moving the data folder %s to %s failed.', old_data, new_data)
+		if _real_folder(old_data) and not _data_folder_entries(new_data):
+			TOMATO_DATA_DIR = old_data
+			return 'error'
+		return 'latest'
+
+
+def carry_over_macos_preferences(old_domain: str = LEGACY_TOMATO_BUNDLE_ID, new_domain: str = TOMATO_BUNDLE_ID, *,
+								 only_in_app: bool = True, defaults=None) -> int:
+	"""macOS keeps an app's own remembered state under its bundle id (~/Library/Preferences/<id>.plist: where
+	its menu-bar icon sits, the open-file panel's last folder). The app with the new bundle id takes over what
+	the old id had — what it set itself stays — and the old domain is emptied (macOS keeps its empty file: it
+	writes it back a few seconds after a delete, so it is left to macOS). Only in the packaged app (run from
+	source, the domain is Python's). How many settings were carried over. (Broccoli's / Strawberry's.)"""
+	try:
+		if only_in_app:
+			from Foundation import NSBundle
+			if str(NSBundle.mainBundle().bundleIdentifier() or '') != new_domain:
+				return 0
+		if defaults is None:
+			defaults = NSUserDefaults.standardUserDefaults()
+		old = defaults.persistentDomainForName_(old_domain)
+		if not old:
+			return 0
+		current = defaults.persistentDomainForName_(new_domain) or {}
+		merged = dict(old)
+		merged.update(dict(current))
+		defaults.setPersistentDomain_forName_(merged, new_domain)
+		defaults.removePersistentDomainForName_(old_domain)
+		return len(set(dict(old)) - set(dict(current)))
+	except Exception:
+		logging.exception('Carrying the macOS preferences over to %s failed.', new_domain)
+		return 0
+
+
+DATA_FOLDER_MOVE_REPORT = _move_legacy_data_folder()
+MACOS_PREFERENCES_CARRIED_OVER = carry_over_macos_preferences()
+os.makedirs(TOMATO_DATA_DIR, exist_ok=True)
+UI_LANGUAGE = tomato_ui.read_ui_language_setting(TOMATO_DATA_DIR)
+tomato_ui.load_translation(UI_LANGUAGE, [os.path.join(BasePath, 'i18n'),
+										 os.path.join(os.path.dirname(os.path.abspath(__file__)), 'i18n')])
+_app_font = QFont('Helvetica Neue')
+_app_font.setPixelSize(13)
+app.setFont(_app_font)
+
+
+EDIT_PANEL_COLUMNS_HEIGHT = 236  # the three columns of an edit panel (filter + buttons | comments | diary)
+
+
+def compact_dropdown(parent=None):
+	"""A drop-down in the edit panel: the compact grey drop-down (22 high, the system menu pops up; 5.2)."""
+	return StrawberryDropdown(parent, compact_light=True)
+
+
 # Create the icon
-icon = QIcon(BasePath + "tmt.icns")
+# the menu-bar icon has a picture of its own (tomatomen.icns: drawn for that small size); the Dock icon is the
+# app's icon, tomato.icns. A copy of the app without the menu-bar picture falls back to the app's icon.
+_menu_bar_icon_path = BasePath + "tomatomen.icns"
+icon = QIcon(_menu_bar_icon_path if os.path.isfile(_menu_bar_icon_path) else BasePath + "tomato.icns")
 
 # Create the tray
 tray = QSystemTrayIcon()
@@ -99,27 +303,27 @@ tray.setVisible(True)
 # Create the menu
 menu = QMenu()
 
-tray_selected_section = menu.addSection("⏱ 主清单（倒计时）")
+tray_selected_section = menu.addSection(_tr("⏱ Main list (countdown)"))
 tray_selected_section.setVisible(False)
 tray_selected_separator = menu.addSeparator()
 tray_selected_separator.setVisible(False)
 
-time_sensitive_menu = menu.addMenu("🕒 Countdown")
+time_sensitive_menu = menu.addMenu(_tr("🕒 Countdown"))
 menu.addSeparator()
 
-action3 = QAction("📝 Plan + record!")
+action3 = QAction(_tr("📝 Plan + record!"))
 menu.addAction(action3)
 
-action4 = QAction("👀 Auto-record!")
+action4 = QAction(_tr("👀 Auto-record!"))
 action4.setCheckable(True)
 menu.addAction(action4)
 
-action_auto_record_startup = QAction("🔄 Auto-record on startup")
+action_auto_record_startup = QAction(_tr("🔄 Auto-record on startup"))
 action_auto_record_startup.setCheckable(True)
 menu.addAction(action_auto_record_startup)
 
 # Submenu for repeat pre-generation count
-repeat_pregenerate_menu = menu.addMenu("🔁 Repeat pre-generate count")
+repeat_pregenerate_menu = menu.addMenu(_tr("🔁 Repeat pre-generate count"))
 repeat_pregenerate_actions = []
 repeat_pregenerate_action_group = QActionGroup(menu)
 repeat_pregenerate_action_group.setExclusive(True)
@@ -132,35 +336,116 @@ for i in range(1, 16):
 	repeat_pregenerate_menu.addAction(action)
 	repeat_pregenerate_actions.append(action)
 
+# The main window above every other window, or an ordinary window (Broccoli's switch; kept in the settings file).
+action_always_on_top = QAction(_tr("📌 Always on top"))
+action_always_on_top.setCheckable(True)
+action_always_on_top.setChecked(True)
+menu.addAction(action_always_on_top)
+
+# Dock icon shown or hidden, Broccoli's / Strawberry's way: the app starts without one (LSBackgroundOnly in
+# Tomato.spec) and shows it at run time unless it was hidden here. Hidden, Tomato lives in the menu bar only:
+# no Dock icon, no app menu, not in Command-Tab; its windows still open from this menu and from the edge strip.
+def set_dock_icon_visible(visible, activate=False):
+	"""(Broccoli's.) Regular app with a Dock icon, or an accessory app without one."""
+	try:
+		from AppKit import NSApplication
+		ns_app = NSApplication.sharedApplication()
+		ns_app.setActivationPolicy_(0 if visible else 1)
+		if visible and activate:
+			ns_app.activateIgnoringOtherApps_(True)
+		return True
+	except Exception:
+		logging.exception('Failed to change the Dock icon visibility.')
+		return False
+
+
+action_dock_icon = QAction(_tr("👀 Show/Hide dock icon"))
+action_dock_icon.setCheckable(True)
+action_dock_icon.setChecked(True)
+menu.addAction(action_dock_icon)
+
+# Tomato's windows on every desktop (Space) and over other apps' full-screen windows, or only on the desktop
+# they were opened on (Broccoli's switch; on unless switched off — Tomato always was on every desktop).
+action_all_spaces = QAction(_tr("🪟 Show on all Spaces"))
+action_all_spaces.setCheckable(True)
+action_all_spaces.setChecked(True)
+menu.addAction(action_all_spaces)
+
+# The show / hide shortcut (2026-11-22, tomato_hotkey.py): set in a small dialog; ⌃⌥T unless changed.
+action_shortcut = QAction(_tr("⌨️ Show/Hide shortcut…"))
+menu.addAction(action_shortcut)
+
+# The tasks Tomato sends to Broccoli at their time (tomato_broccoli.py): the manager window.
+action_broccoli_tasks = QAction(_tr("🥦 Broccoli tasks…"))
+menu.addAction(action_broccoli_tasks)
+
+# What Broccoli's background vision sees goes into the diary, one short line per look (tomato_feed.py, 2026-11-23).
+action_vision_diary = QAction(_tr("👁 Broccoli's view in diary"))
+action_vision_diary.setCheckable(True)
+action_vision_diary.setChecked(True)
+menu.addAction(action_vision_diary)
+
+# The day / week / month gathered into one page (tomato_report.py, 2026-11-23/24): the window with the month, the reports, the language.
+action_daily_report = QAction(_tr("📊 Reports…"))
+menu.addAction(action_daily_report)
+
+# Tomato's tools in any other AI app that speaks MCP (Claude Desktop, Cursor, …; 2026-11-24): copies the setup lines.
+action_ai_apps = QAction(_tr("🔌 Use in other AI apps…"))
+menu.addAction(action_ai_apps)
+
+
+def _copy_ai_apps_setup() -> None:
+	QGuiApplication.clipboard().setText(app_mcp_host.bridge_setup_json())
+	tomato_alert(None, _tr('Use in other AI apps'),
+				 _tr('The setup is copied. Paste it into the MCP settings of your AI app (for example Claude Desktop or Cursor). '
+					 'The AI app can then use the tools of Tomato and of your other apps on this Mac.'))
+
+# The interface language: applied at the next launch.
+lang_menu = QMenu(_tr("🌐 Language"))
+menu.addMenu(lang_menu)
+_lang_menu_actions = {}
+
+
+def _on_ui_language_chosen(code: str) -> None:
+	tomato_ui.write_ui_language_setting(TOMATO_DATA_DIR, code)
+	for _code, _action in _lang_menu_actions.items():
+		_action.setChecked(_code == code)
+	if code != UI_LANGUAGE:
+		tomato_alert(None, _tr('Language'), _tr('The language setting will apply after Tomato restarts.'))
+
+
+for _lang_code, _lang_label in tomato_ui.UI_LANGUAGES:
+	_lang_action = QAction(_lang_label)
+	_lang_action.setCheckable(True)
+	_lang_action.setChecked(_lang_code == UI_LANGUAGE)
+	_lang_action.triggered.connect(lambda _checked, c=_lang_code: _on_ui_language_chosen(c))
+	_lang_menu_actions[_lang_code] = _lang_action
+	lang_menu.addAction(_lang_action)
+
 menu.addSeparator()
 
-action2 = QAction("🆕 Check for Updates")
+action2 = QAction(_tr("🆕 Check for Updates"))
 menu.addAction(action2)
 
-action1 = QAction("ℹ️ About")
+action1 = QAction(_tr("ℹ️ About"))
 menu.addAction(action1)
 
 menu.addSeparator()
 
 # Add a Quit option to the menu.
-quit = QAction("Quit")
+quit = QAction(_tr("Quit"))
 menu.addAction(quit)
 
 # Add the menu to the tray
 tray.setContextMenu(menu)
 
 # create a system menu
-btna4 = QAction("&Pin!")
+btna4 = QAction(_tr("&Pin!"))
 btna4.setCheckable(True)
 sysmenu = QMenuBar()
-file_menu = sysmenu.addMenu("&Actions")
+file_menu = sysmenu.addMenu(_tr("&Actions"))
 file_menu.addAction(btna4)
 
-
-def is_dark_theme(app):
-	defaults = NSUserDefaults.standardUserDefaults()
-	style = defaults.stringForKey_("AppleInterfaceStyle")
-	return style == "Dark"
 
 def get_accent_color_hex():
 	try:
@@ -175,57 +460,7 @@ def get_accent_color_hex():
 		pass
 	return "#0A84FF"
 
-def set_light_palette(app):
-	palette = QPalette()
-	palette.setColor(QPalette.ColorRole.Window, QColor(255, 255, 255))
-	palette.setColor(QPalette.ColorRole.WindowText, QColor(0, 0, 0))
-	palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255))
-	palette.setColor(QPalette.ColorRole.Text, QColor(0, 0, 0))
-	palette.setColor(QPalette.ColorRole.Button, QColor(240, 240, 240))
-	palette.setColor(QPalette.ColorRole.ButtonText, QColor(0, 0, 0))
-	app.setPalette(palette)
 
-def set_dark_palette(app):
-	palette = QPalette()
-	palette.setColor(QPalette.ColorRole.Window, QColor(30, 30, 30))
-	palette.setColor(QPalette.ColorRole.WindowText, QColor(220, 220, 220))
-	palette.setColor(QPalette.ColorRole.Base, QColor(40, 40, 40))
-	palette.setColor(QPalette.ColorRole.Text, QColor(220, 220, 220))
-	palette.setColor(QPalette.ColorRole.Button, QColor(50, 50, 50))
-	palette.setColor(QPalette.ColorRole.ButtonText, QColor(220, 220, 220))
-	app.setPalette(palette)
-
-
-class ThemeObserver(NSObject):
-	def initWithApp_(self, app):
-		self = objc.super(ThemeObserver, self).init()
-		self.app = app
-		return self
-
-	def themeChanged_(self, notification):
-		# 主题变更时自动切换 palette + stylesheet
-		apply_theme(self.app)
-
-
-def install_theme_observer(app):
-	observer = ThemeObserver.alloc().initWithApp_(app)
-	center = NSDistributedNotificationCenter.defaultCenter()
-	center.addObserver_selector_name_object_(
-		observer,
-		NSSelectorFromString("themeChanged:"),
-		"AppleInterfaceThemeChangedNotification",
-		None
-	)
-	return observer
-
-#app = QApplication(sys.argv)
-
-if is_dark_theme(app):
-	set_dark_palette(app)
-else:
-	set_light_palette(app)
-
-theme_observer = install_theme_observer(app)
 
 
 class SleepWakeState:
@@ -278,72 +513,61 @@ def _register_sleep_wake_observer():
 		logging.exception("Failed to register sleep/wake observer; continuing without it.")
 
 
-def _system_active():
+def _system_pause_reason():
+	"""None, 'away' (asleep, nobody logged in) or 'front' (Reminders / Calendar is the front app)."""
 	if sleep_wake_state.is_sleeping():
-		return False
+		return 'away'
 	if NSWorkspace is None:
-		return True
+		return None
 	try:
 		active_app = NSWorkspace.sharedWorkspace().activeApplication()
 	except Exception:
 		# If we cannot read active application, do not pause the threads
-		return True
+		return None
 	if not active_app:
-		return False
+		return 'away'
 	app_name = active_app.get('NSApplicationName')
-	if not app_name or app_name == 'loginwindow' or app_name == 'Reminders' or app_name == 'Calendar':
-		return False
-	return True
-
-
-def is_newer_version(latest: str, current: str) -> bool:
-	# 'v0.0.12' vs 'v0.0.11'
-	def parse(v: str):
-		return [int(x) for x in v.lstrip('vV').split('.')]
-	try:
-		return parse(latest) > parse(current)
-	except Exception:
-		return False
+	if not app_name or app_name == 'loginwindow':
+		return 'away'
+	if app_name == 'Reminders' or app_name == 'Calendar':
+		return 'front'
+	return None
 
 
 _register_sleep_wake_observer()
 
 
-class UpdateCheckWorker(QThread):
-	update_available = pyqtSignal(str)  # latest version, e.g., 'v0.0.13'
-	checked_ok = pyqtSignal(str)		# latest version (even if not newer),用于日志或状态
-	checked_error = pyqtSignal(str)	 # error message
+class _MainThreadRunner(QObject):
+	"""runner(fn): fn runs on the main thread, the calling thread gets what it returned (or its exception)."""
+	_call = pyqtSignal(object)
 
-	def __init__(self, current_version: str, interval_seconds: int = 86400, parent=None):
-		super().__init__(parent)
-		self._running = True
-		self.current_version = current_version  # e.g., 'v0.0.12'
-		self.interval_seconds = interval_seconds
+	def __init__(self):
+		super().__init__()
+		self._call.connect(self._run)      # emitted from another thread → queued to this object's (the main) thread
 
-	def stop(self):
-		self._running = False
+	def _run(self, job):
+		job()
 
-	def run(self):
-		# 循环：只要应用在运行，就每隔 interval 检查一次
-		while self._running:
+	def __call__(self, fn):
+		if threading.current_thread() is threading.main_thread():
+			return fn()
+		box, done = {}, threading.Event()
+
+		def job():
 			try:
-				text = WindowUpdate.fetch_latest_version_text()
-				latest = WindowUpdate.extract_latest_tag(text) if text else None
-				if latest:
-					self.checked_ok.emit(latest)
-					if is_newer_version(latest, 'v' + VERSION):
-						# 通知主线程有新版本
-						self.update_available.emit(latest)
-				else:
-					self.checked_error.emit("No version tag found")
-			except Exception as e:
-				self.checked_error.emit(str(e))
+				box['value'] = fn()
+			except BaseException as exc:
+				box['error'] = exc
+			done.set()
+		self._call.emit(job)
+		done.wait()
+		if 'error' in box:
+			raise box['error']
+		return box.get('value')
 
-			# 可中断的“休眠”24小时
-			for _ in range(self.interval_seconds):
-				if not self._running:
-					return
-				self.msleep(1000)
+	def post(self, fn):
+		"""fn runs on the main thread a moment later; the caller does not wait."""
+		self._call.emit(fn)
 
 
 class AutoRecordThread(threading.Thread):
@@ -358,7 +582,7 @@ class AutoRecordThread(threading.Thread):
 
 	def run(self):
 		while not self._stop_event.wait(1):
-			if not _system_active():
+			if _system_pause_reason() == 'away':    # asleep / nobody logged in; every app is recorded, Reminders and Calendar too
 				if not self._paused_logged:
 					logging.info("AutoRecordThread paused (system inactive).")
 					self._paused_logged = True
@@ -382,10 +606,7 @@ class AutoRecordThread(threading.Thread):
 	def auto_scan(self):
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
-		diary_file = self.diary_dir / f"{theTime}.md"
-		if not diary_file.exists():
-			with diary_file.open('a', encoding='utf-8') as f0:
-				f0.write(f'# {theTime}')
+		tomato_diary.ensure(self.diary_dir)
 		if NSWorkspace is None:
 			return
 		try:
@@ -398,8 +619,7 @@ class AutoRecordThread(threading.Thread):
 		app_name = active_app.get('NSApplicationName')
 		if self._last_active_name is None:
 			pretext = '\n\n- %s -(Tomato)' % datetime.datetime.now().strftime('%H:%M:%S ')
-			with diary_file.open('a', encoding='utf-8') as f0:
-				f0.write(pretext)
+			tomato_diary.append_raw(self.diary_dir, pretext)
 		if app_name and app_name != self._last_active_name:
 			self._last_active_name = app_name
 			parta = '- %s \n\n- %s -(%s)' % (
@@ -407,236 +627,148 @@ class AutoRecordThread(threading.Thread):
 				datetime.datetime.now().strftime('%H:%M:%S'),
 				app_name
 			)
-			with diary_file.open('a', encoding='utf-8') as f0:
-				f0.write(parta)
+			tomato_diary.append_raw(self.diary_dir, parta)
 
 
-class ReminderSyncThread(threading.Thread):
-	def __init__(self, output_queue, interval_seconds=120):
+class SystemSyncSignals(QObject):
+	ready = pyqtSignal()      # a reading is in the queue (sent from the reading thread)
+
+
+class SystemSyncThread(threading.Thread):
+	"""Reads the Calendar and the Reminders list back to back and hands the pair over, so the main thread
+	decides about both at once (tomato_sync.reconcile). A pass runs: every `interval` seconds; when the Mac
+	wakes; when the main thread asks (request()); and — with the system interface — SETTLE seconds after the
+	system said that something changed (note_change(): a change made in Reminders, in Calendar or on another
+	device is on the table a moment later, also while one of the two apps stays in front; several changes in
+	a row are one pass).
+
+	Both are read through the system interface (tomato_eventkit: hundredths of a second, the two apps are
+	not woken). Without full access to Calendars the calendar is read by asking Calendar.app (17–28 s for
+	130 events): then, as before, nothing is read while Reminders / Calendar are in front (looked at again
+	every TICK seconds, read at once when they leave), change notices are not followed, and the passes keep
+	the long interval."""
+	TICK = 2.0
+	MIN_GAP = 10.0            # between two passes on the old way, however often the front app changes
+	FAST_INTERVAL = 30        # seconds between passes when a pass costs next to nothing
+	FAST_MIN_GAP = 1.5
+	SETTLE = 1.5              # after the last change notice: the hand has left the item
+	CALENDAR_TIMEOUT = 150    # seconds; Calendar.app answers a column of 130 events in about 7
+
+	def __init__(self, output_queue, interval_seconds=120, on_reading=None):
 		super().__init__(daemon=True)
 		self.output_queue = output_queue
 		self.interval = max(30, int(interval_seconds))
+		self.on_reading = on_reading
 		self._stop_event = threading.Event()
+		self._requested = threading.Event()
+		self._wake = threading.Event()
+		self._changed_at = 0.0
+		self._store = tomato_eventkit.STORE
 		self._paused_logged = False
-		self._event_store = None
-		self._eventkit_warned_missing = False
-		self._eventkit_warned_denied = False
-		self._paused_logged = False
+		self._no_access_logged = False
 
 	def stop(self, timeout=2.0):
 		self._stop_event.set()
+		self._wake.set()
 		if self.is_alive():
 			self.join(timeout)
 
-	def run(self):
-		while not self._stop_event.is_set():
-			if not _system_active():
-				if not self._paused_logged:
-					logging.info("ReminderSyncThread paused (system inactive).")
-					self._paused_logged = True
-				if self._stop_event.wait(self.interval):
-					break
-				continue
-			if self._paused_logged:
-				logging.info("ReminderSyncThread resumed.")
-				self._paused_logged = False
-			try:
-				start_time = time.time()
-				snapshot = self._fetch_snapshot()
-				if snapshot is not None:
-					self.output_queue.put({
-						'timestamp': start_time,
-						'snapshot': snapshot
-					})
-			except Exception:
-				logging.exception("Failed to fetch reminders snapshot.")
-			if self._stop_event.wait(self.interval):
-				break
+	def request(self):
+		self._requested.set()
+		self._wake.set()
 
-	def _fetch_snapshot(self):
-		return self._fetch_snapshot_eventkit()
+	def note_change(self):
+		"""The system said that reminders / events changed (any thread)."""
+		if not self._store.events_ok:
+			return      # old way: a pass asks Calendar.app for half a minute; the timed passes do
+		self._changed_at = time.time()
+		self._wake.set()
 
-	def _fetch_snapshot_eventkit(self):
-		# Fast path using EventKit so we do not wake Reminders.app
-		if not EKEventStore or not NSRunLoop or not NSCalendar:
-			if not self._eventkit_warned_missing:
-				logging.warning("EventKit modules not available; reminder sync disabled (JXA disabled).")
-				self._eventkit_warned_missing = True
-			return None
-		try:
-			if self._event_store is None:
-				self._event_store = EKEventStore.alloc().init()
-			if not self._ensure_eventkit_access():
-				return None
-			calendars = [
-				cal for cal in self._event_store.calendarsForEntityType_(EKEntityTypeReminder)
-				if cal.title() == "Tomato"
-			]
-			if not calendars:
-				return []
-			# Limit window to reduce payload; adjust if you need older/future items
-			start_date = NSDate.dateWithTimeIntervalSinceNow_(-30 * 24 * 60 * 60)
-			end_date = NSDate.dateWithTimeIntervalSinceNow_(365 * 24 * 60 * 60)
-			start_ts = start_date.timeIntervalSince1970()
-			end_ts = end_date.timeIntervalSince1970()
-			# Fetch both completed and incomplete reminders so completions are detected
-			predicate = self._event_store.predicateForRemindersInCalendars_(calendars)
-			raw_reminders = self._fetch_eventkit_reminders(predicate)
-			result = []
-			calendar = NSCalendar.currentCalendar()
-			for rem in raw_reminders:
-				due_components = rem.dueDateComponents()
-				if not due_components:
-					continue
-				due_date = calendar.dateFromComponents_(due_components)
-				if not due_date:
-					continue
-				ts = due_date.timeIntervalSince1970()
-				if ts < start_ts or ts > end_ts:
-					continue
-				result.append({
-					'id': rem.calendarItemIdentifier() or "",
-					'name': rem.title() or "",
-					'stamp': int(ts),
-					'completed': bool(rem.isCompleted())
-				})
-			return result
-		except Exception:
-			logging.exception("EventKit reminder fetch failed.")
-			self._event_store = None
-			return None
-
-	def _ensure_eventkit_access(self):
-		status = EKEventStore.authorizationStatusForEntityType_(EKEntityTypeReminder)
-		if status == EKAuthorizationStatusAuthorized:
-			return True
-		if status not in (0,):  # 0 == NotDetermined
-			if not self._eventkit_warned_denied:
-				logging.warning("EventKit reminders access denied; reminder sync disabled (JXA disabled).")
-				self._eventkit_warned_denied = True
-			return False
-		done = threading.Event()
-		granted_flag = {'val': False}
-
-		def _handler(granted, error):
-			granted_flag['val'] = bool(granted)
-			done.set()
-
-		self._event_store.requestAccessToEntityType_completion_(EKEntityTypeReminder, _handler)
-		while not done.wait(0.1):
-			NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
-		return granted_flag['val']
-
-	def _fetch_eventkit_reminders(self, predicate):
-		done = threading.Event()
-		results = []
-
-		def _handler(reminders):
-			if reminders:
-				results.extend(reminders)
-			done.set()
-
-		self._event_store.fetchRemindersMatchingPredicate_completion_(predicate, _handler)
-		while not done.wait(0.1):
-			NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
-		return results
-
-class CalendarSyncThread(threading.Thread):
-	def __init__(self, output_queue, interval_seconds=120):
-		super().__init__(daemon=True)
-		self.output_queue = output_queue
-		self.interval = max(30, int(interval_seconds))
-		self._stop_event = threading.Event()
-
-	def stop(self, timeout=2.0):
-		self._stop_event.set()
-		if self.is_alive():
-			self.join(timeout)
+	def _must_wait(self):
+		reason = _system_pause_reason()
+		if reason == 'front':
+			return not self._store.events_ok    # the system interface does not disturb the two apps
+		return reason is not None
 
 	def run(self):
-		if not hasattr(self, '_paused_logged'):
-			self._paused_logged = False
+		next_due = 0.0
+		last_pass = 0.0
+		held = False
 		while not self._stop_event.is_set():
-			if not _system_active():
+			self._wake.clear()
+			now = time.time()
+			if self._store.events_ok is None and _system_pause_reason() != 'away':
+				with contextlib.suppress(Exception):
+					self._store.ensure_access()   # which way it goes decides whether the front app matters
+			direct = bool(self._store.events_ok)
+			gap = self.FAST_MIN_GAP if direct else self.MIN_GAP
+			changed = self._changed_at
+			settled = bool(changed) and now - changed >= self.SETTLE
+			pause = self.TICK
+			if self._must_wait():
+				held = True
 				if not self._paused_logged:
-					logging.info("CalendarSyncThread paused (system inactive).")
+					logging.info("SystemSyncThread paused (system inactive).")
 					self._paused_logged = True
-				if self._stop_event.wait(self.interval):
-					break
-				continue
-			if self._paused_logged:
-				logging.info("CalendarSyncThread resumed.")
-				self._paused_logged = False
-			try:
-				start_time = time.time()
-				snapshot = self._fetch_snapshot()
-				if snapshot is not None:
-					self.output_queue.put({
-						'timestamp': start_time,
-						'snapshot': snapshot
-					})
-			except Exception:
-				logging.exception("Failed to fetch calendar snapshot.")
-			if self._stop_event.wait(self.interval):
+			elif held or self._requested.is_set() or settled or now >= next_due:
+				if now - last_pass >= gap:
+					if self._paused_logged:
+						logging.info("SystemSyncThread resumed.")
+						self._paused_logged = False
+					held = False
+					self._requested.clear()
+					if self._changed_at == changed:
+						self._changed_at = 0.0
+					try:
+						self._pass()
+					except Exception:
+						logging.exception("Failed to read Reminders / Calendar.")
+					last_pass = time.time()
+					next_due = last_pass + (min(self.interval, self.FAST_INTERVAL) if self._store.events_ok else self.interval)
+				else:
+					pause = min(pause, gap - (now - last_pass) + 0.02)
+			elif changed:
+				pause = min(pause, self.SETTLE - (now - changed) + 0.02)
+			if self._stop_event.is_set():
 				break
+			self._wake.wait(max(0.05, pause))
 
-	def _fetch_snapshot(self):
-		script = r'''
-function run() {
-	var result = {status: "ok", data: []};
-	try {
-		var app = Application("Calendar");
-		var cals = app.calendars.whose({name: "Tomato"});
-		if (cals.length === 0) {
-			result.status = "missing";
-			return JSON.stringify(result);
-		}
-		var cal = cals[0];
-		var events = cal.events();
-		for (var i = 0; i < events.length; i++) {
-			var ev = events[i];
-			var start = ev.startDate();
-			if (!start) {
-				continue;
-			}
-			var end = ev.endDate();
-			var duration = 0;
-			if (end) {
-				duration = Math.floor((end.getTime() - start.getTime()) / 1000);
-			}
-			result.data.push({
-				id: ev.id(),
-				name: ev.summary() || "",
-				stamp: Math.floor(start.getTime() / 1000),
-				duration: duration
-			});
-		}
-	} catch (err) {
-		result.status = "error";
-		result.message = err.toString();
-	}
-	return JSON.stringify(result);
-}
-'''
+	def _pass(self):
+		self._store.ensure_access()   # the first time the system asks; the answer is waited for here
+		if not self._store.reminders_ok:
+			if not self._no_access_logged:
+				logging.warning("No access to Reminders; nothing is synchronised.")
+				self._no_access_logged = True
+			return
+		started = time.time()
+		event_window = None
+		if self._store.events_ok:
+			calendar, event_window = self._store.read_events(started)
+		else:
+			calendar = self._fetch_calendar()
+		if self._must_wait():
+			self._requested.set()   # Reminders / Calendar came to the front meanwhile: read again afterwards
+			return
+		# the same stretch as always: 30 days back, a year ahead
+		reminders = self._store.read_reminders(started - 30 * 86400, started + 365 * 86400)
+		if reminders is None:
+			return
+		self.output_queue.put({'timestamp': started, 'reminders': reminders, 'calendar': calendar, 'event_window': event_window})
+		if self.on_reading:
+			with contextlib.suppress(Exception):
+				self.on_reading()       # the main thread looks at it now (it also looks every few seconds)
+
+	def _fetch_calendar(self):
+		"""The events of the "Tomato" calendar, or None when it could not be read as a whole (then nothing
+		is decided about events in this pass)."""
 		try:
-			output = subprocess.check_output(
-				['osascript', '-l', 'JavaScript', '-e', script],
-				text=True
-			).strip()
-		except subprocess.CalledProcessError:
+			output = subprocess.run(
+				['osascript', '-l', 'JavaScript', '-e', tomato_sync.CALENDAR_SNAPSHOT_JXA],
+				capture_output=True, text=True, timeout=self.CALENDAR_TIMEOUT
+			).stdout.strip()
+		except (subprocess.SubprocessError, OSError):
 			return None
-		if not output:
-			return None
-		try:
-			payload = json.loads(output)
-		except json.JSONDecodeError:
-			logging.warning("Unable to parse calendar snapshot: %s", output)
-			return None
-		if payload.get('status') != 'ok':
-			if payload.get('status') not in ('missing', 'error'):
-				logging.warning("Unexpected calendar snapshot status: %s", payload.get('status'))
-			return None
-		return payload.get('data', [])
+		return tomato_sync.parse_calendar_snapshot(output)
 
 
 class AppleScriptWorkerSignals(QObject):
@@ -662,9 +794,34 @@ class AppleScriptWorker(threading.Thread):
 		if not self.script_chunks:
 			self.signals.finished.emit()
 			return
-		script = '\n'.join(self.script_chunks)
+		# what Tomato asks for in these texts goes straight to the system interface where the access is there
+		# (hundredths of a second); the rest runs as AppleScript, as before
+		store = tomato_eventkit.STORE
+		direct, remaining = [], []
+		for chunk in self.script_chunks:
+			ops = tomato_sync.parse_script(chunk) if store.reminders_ok else None
+			if ops is not None and store.can(ops):
+				direct.extend(ops)
+			else:
+				remaining.append(chunk)
+		if direct:
+			try:
+				store.apply(direct)
+			except Exception:
+				logging.exception("System interface: the changes could not be sent.")
+		# each command on its own: one that fails (nothing matched, a calendar that is gone) used to stop
+		# every command after it in the same batch
+		parts = []
+		for chunk in remaining:
+			text = (chunk or '').strip()
+			if text.startswith('tell application') and text.endswith('end tell'):
+				parts.append('try\n%s\nend try' % text)
+			elif text:
+				parts.append(text)
+		script = '\n'.join(parts)
 		try:
-			subprocess.call(['osascript', '-e', script])
+			if script:
+				subprocess.call(['osascript', '-e', script])
 		except Exception as e:
 			self._error = str(e)
 			self.signals.error.emit(str(e))
@@ -734,7 +891,7 @@ class TimeSensitiveTrayController(QObject):
 	def _build_submenu_actions(self, tasks):
 		self.submenu.clear()
 		if not tasks:
-			no_item_action = QAction("No Countdown for now", self.submenu)
+			no_item_action = QAction(_tr("No Countdown for now"), self.submenu)
 			no_item_action.setEnabled(False)
 			self.submenu.addAction(no_item_action)
 			return
@@ -792,7 +949,7 @@ class TimeSensitiveTrayController(QObject):
 		now = now or datetime.datetime.now()
 		delta_seconds = (task.due - now).total_seconds()
 		countdown_text = self._format_countdown(delta_seconds)
-		prefix = "Still: " if delta_seconds >= 0 else "Overdue: "
+		prefix = _tr("Still: ") if delta_seconds >= 0 else _tr("Overdue: ")
 		action.setText(f"{task.name} · {task.due_label} · {prefix}{countdown_text}")
 
 	def _reorder_main_actions(self, now=None):
@@ -826,13 +983,13 @@ class TimeSensitiveTrayController(QObject):
 		minutes, rem = divmod(rem, 60)
 		parts = []
 		if days:
-			parts.append(f"{days} Days")
+			parts.append(_tr('%n Days').replace('%n', str(days)))
 		if hours:
-			parts.append(f" {hours} Hours")
+			parts.append(' ' + _tr('%n Hours').replace('%n', str(hours)))
 		if minutes:
-			parts.append(f" {minutes} Minutes")
+			parts.append(' ' + _tr('%n Minutes').replace('%n', str(minutes)))
 		if not parts:
-			parts.append(f" {rem} Seconds")
+			parts.append(' ' + _tr('%n Seconds').replace('%n', str(rem)))
 		return "".join(parts[:3])
 
 	def _update_section_visibility(self):
@@ -997,12 +1154,14 @@ class TableEditDelegate(QStyledItemDelegate):
 
 
 class ClockPickerPopup(QWidget):
-	"""A hover-triggered clock picker popup for selecting time"""
+	"""A hover-triggered clock picker popup for selecting time: a small Liquid Glass pop-up (style book
+	5.4.1 — window glass, corner 9, the system window shadow); without glass the same shape, solid."""
 	time_changed = PyQt6.QtCore.pyqtSignal(QTime)
 
 	def __init__(self, parent=None):
 		super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
-		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+		self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
 		self.selected_hour = 12
 		self.selected_minute = 0
 		self.selecting_hour = True
@@ -1013,38 +1172,23 @@ class ClockPickerPopup(QWidget):
 		self.initUI()
 
 	def initUI(self):
-		self.setFixedSize(220, 280)
+		self.setFixedSize(220, 286)
 
 		layout = QVBoxLayout()
-		layout.setContentsMargins(6, 6, 6, 6)
-		layout.setSpacing(4)
+		layout.setContentsMargins(8, 8, 8, 8)
+		layout.setSpacing(6)
 
 		# Time display at top
 		self.time_display = QLabel()
 		self.time_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
-		self.time_display.setStyleSheet("""
-			QLabel {
-				font-size: 22px;
-				font-weight: bold;
-				padding: 5px;
-				background-color: #2196F3;
-				color: white;
-				border-radius: 4px;
-			}
-		""")
 		self.update_time_display()
 		layout.addWidget(self.time_display)
 
-		# Mode toggle buttons
+		# Mode toggle buttons (grey normal buttons; the chosen one is filled with the system accent)
 		mode_layout = QHBoxLayout()
-		mode_layout.setSpacing(4)
-		self.hour_btn = QPushButton('Hour')
-		self.minute_btn = QPushButton('Minute')
-		self.hour_btn.setCheckable(True)
-		self.minute_btn.setCheckable(True)
-		self.hour_btn.setChecked(True)
-		self.hour_btn.setFixedHeight(22)
-		self.minute_btn.setFixedHeight(22)
+		mode_layout.setSpacing(6)
+		self.hour_btn = MacNormalButton(_tr('Hour'), self)
+		self.minute_btn = MacNormalButton(_tr('Minute'), self)
 		self.hour_btn.clicked.connect(lambda: self.set_mode(True))
 		self.minute_btn.clicked.connect(lambda: self.set_mode(False))
 		mode_layout.addWidget(self.hour_btn)
@@ -1063,13 +1207,27 @@ class ClockPickerPopup(QWidget):
 		layout.addLayout(clock_layout)
 
 		self.setLayout(layout)
-		self.setStyleSheet("""
-			ClockPickerPopup {
-				background-color: white;
-				border: 1px solid #ccc;
-				border-radius: 6px;
-			}
-		""")
+		self._restyle()
+
+	def _restyle(self):
+		accent = tomato_ui.accent_color()
+		self.time_display.setStyleSheet(
+			'QLabel { font-size: 22px; font-weight: bold; padding: 5px; background-color: %s;'
+			' color: white; border-radius: 6px; }' % accent.name())
+		tomato_ui.set_button_highlight(self.hour_btn, self.selecting_hour)
+		tomato_ui.set_button_highlight(self.minute_btn, not self.selecting_hour)
+
+	def paintEvent(self, event):
+		if getattr(self, '_liquid_glass_active', False):
+			return  # the window's Liquid Glass is the card
+		pal = tomato_ui.ui_palette()
+		painter = QPainter(self)
+		painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+		painter.setPen(QPen(QColor('#4A4B4F') if pal['dark'] else QColor('#ECECEC'), 1))
+		painter.setBrush(pal['panel'])
+		radius = tomato_ui.POPUP_GLASS_RADIUS
+		painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+		painter.end()
 
 	def set_target_widget(self, widget):
 		self._target_widget = widget
@@ -1082,8 +1240,7 @@ class ClockPickerPopup(QWidget):
 
 	def set_mode(self, selecting_hour):
 		self.selecting_hour = selecting_hour
-		self.hour_btn.setChecked(selecting_hour)
-		self.minute_btn.setChecked(not selecting_hour)
+		self._restyle()
 		self.update_clock()
 
 	def update_time_display(self):
@@ -1106,6 +1263,7 @@ class ClockPickerPopup(QWidget):
 		return QTime(self.selected_hour, self.selected_minute)
 
 	def showAt(self, global_pos):
+		self._restyle()  # light / dark, the accent colour
 		self.move(global_pos)
 		self.show()
 		self.update_clock()
@@ -1149,8 +1307,21 @@ class ClockFaceWidget(QWidget):
 		self.hovered_value = None
 		self.update()
 
+	def _colors(self):
+		"""System accent for the chosen value and the hand (style book 5.8), light / dark for the rest."""
+		dark = is_dark_theme(app)
+		accent = tomato_ui.accent_color()
+		hover = QColor(accent)
+		hover.setAlpha(70)
+		return {'accent': accent, 'hover': hover,
+				'face': QColor(255, 255, 255, 26) if dark else QColor(0, 0, 0, 13),
+				'rim': QColor(255, 255, 255, 40) if dark else QColor(0, 0, 0, 26),
+				'text': QColor('#F2F2F7') if dark else QColor('#20242B'),
+				'text2': QColor('#B8BAC0') if dark else QColor(80, 80, 80)}
+
 	def paintEvent(self, event):
 		import math
+		c = self._colors()
 		painter = PyQt6.QtGui.QPainter(self)
 		painter.setRenderHint(PyQt6.QtGui.QPainter.RenderHint.Antialiasing)
 
@@ -1159,8 +1330,8 @@ class ClockFaceWidget(QWidget):
 		radius = min(center_x, center_y) - 3
 
 		# Background circle
-		painter.setBrush(QColor(245, 245, 245))
-		painter.setPen(QColor(220, 220, 220))
+		painter.setBrush(c['face'])
+		painter.setPen(c['rim'])
 		painter.drawEllipse(center_x - radius, center_y - radius, radius * 2, radius * 2)
 
 		# Clear position caches
@@ -1189,17 +1360,17 @@ class ClockFaceWidget(QWidget):
 				is_hovered = (self.hovered_value == hour)
 
 				if is_selected:
-					painter.setBrush(QColor(33, 150, 243))
+					painter.setBrush(c['accent'])
 					painter.setPen(Qt.PenStyle.NoPen)
 					painter.drawEllipse(x - 13, y - 13, 26, 26)
 					painter.setPen(QColor(255, 255, 255))
 				elif is_hovered:
-					painter.setBrush(QColor(200, 220, 240))
+					painter.setBrush(c['hover'])
 					painter.setPen(Qt.PenStyle.NoPen)
 					painter.drawEllipse(x - 13, y - 13, 26, 26)
-					painter.setPen(QColor(0, 0, 0))
+					painter.setPen(c['text'])
 				else:
-					painter.setPen(QColor(0, 0, 0))
+					painter.setPen(c['text'])
 
 				rect = PyQt6.QtCore.QRect(x - 13, y - 8, 26, 16)
 				painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(hour))
@@ -1219,17 +1390,17 @@ class ClockFaceWidget(QWidget):
 				is_hovered = (self.hovered_value == hour)
 
 				if is_selected:
-					painter.setBrush(QColor(33, 150, 243))
+					painter.setBrush(c['accent'])
 					painter.setPen(Qt.PenStyle.NoPen)
 					painter.drawEllipse(x - 11, y - 11, 22, 22)
 					painter.setPen(QColor(255, 255, 255))
 				elif is_hovered:
-					painter.setBrush(QColor(200, 220, 240))
+					painter.setBrush(c['hover'])
 					painter.setPen(Qt.PenStyle.NoPen)
 					painter.drawEllipse(x - 11, y - 11, 22, 22)
-					painter.setPen(QColor(80, 80, 80))
+					painter.setPen(c['text2'])
 				else:
-					painter.setPen(QColor(80, 80, 80))
+					painter.setPen(c['text2'])
 
 				rect = PyQt6.QtCore.QRect(x - 11, y - 7, 22, 14)
 				painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(hour))
@@ -1263,17 +1434,17 @@ class ClockFaceWidget(QWidget):
 				is_hovered = (self.hovered_value == minute)
 
 				if is_selected:
-					painter.setBrush(QColor(33, 150, 243))
+					painter.setBrush(c['accent'])
 					painter.setPen(Qt.PenStyle.NoPen)
 					painter.drawEllipse(x - 13, y - 13, 26, 26)
 					painter.setPen(QColor(255, 255, 255))
 				elif is_hovered:
-					painter.setBrush(QColor(200, 220, 240))
+					painter.setBrush(c['hover'])
 					painter.setPen(Qt.PenStyle.NoPen)
 					painter.drawEllipse(x - 13, y - 13, 26, 26)
-					painter.setPen(QColor(0, 0, 0))
+					painter.setPen(c['text'])
 				else:
-					painter.setPen(QColor(0, 0, 0))
+					painter.setPen(c['text'])
 
 				rect = PyQt6.QtCore.QRect(x - 13, y - 8, 26, 16)
 				painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(minute).zfill(2))
@@ -1285,12 +1456,12 @@ class ClockFaceWidget(QWidget):
 			hand_y = center_y + int(hand_radius * math.sin(angle))
 
 		# Draw center dot
-		painter.setBrush(QColor(33, 150, 243))
+		painter.setBrush(c['accent'])
 		painter.setPen(Qt.PenStyle.NoPen)
 		painter.drawEllipse(center_x - 4, center_y - 4, 8, 8)
 
 		# Draw hand line
-		painter.setPen(PyQt6.QtGui.QPen(QColor(33, 150, 243), 2))
+		painter.setPen(PyQt6.QtGui.QPen(c['accent'], 2))
 		painter.drawLine(center_x, center_y, hand_x, hand_y)
 
 	def mouseMoveEvent(self, event):
@@ -1337,19 +1508,33 @@ class ClockFaceWidget(QWidget):
 
 
 class AutoCloseNotification(QDialog):
-	"""Auto-closing notification dialog for safety check warnings"""
-	def __init__(self, title, message, auto_close_seconds=5):
+	"""Auto-closing notification for safety check warnings: a glass dialog (style book 5.7: the window is
+	the card, corner 16, grey normal button), non-modal so it never blocks the main thread."""
+	def __init__(self, title, message, auto_close_seconds=5, action=None):
 		super().__init__()
 		self.auto_close_seconds = auto_close_seconds
 		self.remaining_seconds = auto_close_seconds
+		self._action = action      # (label, callback): one more grey button left of Close (e.g. Download Broccoli…)
 		self.initUI(title, message)
+
+	def _countdown_text(self):
+		return _tr('This window will auto-close in %n seconds').replace('%n', str(self.remaining_seconds))
 
 	def initUI(self, title, message):
 		self.setWindowTitle(title)
-		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+		make_glass_dialog(self)
 		self.setModal(False)  # Non-modal so it doesn't block the main thread
 
 		layout = QVBoxLayout()
+		layout.setContentsMargins(20, 18, 20, 16)
+		layout.setSpacing(10)
+
+		heading = QLabel(title)
+		heading_font = QFont(heading.font())
+		heading_font.setPixelSize(15)
+		heading_font.setBold(True)
+		heading.setFont(heading_font)
+		layout.addWidget(heading)
 
 		# Message label
 		message_label = QLabel(message)
@@ -1357,17 +1542,28 @@ class AutoCloseNotification(QDialog):
 		layout.addWidget(message_label)
 
 		# Countdown label
-		self.countdown_label = QLabel(f"This window will auto-close in {self.remaining_seconds} seconds")
-		self.countdown_label.setStyleSheet("color: gray; font-size: 10px;")
+		self.countdown_label = QLabel(self._countdown_text())
+		self.countdown_label.setStyleSheet("color: #8E8E93; font-size: 11px;")
 		layout.addWidget(self.countdown_label)
 
 		# Close button
-		button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-		button_box.rejected.connect(self.accept)
-		layout.addWidget(button_box)
+		close_button = MacNormalButton(_tr('Close'), self)
+		close_button.setMinimumWidth(96)
+		close_button.clicked.connect(self.accept)
+		button_row = QHBoxLayout()
+		button_row.setContentsMargins(0, 0, 0, 0)
+		button_row.setSpacing(8)
+		button_row.addStretch()
+		if self._action is not None:
+			action_button = MacNormalButton(self._action[0], self)
+			action_button.setMinimumWidth(96)
+			action_button.clicked.connect(lambda: (self._action[1](), self.accept()))
+			button_row.addWidget(action_button)
+		button_row.addWidget(close_button)
+		layout.addLayout(button_row)
 
 		self.setLayout(layout)
-		self.resize(400, 150)
+		self.resize(420, 190)
 
 		# Setup auto-close timer
 		self.timer = QTimer(self)
@@ -1380,279 +1576,34 @@ class AutoCloseNotification(QDialog):
 			self.timer.stop()
 			self.accept()
 		else:
-			self.countdown_label.setText(f"This window will auto-close in {self.remaining_seconds} seconds")
+			self.countdown_label.setText(self._countdown_text())
 
 
-class WhiteButton(QPushButton):
-	def __init__(self, text):
-		super().__init__(text)
-		self.setFixedHeight(30)
-		self.setStyleSheet("""
-		QPushButton {
-			background-color: white;
-			color: #444;
-			border: none;
-			border-radius: 15px;
-			font-size: 13px;
-			padding: 5px 20px;
-		}
-		QPushButton:hover {
-			background-color: #f5f5f5;
-		}
-		""")
-
-		shadow = QGraphicsDropShadowEffect(self)
-		shadow.setBlurRadius(40)
-		shadow.setXOffset(0)
-		shadow.setYOffset(0)
-		shadow.setColor(QColor(0, 0, 0, 40))  # 半透明黑色阴影
-		self.setGraphicsEffect(shadow)
+install_glass_dialog_class(AutoCloseNotification)
 
 
-class MacWindowButton(QPushButton):
-	def __init__(self, color, symbol, parent=None):
-		super().__init__(parent)
-		self.setFixedSize(16,16)
-		self.base_color = QColor(color)
-		self.symbol = symbol  # "x", "-", "+"
-		self.hovered = False
-		self.setStyleSheet("border: none; background: transparent;")
-
-	def enterEvent(self, event):
-		self.hovered = True
-		self.update()
-		super().enterEvent(event)
-
-	def leaveEvent(self, event):
-		self.hovered = False
-		self.update()
-		super().leaveEvent(event)
-
-	def paintEvent(self, event):
-		painter = QPainter(self)
-		painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-		painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-		# # 1. 选择底色
-		# if self.hovered:
-		#	 # hover 时用更深的颜色
-		#	 if self.symbol == "x":
-		#		 color = QColor("#BF4943")
-		#	 elif self.symbol == "-":
-		#		 color = QColor("#B29B32")
-		#	 elif self.symbol == "+":
-		#		 color = QColor("#24912D")
-		#	 else:
-		#		 color = self.base_color
-		# else:
-		#	 color = self.base_color
-		# Draw circle
-		painter.setBrush(self.base_color)
-		painter.setPen(Qt.PenStyle.NoPen)
-		painter.drawEllipse(0, 0, self.width(), self.height())
-		# Draw symbol if hovered
-		if self.hovered:
-			pen = QPen(QColor("black"))
-			pen.setWidth(2)
-			painter.setPen(pen)
-			margin = 5  # 增大 margin，叉号更小
-			if self.symbol == "x":
-				painter.drawLine(margin, margin, self.width()-margin, self.height()-margin)
-				painter.drawLine(self.width()-margin, margin, margin, self.height()-margin)
-			elif self.symbol == "-":
-				painter.drawLine(margin, self.height()//2, self.width()-margin, self.height()//2)
-			elif self.symbol == "+":
-				painter.drawLine(self.width()//2, margin, self.width()//2, self.height()-margin)
-				painter.drawLine(margin, self.height()//2, self.width()-margin, self.height()//2)
-
-
-class CustomMessageBox(QWidget):
-	def __init__(self, text, parent=None, icon=None, buttons=("OK",), default=0):
-		super().__init__(parent)
-		self.radius = 16
-		self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Dialog)
-		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-		self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
-		self.setFixedSize(400, 200)
-		self.result = None
-
-		# 拖动支持
-		self.drag_pos = None
-
-		# 关闭按钮
-		self.close_button = MacWindowButton("#FF605C", "x", self)
-		self.close_button.move(10, 10)
-		self.close_button.clicked.connect(self.close)
-
-		# 主内容
-		layout = QVBoxLayout()
-		layout.setContentsMargins(32, 40, 32, 32)
-		layout.setSpacing(16)
-
-		# 图标
-		if icon:
-			icon_label = QLabel()
-			icon_label.setPixmap(icon.pixmap(48, 48))
-			icon_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-			layout.addWidget(icon_label)
-
-		# 文本
-		label = QLabel(text)
-		label.setWordWrap(True)
-		label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-		# label.setStyleSheet("font-size: 16px;")
-		label.setStyleSheet("""
-			font-size: 16px;
-			background-color: rgba(255,255,255,0);
-			border-radius: 8px;
-			padding: 8px;
-		""")
-		layout.addWidget(label, stretch=1)
-
-		# 按钮
-		btn_layout = QHBoxLayout()
-		btn_layout.addStretch()
-		self.btns = []
-		for i, btn_text in enumerate(buttons):
-			btn = WhiteButton(btn_text)
-			btn.setFixedWidth(150)
-			# btn.setFixedHeight(32)
-			# btn.setStyleSheet("""
-			#	 QPushButton {
-			#		 background: #F2F2F2;
-			#		 border-radius: 8px;
-			#		 border: 1px solid #E0E0E0;
-			#		 min-width: 80px;
-			#		 font-size: 15px;
-			#	 }
-			#	 QPushButton:hover {
-			#		 background: #E0E0E0;
-			#	 }
-			# """)
-			btn.clicked.connect(lambda checked, idx=i: self._on_btn(idx))
-			btn_layout.addWidget(btn)
-			self.btns.append(btn)
-		btn_layout.addStretch()
-		layout.addLayout(btn_layout)
-
-		self.setLayout(layout)
-		self.btns[default].setFocus()
-
-	def _on_btn(self, idx):
-		self.result = idx
-		self.accept()
-
-	def accept(self):
-		self.close()
-
-	def paintEvent(self, event):
-		painter = QPainter(self)
-		painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-		rect = QRectF(self.rect())
-		path = QPainterPath()
-		path.addRoundedRect(rect, self.radius, self.radius)
-		painter.setClipPath(path)
-		if is_dark_theme(self):
-			painter.fillPath(path, QColor(30, 30, 30, 245))
-		else:
-			painter.fillPath(path, QColor(255, 255, 255, 245))
-
-	def mousePressEvent(self, event):
-		if event.button() == Qt.MouseButton.LeftButton:
-			self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-			event.accept()
-
-	def mouseMoveEvent(self, event):
-		if event.buttons() == Qt.MouseButton.LeftButton and self.drag_pos is not None:
-			self.move(event.globalPosition().toPoint() - self.drag_pos)
-			event.accept()
-
-	def exec(self):
-		self.setWindowModality(Qt.WindowModality.ApplicationModal)
-		self.show()
-		loop = QEventLoop()
-		self.destroyed.connect(loop.quit)
-		loop.exec()
-		return self.result
+# WhiteButton (glass white capsule), MacNormalButton (grey normal button): the kit's (glass_kit.py).
+# The old hand-drawn traffic light (MacWindowButton) and CustomMessageBox are gone: windows carry the
+# system's own traffic lights, notices and questions are system alerts (style book 5.7 / 5.7.2).
 
 
 class WindowAbout(QWidget):  # 增加说明页面(About)
 	def __init__(self):
 		super().__init__()
-		self.radius = 16  # 圆角半径，可按 macOS 15 或 26 设置为 16~26
-
-		self.setWindowFlags(
-			Qt.WindowType.FramelessWindowHint |
-			Qt.WindowType.Window |
-			Qt.WindowType.WindowStaysOnTopHint
-		)
-		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-		self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
-
 		self.init_ui()
 
 	def init_ui(self):
 		self.setUpMainWindow()
-		self.setFixedSize(400, 600)
+		make_native_glass_window(self)
+		self.setFixedSize(400, 600)  # Broccoli's About
 		self.center()
+		self.setWindowTitle(_tr('About'))
 		self.setFocus()
 
-	def paintEvent(self, event):
-		painter = QPainter(self)
-		painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-		painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-
-		rect = QRectF(self.rect())
-		path = QPainterPath()
-		path.addRoundedRect(rect, self.radius, self.radius)
-
-		painter.setClipPath(path)
-		bg_color = self.palette().color(QPalette.ColorRole.Window)
-		painter.fillPath(path, bg_color)
-
-	# 让无边框窗口可拖动
-	def mousePressEvent(self, event):
-		if event.button() == Qt.MouseButton.LeftButton:
-			self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-			event.accept()
-
-	def mouseMoveEvent(self, event):
-		if event.buttons() == Qt.MouseButton.LeftButton:
-			self.move(event.globalPosition().toPoint() - self.drag_pos)
-			event.accept()
-
 	def setUpMainWindow(self):
-		# 添加关闭按钮（仿 macOS 左上角红色圆点）
-		# self.close_button = QPushButton(self)
-		# self.close_button.setFixedSize(12, 12)
-		# self.close_button.move(10, 10)
-		# self.close_button.setStyleSheet("""
-		#	 QPushButton {
-		#		 background-color: #FF5F57;
-		#		 border-radius: 6px;
-		#		 border: none;
-		#	 }
-		#	 QPushButton:hover {
-		#		 background-color: #BF4943;
-		#	 }
-		# """)
-		# self.close_button.clicked.connect(self.close)
-		# 三个按钮
-		##FF5F57
-		self.close_button = MacWindowButton("#FF605C", "x", self)
-		self.close_button.move(10, 10)
-		self.close_button.clicked.connect(self.close)
-		##FFBD2E
-		# self.min_button = MacWindowButton("#FFBD44", "-", self)
-		# self.min_button.move(30, 10)
-		# self.min_button.clicked.connect(self.showMinimized)
-		##28C940
-		# self.max_button = MacWindowButton("#00CA4E", "+", self)
-		# self.max_button.move(50, 10)
-		# self.max_button.clicked.connect(self.showMaximized)
-
 		widg1 = QWidget()
 		l1 = QLabel(self)
-		png = QPixmap(BasePath + 'tmt.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
+		png = QPixmap(BasePath + 'tomato.png')  # 调用QtGui.QPixmap方法，打开一个图片，存放在变量png中
 		l1.setPixmap(png)  # 在l1里面，调用setPixmap命令，建立一个图像存放框，并将之前的图像png存放在这个框框里。
 		l1.setMaximumWidth(100)
 		l1.setMaximumHeight(100)
@@ -1679,7 +1630,7 @@ class WindowAbout(QWidget):  # 增加说明页面(About)
 		widg2.setLayout(blay2)
 
 		widg3 = QWidget()
-		lbl1 = QLabel(self.tr(f'Version %n').replace('%n', VERSION), self)
+		lbl1 = QLabel(_tr('Version %n').replace('%n', VERSION), self)
 		blay3 = QHBoxLayout()
 		blay3.setContentsMargins(0, 0, 0, 0)
 		blay3.addStretch()
@@ -1688,7 +1639,7 @@ class WindowAbout(QWidget):  # 增加说明页面(About)
 		widg3.setLayout(blay3)
 
 		widg4 = QWidget()
-		lbl2 = QLabel(self.tr('Thanks for your love🤟.'), self)
+		lbl2 = QLabel(_tr('Thanks for your love🤟.'), self)
 		blay4 = QHBoxLayout()
 		blay4.setContentsMargins(0, 0, 0, 0)
 		blay4.addStretch()
@@ -1697,7 +1648,7 @@ class WindowAbout(QWidget):  # 增加说明页面(About)
 		widg4.setLayout(blay4)
 
 		widg5 = QWidget()
-		lbl3 = QLabel(self.tr('For more of my works, please visit the homepage🥰.'), self)
+		lbl3 = QLabel(_tr('For more of my works, please visit the homepage🥰.'), self)
 		blay5 = QHBoxLayout()
 		blay5.setContentsMargins(0, 0, 0, 0)
 		blay5.addStretch()
@@ -1706,7 +1657,7 @@ class WindowAbout(QWidget):  # 增加说明页面(About)
 		widg5.setLayout(blay5)
 
 		widg6 = QWidget()
-		lbl4 = QLabel(self.tr('Special thanks to ut.code(); of the University of Tokyo❤️.'), self)
+		lbl4 = QLabel(_tr('Special thanks to ut.code(); of the University of Tokyo❤️.'), self)
 		blay6 = QHBoxLayout()
 		blay6.setContentsMargins(0, 0, 0, 0)
 		blay6.addStretch()
@@ -1715,7 +1666,7 @@ class WindowAbout(QWidget):  # 增加说明页面(About)
 		widg6.setLayout(blay6)
 
 		widg7 = QWidget()
-		lbl5 = QLabel(self.tr('This app is under the protection of GPL-3.0 license.'), self)
+		lbl5 = QLabel(_tr('This app is under the protection of GPL-3.0 license.'), self)
 		blay7 = QHBoxLayout()
 		blay7.setContentsMargins(0, 0, 0, 0)
 		blay7.addStretch()
@@ -1725,10 +1676,10 @@ class WindowAbout(QWidget):  # 增加说明页面(About)
 
 		widg8 = QWidget()
 		widg8.setFixedHeight(50)
-		bt1 = WhiteButton(self.tr('The Author'))
+		bt1 = WhiteButton(_tr('The Author'))
 		bt1.setMinimumWidth(100)
 		bt1.clicked.connect(self.intro)
-		bt2 = WhiteButton(self.tr('Github Page'))
+		bt2 = WhiteButton(_tr('Github Page'))
 		bt2.setMinimumWidth(100)
 		bt2.clicked.connect(self.homepage)
 		blay8 = QHBoxLayout()
@@ -1739,7 +1690,7 @@ class WindowAbout(QWidget):  # 增加说明页面(About)
 		blay8.addStretch()
 		widg8.setLayout(blay8)
 
-		bt7 = WhiteButton(self.tr('Buy me a cup of coffee☕'))
+		bt7 = WhiteButton(_tr('Buy me a cup of coffee☕'))
 		bt7.setMinimumWidth(215)
 		bt7.clicked.connect(self.coffee)
 		widg8_5 = QWidget()
@@ -1858,11 +1809,11 @@ class CustomDialog(QDialog):  # (About1)
 
 	def initUI(self):
 		self.setUpMainWindow()
-		self.setWindowTitle(self.tr("Thank you for your support!"))
+		make_native_glass_window(self, kind=Qt.WindowType.Dialog)
+		self.setWindowTitle(_tr("Thank you for your support!"))
+		self.setFixedSize(400, 420)
 		self.center()
-		self.resize(440, 390)
 		self.setFocus()
-		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
 	def setUpMainWindow(self):
 		widge_all = QWidget()
@@ -1882,16 +1833,15 @@ class CustomDialog(QDialog):  # (About1)
 		bk.addWidget(l2)
 		widge_all.setLayout(bk)
 
-		m1 = QLabel(self.tr('Thank you for your kind support! 😊'), self)
-		m2 = QLabel(self.tr('I will write more interesting apps! 🥳'), self)
+		m1 = QLabel(_tr('Thank you for your kind support! 😊'), self)
+		m2 = QLabel(_tr('I will write more interesting apps! 🥳'), self)
 
 		widg_c = QWidget()
 		widg_c.setFixedHeight(50)
-		bt1 = WhiteButton(self.tr('Thank you!'))
-		#bt1.setMaximumHeight(20)
-		bt1.setMinimumWidth(100)
+		bt1 = WhiteButton(_tr('Thank you!'))
+		bt1.setMinimumWidth(120)
 		bt1.clicked.connect(self.cancel)
-		bt2 = WhiteButton(self.tr('Neither one above? Buy me a coffee~'))
+		bt2 = WhiteButton(_tr('Neither one above? Buy me a coffee~'))
 		#bt2.setMaximumHeight(20)
 		bt2.setMinimumWidth(260)
 		bt2.clicked.connect(self.coffee)
@@ -1932,11 +1882,11 @@ class CustomDialog2(QDialog):  # (About2)
 
 	def initUI(self):
 		self.setUpMainWindow()
-		self.setWindowTitle(self.tr("Thank you for your support!"))
+		make_native_glass_window(self, kind=Qt.WindowType.Dialog)
+		self.setWindowTitle(_tr("Thank you for your support!"))
+		self.setFixedSize(400, 420)
 		self.center()
-		self.resize(440, 390)
 		self.setFocus()
-		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
 	def setUpMainWindow(self):
 		widge_all = QWidget()
@@ -1956,16 +1906,15 @@ class CustomDialog2(QDialog):  # (About2)
 		bk.addWidget(l2)
 		widge_all.setLayout(bk)
 
-		m1 = QLabel(self.tr('Thank you for your kind support! 😊'), self)
-		m2 = QLabel(self.tr('I will write more interesting apps! 🥳'), self)
+		m1 = QLabel(_tr('Thank you for your kind support! 😊'), self)
+		m2 = QLabel(_tr('I will write more interesting apps! 🥳'), self)
 
 		widg_c = QWidget()
 		widg_c.setFixedHeight(50)
-		bt1 = WhiteButton(self.tr('Thank you!'))
-		#bt1.setMaximumHeight(20)
-		bt1.setMinimumWidth(100)
+		bt1 = WhiteButton(_tr('Thank you!'))
+		bt1.setMinimumWidth(120)
 		bt1.clicked.connect(self.cancel)
-		bt2 = WhiteButton(self.tr('Neither one above? Buy me a coffee~'))
+		bt2 = WhiteButton(_tr('Neither one above? Buy me a coffee~'))
 		#bt2.setMaximumHeight(20)
 		bt2.setMinimumWidth(260)
 		bt2.clicked.connect(self.coffee)
@@ -2006,11 +1955,11 @@ class CustomDialog3(QDialog):  # (About3)
 
 	def initUI(self):
 		self.setUpMainWindow()
-		self.setWindowTitle(self.tr("Thank you for your support!"))
+		make_native_glass_window(self, kind=Qt.WindowType.Dialog)
+		self.setWindowTitle(_tr("Thank you for your support!"))
+		self.setFixedSize(400, 420)
 		self.center()
-		self.resize(440, 390)
 		self.setFocus()
-		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
 	def setUpMainWindow(self):
 		widge_all = QWidget()
@@ -2030,16 +1979,15 @@ class CustomDialog3(QDialog):  # (About3)
 		bk.addWidget(l2)
 		widge_all.setLayout(bk)
 
-		m1 = QLabel(self.tr('Thank you for your kind support! 😊'), self)
-		m2 = QLabel(self.tr('I will write more interesting apps! 🥳'), self)
+		m1 = QLabel(_tr('Thank you for your kind support! 😊'), self)
+		m2 = QLabel(_tr('I will write more interesting apps! 🥳'), self)
 
 		widg_c = QWidget()
 		widg_c.setFixedHeight(50)
-		bt1 = WhiteButton(self.tr('Thank you!'))
-		#bt1.setMaximumHeight(20)
-		bt1.setMinimumWidth(100)
+		bt1 = WhiteButton(_tr('Thank you!'))
+		bt1.setMinimumWidth(120)
 		bt1.clicked.connect(self.cancel)
-		bt2 = WhiteButton(self.tr('Neither one above? Buy me a coffee~'))
+		bt2 = WhiteButton(_tr('Neither one above? Buy me a coffee~'))
 		#bt2.setMaximumHeight(20)
 		bt2.setMinimumWidth(260)
 		bt2.clicked.connect(self.coffee)
@@ -2080,11 +2028,11 @@ class CustomDialog4(QDialog):  # (About4)
 
 	def initUI(self):
 		self.setUpMainWindow()
-		self.setWindowTitle(self.tr("Thank you for your support!"))
+		make_native_glass_window(self, kind=Qt.WindowType.Dialog)
+		self.setWindowTitle(_tr("Thank you for your support!"))
+		self.setFixedSize(400, 420)
 		self.center()
-		self.resize(440, 390)
 		self.setFocus()
-		self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
 	def setUpMainWindow(self):
 		widge_all = QWidget()
@@ -2104,16 +2052,15 @@ class CustomDialog4(QDialog):  # (About4)
 		bk.addWidget(l2)
 		widge_all.setLayout(bk)
 
-		m1 = QLabel(self.tr('Thank you for your kind support! 😊'), self)
-		m2 = QLabel(self.tr('I will write more interesting apps! 🥳'), self)
+		m1 = QLabel(_tr('Thank you for your kind support! 😊'), self)
+		m2 = QLabel(_tr('I will write more interesting apps! 🥳'), self)
 
 		widg_c = QWidget()
 		widg_c.setFixedHeight(50)
-		bt1 = WhiteButton(self.tr('Thank you!'))
-		#bt1.setMaximumHeight(20)
-		bt1.setMinimumWidth(100)
+		bt1 = WhiteButton(_tr('Thank you!'))
+		bt1.setMinimumWidth(120)
 		bt1.clicked.connect(self.cancel)
-		bt2 = WhiteButton(self.tr('Neither one above? Buy me a coffee~'))
+		bt2 = WhiteButton(_tr('Neither one above? Buy me a coffee~'))
 		#bt2.setMaximumHeight(20)
 		bt2.setMinimumWidth(260)
 		bt2.clicked.connect(self.coffee)
@@ -2147,119 +2094,630 @@ class CustomDialog4(QDialog):  # (About4)
 		self.close()
 
 
-class WindowUpdate(QWidget):  # 增加更新页面（Check for Updates）
-	def __init__(self):
-		super().__init__()
-		self.radius = 16  # 圆角半径，可按 macOS 15 或 26 设置为 16~26
+# ---- One-click update: check → download → verify → install → relaunch (Broccoli's, ported 2026-11-25;
+# Ryan: "所有的软件……都是要学习 Broccoli 的这个更新写法的，下载更新的写法") ----
+# Every release ships one notarized DMG on GitHub (the API gives the asset's `digest` = its sha256).
+#  1. WindowUpdate downloads it into ~/Library/Caches/com.ryanthehito.tomato/Updates with a progress bar
+#     (a .part file, resumed with an HTTP Range request), then checks size + sha256.
+#  2. It mounts the DMG read-only ("Y" answers its licence agreement), copies Tomato.app into a hidden
+#     folder NEXT TO the running bundle (same volume → the swap is a rename) and requires the copy to
+#     satisfy TOMATO_UPDATE_CODE_REQUIREMENT (Developer ID + this team + this bundle id); a changed or
+#     foreign-signed installer, or an older version, is never installed.
+#  3. Tomato quits the normal way (totalquit: the diary line, the threads stopped). AFTER app.exec() returns,
+#     this process swaps the bundles (macOS App Management lets an app modify apps signed by its own team).
+#     Tomato's data and settings live outside the app (Application Support/com.ryanthehito.tomato), so the
+#     swap keeps them; nothing is carried over. Tomato does not replace NSApp's delegate (Qt's own stays),
+#     so app.exec() does return on Quit / ⌘Q / the Dock's Quit — unlike Raspberry, no applicationWillTerminate_ hook.
+#  4. A detached waiter reopens the app once this PID is gone; the new build deletes the previous bundle on
+#     its first start and says how the install went (the update window's startup note).
+# The old daily re-check (UpdateCheckWorker) and its "open the release page?" question are gone: one check
+# 3 s after the start; when a newer release is out (or the last install left a note) the window comes out.
+TOMATO_CACHE_DIR = os.path.join(str(Path.home()), 'Library', 'Caches', TOMATO_BUNDLE_ID)
+TOMATO_UPDATE_LATEST_API = 'https://api.github.com/repos/Ryan-the-hito/Tomato/releases/latest'
+TOMATO_UPDATE_RELEASES_URL = 'https://github.com/Ryan-the-hito/Tomato/releases'
+TOMATO_UPDATE_BUNDLE_ID = TOMATO_BUNDLE_ID
+TOMATO_UPDATE_TEAM_ID = '49C7YMHM5Q'
+TOMATO_UPDATE_CODE_REQUIREMENT = (
+	'anchor apple generic and identifier "%s"'
+	' and certificate 1[field.1.2.840.113635.100.6.2.6] exists'      # Developer ID CA
+	' and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'  # Developer ID Application
+	' and certificate leaf[subject.OU] = "%s"' % (TOMATO_UPDATE_BUNDLE_ID, TOMATO_UPDATE_TEAM_ID))
+TOMATO_UPDATE_CACHE_DIR = os.path.join(TOMATO_CACHE_DIR, 'Updates')
+TOMATO_UPDATE_RESULT_PATH = os.path.join(TOMATO_UPDATE_CACHE_DIR, 'last_install.json')
+TOMATO_UPDATE_STAGING_DIRNAME = '.Tomato-update'
+_TOMATO_UPDATE_FS_LOCK = threading.Lock()   # staging vs. the startup cleanup of the same folder
+_TOMATO_PENDING_UPDATE_INSTALL = None        # set right before quitting for an install
 
-		self.setWindowFlags(
-			Qt.WindowType.FramelessWindowHint |
-			Qt.WindowType.Window |
-			Qt.WindowType.WindowStaysOnTopHint
-		)
-		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-		self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
 
-		self.init_ui()
+class TomatoUpdateError(Exception):
+	"""A user-presentable reason the update stopped (already translated)."""
 
-	def init_ui(self):
-		self.setUpMainWindow()
-		self.setFixedSize(280, 220)
-		self.center()
-		self.setFocus()
+
+class TomatoUpdateCanceled(TomatoUpdateError):
+	pass
+
+
+def tomato_parse_version(text):
+	match = re.search(r'(\d+)\.(\d+)\.(\d+)', str(text or ''))
+	return tuple(int(part) for part in match.groups()) if match else None
+
+
+def tomato_is_newer_version(candidate, current) -> bool:
+	"""'v1.2.13' / 'Tomato_v1.2.13.dmg' / '1.2.13' against VERSION: strictly newer only (numbers, not text)."""
+	newer, older = tomato_parse_version(candidate), tomato_parse_version(current)
+	return bool(newer and older and newer > older)
+
+
+def tomato_running_app_bundle():
+	"""The .app bundle this process runs from (packaged builds only)."""
+	if not getattr(sys, 'frozen', False):
+		return None
+	try:
+		bundle = Path(sys.executable).resolve().parents[2]
+	except Exception:
+		return None
+	if bundle.suffix != '.app' or not (bundle / 'Contents' / 'Info.plist').is_file():
+		return None
+	return bundle
+
+
+def tomato_update_install_blocker(bundle) -> str:
+	"""Why this copy cannot replace itself ('' when it can)."""
+	if sys.platform != 'darwin':
+		return _tr('automatic install needs macOS')
+	if bundle is None:
+		return _tr('Tomato is not running from an installed app')
+	if '/AppTranslocation/' in str(bundle):
+		return _tr('macOS is running Tomato from a temporary copy; move it into Applications first')
+	# renaming the bundle into another folder needs write access to it and its parent
+	if not os.access(str(bundle.parent), os.W_OK) or not os.access(str(bundle), os.W_OK):
+		return _tr('no permission to replace %1').replace('%1', str(bundle))
+	return ''
+
+
+def tomato_fetch_latest_release():
+	"""Latest release from the GitHub API: tag, version and its DMG asset
+	(dmg_* fields stay empty when the release carries no DMG)."""
+	response = requests.get(TOMATO_UPDATE_LATEST_API, timeout=(4, 6),
+							headers={'Accept': 'application/vnd.github+json'})
+	if not response.ok:
+		return None
+	data = response.json() or {}
+	tag = str(data.get('tag_name', '') or '').strip()
+	if not re.fullmatch(r'v\d+\.\d+\.\d+', tag):
+		return None
+	info = {'tag': tag, 'version': tag[1:], 'dmg_name': '', 'dmg_url': '', 'dmg_size': 0, 'dmg_sha256': ''}
+	dmgs = [asset for asset in (data.get('assets') or []) if isinstance(asset, dict)
+			and str(asset.get('name', '')).lower().endswith('.dmg')
+			and str(asset.get('state', 'uploaded')) == 'uploaded'
+			and str(asset.get('browser_download_url', '')).startswith('https://')]
+	dmgs.sort(key=lambda asset: not str(asset.get('name', '')).lower().startswith('tomato'))
+	if dmgs:
+		asset = dmgs[0]
+		digest = str(asset.get('digest') or '')
+		info.update(dmg_name=str(asset.get('name')),
+					dmg_url=str(asset.get('browser_download_url')),
+					dmg_size=int(asset.get('size') or 0),
+					dmg_sha256=digest[7:].lower() if digest.lower().startswith('sha256:') else '')
+	return info
+
+
+def _tomato_sha256_file(path) -> str:
+	digest = hashlib.sha256()
+	with open(path, 'rb') as handle:
+		for block in iter(lambda: handle.read(4 << 20), b''):
+			digest.update(block)
+	return digest.hexdigest()
+
+
+def _tomato_update_file_matches(path, size, sha256) -> bool:
+	try:
+		if size and os.path.getsize(path) != size:
+			return False
+		return not sha256 or _tomato_sha256_file(path) == sha256
+	except OSError:
+		return False
+
+
+def tomato_download_update_dmg(info, progress, cancel_event, status=None) -> str:
+	"""Download the release DMG into the cache (resuming an earlier .part), verify size + sha256 and
+	return its path. progress(done, total) and status(text) run on the calling worker thread;
+	cancel_event aborts between chunks and keeps the .part for the next attempt."""
+	status = status or (lambda _text: None)
+	url = str(info.get('dmg_url') or '')
+	if not url:
+		raise TomatoUpdateError(_tr('This release has no installer package.'))
+	size = int(info.get('dmg_size') or 0)
+	sha256 = str(info.get('dmg_sha256') or '').lower()
+	os.makedirs(TOMATO_UPDATE_CACHE_DIR, exist_ok=True)
+	name = re.sub(r'[^A-Za-z0-9._-]+', '_', str(info.get('dmg_name') or '')).strip('.') or 'Tomato-update.dmg'
+	final_path = os.path.join(TOMATO_UPDATE_CACHE_DIR, name)
+	part_path = final_path + '.part'
+	if os.path.isfile(final_path):
+		status(_tr('Verifying the download…'))
+		if _tomato_update_file_matches(final_path, size, sha256):
+			return final_path
+		os.remove(final_path)
+	have = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
+	if size and have > size:
+		os.remove(part_path)
+		have = 0
+	if not size or have < size:
+		headers = {'Range': 'bytes=%d-' % have} if have else {}
+		try:
+			with requests.get(url, stream=True, timeout=(10, 60), headers=headers) as response:
+				if have and response.status_code == 206:
+					mode = 'ab'
+				elif response.status_code == 200:
+					mode, have = 'wb', 0
+				else:
+					raise TomatoUpdateError(_tr('Download failed (HTTP %1).').replace('%1', str(response.status_code)))
+				total = size or (have + int(response.headers.get('Content-Length') or 0))
+				progress(have, total)
+				with open(part_path, mode) as handle:
+					for chunk in response.iter_content(chunk_size=1 << 20):
+						if cancel_event.is_set():
+							raise TomatoUpdateCanceled(_tr('Download canceled.'))
+						if chunk:
+							handle.write(chunk)
+							have += len(chunk)
+							progress(have, total)
+		except TomatoUpdateError:
+			raise
+		except Exception as exc:
+			if cancel_event.is_set():   # cancelled while the connection hung: counts as cancelled
+				raise TomatoUpdateCanceled(_tr('Download canceled.')) from exc
+			raise TomatoUpdateError(_tr('Download interrupted: %1').replace('%1', str(exc))) from exc
+	status(_tr('Verifying the download…'))
+	if not _tomato_update_file_matches(part_path, size, sha256):
+		try:
+			os.remove(part_path)
+		except OSError:
+			pass
+		raise TomatoUpdateError(_tr('The download is damaged (checksum mismatch). Please try again.'))
+	os.replace(part_path, final_path)
+	return final_path
+
+
+def _tomato_attach_dmg(dmg_path, mountpoint) -> None:
+	env = dict(os.environ, PAGER='/bin/cat')
+	commands = (
+		['/usr/bin/hdiutil', 'attach', '-nobrowse', '-readonly', '-noautoopen', '-noverify',
+		 '-mountpoint', mountpoint, dmg_path],
+		# hdiutil is deprecated from macOS 27 on; diskutil image is its successor
+		['/usr/sbin/diskutil', 'image', 'attach', '--mountOptions', 'nobrowse', '--readOnly',
+		 '--mountPoint', mountpoint, dmg_path],
+	)
+	for command in commands:
+		if not os.path.exists(command[0]):
+			continue
+		try:
+			# a release DMG shows a licence agreement before mounting; "Y" accepts it
+			subprocess.run(command, input=b'Y\n', capture_output=True, timeout=300, env=env)
+		except Exception:
+			continue
+		if os.path.ismount(mountpoint):
+			return
+	raise TomatoUpdateError(_tr('Could not open the downloaded installer.'))
+
+
+def _tomato_detach_dmg(mountpoint) -> None:
+	for command in (['/usr/bin/hdiutil', 'detach', mountpoint, '-quiet'],
+					['/usr/bin/hdiutil', 'detach', mountpoint, '-force', '-quiet'],
+					['/usr/sbin/diskutil', 'eject', mountpoint]):
+		if not os.path.ismount(mountpoint):
+			break
+		if not os.path.exists(command[0]):
+			continue
+		try:
+			subprocess.run(command, capture_output=True, timeout=60)
+		except Exception:
+			pass
+	if not os.path.ismount(mountpoint):
+		try:
+			os.rmdir(mountpoint)
+		except OSError:
+			pass
+
+
+def _tomato_bundle_info(bundle) -> dict:
+	try:
+		with open(Path(bundle) / 'Contents' / 'Info.plist', 'rb') as handle:
+			data = plistlib.load(handle)
+		return data if isinstance(data, dict) else {}
+	except Exception:
+		return {}
+
+
+def tomato_verify_update_bundle(bundle) -> str:
+	"""Return the bundle's version once its whole signature satisfies TOMATO_UPDATE_CODE_REQUIREMENT
+	(Developer ID, team 49C7YMHM5Q, bundle id com.ryanthehito.tomato); raise TomatoUpdateError otherwise."""
+	info = _tomato_bundle_info(bundle)
+	if info.get('CFBundleIdentifier') != TOMATO_UPDATE_BUNDLE_ID:
+		raise TomatoUpdateError(_tr('The installer does not contain Tomato.'))
+	try:
+		result = subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict',
+								 '-R=' + TOMATO_UPDATE_CODE_REQUIREMENT, str(bundle)],
+								capture_output=True, timeout=900)
+	except Exception as exc:
+		raise TomatoUpdateError(_tr('Could not check the signature: %1').replace('%1', str(exc))) from exc
+	if result.returncode != 0:
+		logging.warning('Update bundle rejected by codesign: %s', result.stderr.decode('utf-8', 'replace')[-800:])
+		raise TomatoUpdateError(_tr('The update is not signed by the Tomato developer, so it was not installed.'))
+	return str(info.get('CFBundleShortVersionString') or '')
+
+
+def tomato_stage_update(dmg_path, target, status=None) -> dict:
+	"""Copy the DMG's Tomato.app into <target's folder>/.Tomato-update and verify the copy.
+	Returns the pending-install record applied after the event loop ends (tomato_apply_pending_update_install)."""
+	status = status or (lambda _text: None)
+	target = Path(target)
+	staging_root = target.parent / TOMATO_UPDATE_STAGING_DIRNAME
+	staged = staging_root / target.name
+	with _TOMATO_UPDATE_FS_LOCK:
+		try:
+			if staging_root.exists():
+				shutil.rmtree(staging_root, ignore_errors=True)
+			staging_root.mkdir(parents=True, exist_ok=True)
+			os.makedirs(TOMATO_UPDATE_CACHE_DIR, exist_ok=True)
+			mountpoint = tempfile.mkdtemp(prefix='mnt-', dir=TOMATO_UPDATE_CACHE_DIR)
+			try:
+				status(_tr('Opening the installer…'))
+				_tomato_attach_dmg(dmg_path, mountpoint)
+				source = next((entry for entry in sorted(Path(mountpoint).iterdir())
+							   if entry.suffix == '.app' and entry.is_dir() and not entry.is_symlink()
+							   and _tomato_bundle_info(entry).get('CFBundleIdentifier') == TOMATO_UPDATE_BUNDLE_ID),
+							  None)
+				if source is None:
+					raise TomatoUpdateError(_tr('The installer does not contain Tomato.'))
+				status(_tr('Copying the new version…'))
+				copied = subprocess.run(['/usr/bin/ditto', str(source), str(staged)],
+										capture_output=True, timeout=1800)
+				if copied.returncode != 0 or not staged.is_dir():
+					raise TomatoUpdateError(_tr('Could not copy the new version: %1').replace(
+						'%1', copied.stderr.decode('utf-8', 'replace').strip()[-300:]))
+			finally:
+				_tomato_detach_dmg(mountpoint)
+			subprocess.run(['/usr/bin/xattr', '-dr', 'com.apple.quarantine', str(staged)],
+						   capture_output=True, timeout=300)
+			status(_tr('Checking the developer signature…'))
+			version = tomato_verify_update_bundle(staged)
+			if tomato_is_newer_version(VERSION, version):
+				raise TomatoUpdateError(
+					_tr('The installer holds an older version (v%1); nothing was changed.').replace('%1', str(version)))
+		except Exception as exc:
+			shutil.rmtree(staging_root, ignore_errors=True)
+			if isinstance(exc, TomatoUpdateError):
+				raise
+			raise TomatoUpdateError(_tr('Could not prepare the update: %1').replace('%1', str(exc))) from exc
+	return {'target': str(target), 'staged': str(staged),
+			'backup': str(staging_root / ('previous-' + target.name)),
+			'version': version, 'dmg': str(dmg_path)}
+
+
+def _tomato_write_update_result(record) -> None:
+	try:
+		os.makedirs(TOMATO_UPDATE_CACHE_DIR, exist_ok=True)
+		with open(TOMATO_UPDATE_RESULT_PATH, 'w', encoding='utf-8') as handle:
+			json.dump(record, handle, ensure_ascii=False)
+	except Exception:
+		pass
+
+
+def tomato_take_last_update_result() -> dict:
+	"""The record the previous run left after an install attempt (read once)."""
+	try:
+		with open(TOMATO_UPDATE_RESULT_PATH, 'r', encoding='utf-8') as handle:
+			record = json.load(handle)
+	except Exception:
+		return {}
+	try:
+		os.remove(TOMATO_UPDATE_RESULT_PATH)
+	except OSError:
+		pass
+	return record if isinstance(record, dict) else {}
+
+
+def _tomato_spawn_relauncher(app_path) -> None:
+	"""Reopen app_path once this process has exited (force-kill after ~60 s if it hangs).
+	Double-forked: the waiter is reparented to launchd, so reaping this process's children at exit
+	cannot take it along."""
+	waiter = ('pid=$1; app=$2; n=0; '
+			  'while kill -0 "$pid" 2>/dev/null; do '
+			  'n=$((n+1)); if [ "$n" -ge 300 ]; then kill -9 "$pid" 2>/dev/null; sleep 1; break; fi; '
+			  'sleep 0.2; done; sleep 0.5; /usr/bin/open "$app"')
+	try:
+		subprocess.Popen(['/bin/sh', '-c', '(' + waiter + ') </dev/null >/dev/null 2>&1 &',
+						  'tomato-relaunch', str(os.getpid()), str(app_path)],
+						 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+						 start_new_session=True, close_fds=True).wait(timeout=10)
+	except Exception:
+		pass
+
+
+def tomato_apply_pending_update_install() -> None:
+	"""Runs after app.exec() returns: swap the staged bundle in, record the outcome, schedule the relaunch.
+	A failed rename rolls back and reopens the old build, which then shows the reason (WindowUpdate's
+	startup note). Once only; nothing happens unless the update window prepared an install."""
+	global _TOMATO_PENDING_UPDATE_INSTALL
+	pending = _TOMATO_PENDING_UPDATE_INSTALL
+	_TOMATO_PENDING_UPDATE_INSTALL = None
+	if not pending:
+		return
+	target, staged, backup = Path(pending['target']), Path(pending['staged']), Path(pending['backup'])
+	record = {'status': 'failed', 'version': str(pending.get('version') or ''), 'previous': VERSION,
+			  'dmg': str(pending.get('dmg') or ''), 'reason': '', 'time': time.time()}
+	try:
+		# exit hooks (pending writes) run now, while every file of the running build is still in place
+		atexit._run_exitfuncs()
+	except Exception:
+		pass
+	launch = target
+	try:
+		if not staged.is_dir():
+			raise FileNotFoundError(str(staged))
+		if backup.exists():
+			shutil.rmtree(backup, ignore_errors=True)
+		os.rename(target, backup)
+		try:
+			os.rename(staged, target)
+		except OSError:
+			try:
+				os.rename(backup, target)
+			except OSError:
+				launch = backup
+			raise
+		record['status'] = 'installed'
+	except Exception as exc:
+		record['reason'] = '%s: %s' % (type(exc).__name__, exc)
+	_tomato_write_update_result(record)
+	_tomato_spawn_relauncher(str(launch))
+
+
+def tomato_cleanup_update_leftovers() -> None:
+	"""Startup (background thread): drop the previous bundle kept by the last swap or a stale staged copy,
+	stale mounts, and cached installers this build has already reached. A failed install keeps its DMG
+	for the retry."""
+	with _TOMATO_UPDATE_FS_LOCK:
+		bundle = tomato_running_app_bundle()
+		if bundle is not None:
+			staging_root = bundle.parent / TOMATO_UPDATE_STAGING_DIRNAME
+			if staging_root.is_dir():
+				shutil.rmtree(staging_root, ignore_errors=True)
+		if not os.path.isdir(TOMATO_UPDATE_CACHE_DIR):
+			return
+		for name in os.listdir(TOMATO_UPDATE_CACHE_DIR):
+			path = os.path.join(TOMATO_UPDATE_CACHE_DIR, name)
+			try:
+				if name.startswith('mnt-') and os.path.isdir(path):
+					_tomato_detach_dmg(path)
+				elif name.endswith(('.dmg', '.dmg.part')) and not tomato_is_newer_version(name, VERSION):
+					os.remove(path)
+			except Exception:
+				pass
+
+
+class _UpdateProgressBar(QWidget):
+	"""Slim rounded track for the update window (style book 5.7.2: the system's progress bar is not drawn
+	under the new design, so it is drawn here). busy=True sweeps an indeterminate segment (mount / copy /
+	signature check have no percentage). Broccoli's, unchanged."""
+
+	def __init__(self, parent=None):
+		super().__init__(parent)
+		self._fraction = 0.0
+		self._busy = False
+		self._phase = 0.0
+		self._timer = QTimer(self)
+		self._timer.setInterval(30)
+		self._timer.timeout.connect(self._advance)
+		self.setFixedHeight(6)
+
+	def fraction(self) -> float:
+		return self._fraction
+
+	def is_busy(self) -> bool:
+		return self._busy
+
+	def set_fraction(self, fraction):
+		self._busy = False
+		self._timer.stop()
+		self._fraction = max(0.0, min(1.0, float(fraction)))
+		self.update()
+
+	def set_busy(self, busy=True):
+		self._busy = bool(busy)
+		if self._busy and self.isVisible():
+			self._timer.start()
+		else:
+			self._timer.stop()
+		self.update()
+
+	def showEvent(self, event):
+		super().showEvent(event)
+		if self._busy:
+			self._timer.start()
+
+	def hideEvent(self, event):
+		self._timer.stop()
+		super().hideEvent(event)
+
+	def _advance(self):
+		self._phase = (self._phase + 0.015) % 1.0
+		self.update()
 
 	def paintEvent(self, event):
 		painter = QPainter(self)
 		painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-		painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-
 		rect = QRectF(self.rect())
-		path = QPainterPath()
-		path.addRoundedRect(rect, self.radius, self.radius)
+		radius = rect.height() / 2.0
+		dark = is_dark_theme(app)
+		track = QPainterPath()
+		track.addRoundedRect(rect, radius, radius)
+		painter.fillPath(track, QColor('#3A3A3C') if dark else QColor('#E5E5EA'))
+		if self._busy:
+			segment = rect.width() * 0.3
+			fill_rect = QRectF(rect.left() - segment + (rect.width() + segment) * self._phase,
+							   rect.top(), segment, rect.height())
+		else:
+			fill_rect = QRectF(rect.left(), rect.top(), rect.width() * self._fraction, rect.height())
+		if fill_rect.width() > 0:
+			fill = QPainterPath()
+			fill.addRoundedRect(fill_rect, radius, radius)
+			painter.setClipPath(track)
+			painter.fillPath(fill, QColor('#0A84FF') if dark else QColor('#007AFF'))
 
-		painter.setClipPath(path)
-		bg_color = self.palette().color(QPalette.ColorRole.Window)
-		painter.fillPath(path, bg_color)
 
-	# 让无边框窗口可拖动
-	def mousePressEvent(self, event):
-		if event.button() == Qt.MouseButton.LeftButton:
-			self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-			event.accept()
+class _UpdateStatusLabel(QLabel):
+	"""The update window's status line; tells the window when its text changes (the window shows the line
+	only while it says something, and fits its height to it). Broccoli's."""
+	text_changed = None
 
-	def mouseMoveEvent(self, event):
-		if event.buttons() == Qt.MouseButton.LeftButton:
-			self.move(event.globalPosition().toPoint() - self.drag_pos)
-			event.accept()
+	def setText(self, text):
+		super().setText(text)
+		if callable(self.text_changed):
+			self.text_changed()
+
+
+class WindowUpdate(QWidget):  # 增加更新页面（Check for Updates）
+	"""Broccoli's update window (layout and size the same: 320 wide, as tall as its content). The release check
+	runs in a background thread; "Update Now" downloads, verifies and installs the new version, then
+	relaunches Tomato."""
+	# (result_text, update_ready, popup_when_ready, release_info) from the check thread
+	update_check_finished = pyqtSignal(str, bool, bool, object)
+	# one-click install worker → GUI thread
+	install_progress = pyqtSignal(object, object)   # (done_bytes, total_bytes)
+	install_status = pyqtSignal(str)                # a phase without percentage
+	install_failed = pyqtSignal(str)
+	install_ready = pyqtSignal(object)              # pending-install record
+
+	def __init__(self):
+		super().__init__()
+		self._check_inflight = False
+		self._release_info = None
+		self._update_available = False
+		self._install_busy = False
+		self._install_can_cancel = False
+		self._install_cancel = None
+		self._download_started_at = 0.0
+		self._download_started_bytes = 0
+		self._startup_note = self._read_startup_note()
+		self.update_check_finished.connect(self._on_update_check_finished)
+		self.install_progress.connect(self._on_install_progress)
+		self.install_status.connect(self._on_install_status)
+		self.install_failed.connect(self._on_install_failed)
+		self.install_ready.connect(self._on_install_ready)
+		self.init_ui()
+
+	def init_ui(self):
+		# style book 5.7.2 / 5.12: the system's traffic lights + window glass (make_native_glass_window, as
+		# About and the donation windows); 320 wide, as tall as its content (Broccoli's update window)
+		self.setUpMainWindow()
+		make_native_glass_window(self)
+		QWidget.layout(self).setContentsMargins(20, NATIVE_TITLEBAR_HEIGHT, 20, 20)
+		self.setFixedWidth(320)
+		self._fit_height()
+		self.center()
+		self.setWindowTitle(_tr('Tomato Updates'))
+		self.setFocus()
+
+	def _fit_height(self):
+		"""As tall as the content: no empty band at the bottom. While a download runs the progress bar and the
+		status line appear under the buttons and the window grows by that much (its top edge stays)."""
+		layout = QWidget.layout(self)
+		if layout is None:
+			return
+		busy = not self.install_progress_bar.isHidden() or bool(self.install_status_lbl.text().strip())
+		self._progress_block.setVisible(busy)
+		layout.activate()
+		width = self.width() or 320
+		height = layout.totalHeightForWidth(width) if layout.hasHeightForWidth() else layout.totalSizeHint().height()
+		self.setFixedHeight(max(1, int(height)))
 
 	def setUpMainWindow(self):
-		# 添加关闭按钮（仿 macOS 左上角红色圆点）
-		# self.close_button = QPushButton(self)
-		# self.close_button.setFixedSize(12, 12)
-		# self.close_button.move(10, 10)
-		# self.close_button.setStyleSheet("""
-		#	 QPushButton {
-		#		 background-color: #FF5F57;
-		#		 border-radius: 6px;
-		#		 border: none;
-		#	 }
-		#	 QPushButton:hover {
-		#		 background-color: #BF4943;
-		#	 }
-		# """)
-		# self.close_button.clicked.connect(self.close)
-		self.close_button = MacWindowButton("#FF605C", "x", self)
-		self.close_button.move(10, 10)
-		self.close_button.clicked.connect(self.close)
-
-		title = QLabel(self.tr("<h2>Tomato Update</h2>"))
+		# Broccoli's layout: centred lines (current, then latest version), then one row per action sharing
+		# one label column and one button column
+		title = QLabel(_tr("<h2>Tomato Update</h2>"), self)
 		title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+		self.lbl = QLabel(_tr('Current version: v%n').replace('%n', VERSION), self)
+		self.lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
 		widg5 = QWidget()
-		lbl1 = QLabel(self.tr('Latest version:'), self)
+		lbl1 = QLabel(_tr('Latest version:'), self)
 		self.lbl2 = QLabel('', self)
 		blay5 = QHBoxLayout()
 		blay5.setContentsMargins(0, 0, 0, 0)
-		# blay5.addStretch()
+		blay5.setSpacing(4)
+		blay5.addStretch(1)
 		blay5.addWidget(lbl1)
 		blay5.addWidget(self.lbl2)
-		blay5.addStretch()
+		blay5.addStretch(1)
 		widg5.setLayout(blay5)
 
-		widg3 = QWidget()
-		self.lbl = QLabel(self.tr(f'Current version: v%n').replace('%n', VERSION), self)
-		blay3 = QHBoxLayout()
-		blay3.setContentsMargins(0, 0, 0, 0)
-		# blay3.addStretch()
-		blay3.addWidget(self.lbl)
-		blay3.addStretch()
-		widg3.setLayout(blay3)
-
-		widg4 = QWidget()
-		widg4.setFixedHeight(50)
-		lbl0 = QLabel(self.tr('Check release:'), self)
-		bt1 = WhiteButton('Github')
+		lbl0 = QLabel(_tr('Check release:'), self)
+		bt1 = WhiteButton(_tr('Github'))
+		bt1.setFixedWidth(120)
 		bt1.clicked.connect(self.upd)
-		blay4 = QHBoxLayout()
-		blay4.setContentsMargins(0, 0, 0, 0)
-		# blay4.addStretch()
-		blay4.addWidget(lbl0)
-		blay4.addWidget(bt1)
-		blay4.addStretch()
-		widg4.setLayout(blay4)
+		# one-click update: download with progress → verify → install → relaunch
+		lbl_install = QLabel(_tr('Install update:'), self)
+		self.install_btn = WhiteButton(_tr('Update Now'))
+		self.install_btn.setFixedWidth(120)
+		self.install_btn.setEnabled(False)
+		self.install_btn.clicked.connect(self.start_install)
+		label_width = max(lbl0.sizeHint().width(), lbl_install.sizeHint().width())
+		action_rows = []
+		for label, button in ((lbl0, bt1), (lbl_install, self.install_btn)):
+			label.setFixedWidth(label_width)
+			label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+			row = QWidget()
+			row.setFixedHeight(50)   # About's button rows
+			row_layout = QHBoxLayout(row)
+			row_layout.setContentsMargins(0, 0, 0, 0)
+			row_layout.setSpacing(12)
+			row_layout.addStretch(1)
+			row_layout.addWidget(label)
+			row_layout.addWidget(button)
+			row_layout.addStretch(1)
+			action_rows.append(row)
+
+		# progress bar + status line: only while there is something to show
+		self._progress_block = QWidget()
+		progress_layout = QVBoxLayout(self._progress_block)
+		progress_layout.setContentsMargins(0, 6, 0, 0)
+		progress_layout.setSpacing(10)
+		self.install_progress_bar = _UpdateProgressBar(self._progress_block)
+		self.install_progress_bar.hide()
+		self.install_status_lbl = _UpdateStatusLabel(self._progress_block)
+		self.install_status_lbl.setWordWrap(True)
+		self.install_status_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+		self.install_status_lbl.text_changed = lambda: QTimer.singleShot(0, self._fit_height)
+		progress_layout.addWidget(self.install_progress_bar)
+		progress_layout.addWidget(self.install_status_lbl)
+		self.install_progress_bar.installEventFilter(self)
+		self._progress_block.hide()
 
 		main_h_box = QVBoxLayout()
-		main_h_box.setContentsMargins(20, 40, 20, 20)  # 重要，用来保证关闭按钮的位置。
+		main_h_box.setContentsMargins(20, 40, 20, 20)
+		main_h_box.addSpacing(10)
 		main_h_box.addWidget(title)
 		main_h_box.addSpacing(5)
-		main_h_box.addWidget(widg5)
+		main_h_box.addWidget(self.lbl)
 		main_h_box.addSpacing(5)
-		main_h_box.addWidget(widg3)
-		main_h_box.addWidget(widg4)
+		main_h_box.addWidget(widg5)
+		main_h_box.addSpacing(16)
+		for row in action_rows:
+			main_h_box.addWidget(row)
+		main_h_box.addWidget(self._progress_block)
+		main_h_box.addSpacing(10)
 		self.setLayout(main_h_box)
 
+	def eventFilter(self, obj, event):
+		if obj is getattr(self, 'install_progress_bar', None) and event.type() in (QEvent.Type.Show, QEvent.Type.Hide):
+			QTimer.singleShot(0, self._fit_height)
+		return super().eventFilter(obj, event)
+
 	def upd(self):
-		webbrowser.open('https://github.com/Ryan-the-hito/Tomato/releases')
+		webbrowser.open(TOMATO_UPDATE_RELEASES_URL)
 
 	def center(self):  # 设置窗口居中
 		qr = self.frameGeometry()
@@ -2271,67 +2729,201 @@ class WindowUpdate(QWidget):  # 增加更新页面（Check for Updates）
 		self.show()
 		self.checkupdate()
 
-	def checkupdate(self):
-		targetURL = 'https://github.com/Ryan-the-hito/Tomato/releases'
+	@staticmethod
+	def _read_startup_note() -> str:
+		"""What the previous run's install attempt left behind, shown once with the startup check."""
+		record = tomato_take_last_update_result()
+		if record.get('status') == 'installed' and not tomato_is_newer_version(record.get('version'), VERSION):
+			return _tr('Tomato was updated to v%1.').replace('%1', VERSION)
+		if record.get('status') == 'failed':
+			return _tr('The last update could not be installed (%1). Click Update Now to try again.').replace(
+				'%1', str(record.get('reason') or '?'))
+		return ''
+
+	def checkupdate(self, *, popup_when_ready=False):
+		"""Start the release check WITHOUT touching the network on the GUI thread (the old check fetched
+		github.com right here and froze the window while GitHub was slow or unreachable)."""
+		if self._check_inflight:
+			return
+		self._check_inflight = True
+		self.lbl2.setText(_tr('Checking…'))
+		self.lbl2.adjustSize()
+
+		def worker():
+			alertupdate = _tr('No Internet')
+			ready = False
+			info = None
+			try:
+				info = self.fetch_latest_release_info()
+				result = (info or {}).get('tag')
+				if result:
+					# only a strictly NEWER release is an update (the old window offered any release that
+					# differed — a build ahead of the latest release was offered a "downgrade")
+					if tomato_is_newer_version(result, VERSION):
+						alertupdate = result + _tr(' is ready!')
+						ready = True
+					else:
+						alertupdate = result + _tr(' (up-to-date)')
+			except Exception:
+				pass
+			try:
+				self.update_check_finished.emit(alertupdate, ready, popup_when_ready, info)
+			except RuntimeError:
+				pass   # window destroyed during shutdown
+
+		threading.Thread(target=worker, daemon=True, name='tomato-update-check').start()
+
+	def _on_update_check_finished(self, alertupdate, ready, popup_when_ready, info):
+		self._check_inflight = False
+		self.lbl2.setText(str(alertupdate or ''))
+		self.lbl2.adjustSize()
+		if not self._install_busy:
+			self._update_available = bool(ready)
+			self._release_info = dict(info) if (ready and isinstance(info, dict)) else None
+			has_package = bool((self._release_info or {}).get('dmg_url'))
+			self.install_btn.setEnabled(has_package)
+			if ready and not has_package:
+				self.install_status_lbl.setText(_tr('This release has no installer package; use the Github button.'))
+		note = self._startup_note if popup_when_ready else ''
+		if note and not self._install_busy:
+			self._startup_note = ''
+			self.install_status_lbl.setText(note)
+		if popup_when_ready and (ready or note) and not self.isVisible():
+			self.show()
+
+	# ---- one-click install ----------------------------------------------------
+	def start_install(self):
+		if self._install_busy:
+			# the same button reads "Cancel" while the download runs
+			if self._install_can_cancel and self._install_cancel is not None:
+				self._install_cancel.set()
+				self.install_btn.setEnabled(False)
+				self.install_status_lbl.setText(_tr('Canceling…'))
+			return
+		info = dict(self._release_info or {})
+		if not info.get('dmg_url'):
+			return
+		self._install_busy = True
+		self._install_can_cancel = True
+		self._install_cancel = threading.Event()
+		self._download_started_at = 0.0
+		self._download_started_bytes = 0
+		self.install_btn.setText(_tr('Cancel'))
+		self.install_progress_bar.set_fraction(0.0)
+		self.install_progress_bar.show()
+		self.install_status_lbl.setText(_tr('Connecting…'))
+		threading.Thread(target=self._install_worker, args=(info, self._install_cancel),
+						 daemon=True, name='tomato-update-install').start()
+
+	def _install_worker(self, info, cancel_event):
+		last_emit = [0.0]
+
+		def progress(done, total):
+			now = time.monotonic()
+			if now - last_emit[0] >= 0.1 or (total and done >= total):
+				last_emit[0] = now
+				self.install_progress.emit(int(done), int(total))
+
 		try:
-			# Fetch the HTML content from the URL
-			urllib3.disable_warnings()
-			logging.captureWarnings(True)
-			s = requests.session()
-			s.keep_alive = False  # 关闭多余连接
-			response = s.get(targetURL, verify=False)
-			response.encoding = 'utf-8'
-			html_content = response.text
-			# Parse the HTML using BeautifulSoup
-			soup = BeautifulSoup(html_content, "html.parser")
-			# Remove all images from the parsed HTML
-			for img in soup.find_all("img"):
-				img.decompose()
-			# Convert the parsed HTML to plain text using html2text
-			text_maker = html2text.HTML2Text()
-			text_maker.ignore_links = True
-			text_maker.ignore_images = True
-			plain_text = text_maker.handle(str(soup))
-			# Convert the plain text to UTF-8
-			plain_text_utf8 = plain_text.encode(response.encoding).decode("utf-8")
+			dmg_path = tomato_download_update_dmg(info, progress, cancel_event, status=self.install_status.emit)
+			bundle = tomato_running_app_bundle()
+			blocker = tomato_update_install_blocker(bundle)
+			if blocker:
+				# this copy cannot replace itself: hand the verified DMG to Finder instead
+				subprocess.Popen(['/usr/bin/open', dmg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+				self.install_ready.emit({'manual': True, 'reason': blocker, 'dmg': dmg_path})
+				return
+			self.install_ready.emit(tomato_stage_update(dmg_path, bundle, status=self.install_status.emit))
+		except TomatoUpdateError as exc:
+			self.install_failed.emit(str(exc))
+		except Exception as exc:
+			logging.exception('One-click update failed.')
+			self.install_failed.emit(_tr('Update failed: %1').replace('%1', str(exc)))
 
-			for i in range(10):
-				plain_text_utf8 = plain_text_utf8.replace('\n\n\n\n', '\n\n')
-				plain_text_utf8 = plain_text_utf8.replace('\n\n\n', '\n\n')
-				plain_text_utf8 = plain_text_utf8.replace('   ', ' ')
-				plain_text_utf8 = plain_text_utf8.replace('  ', ' ')
+	def _on_install_progress(self, done, total):
+		done, total = int(done or 0), int(total or 0)
+		now = time.monotonic()
+		if not self._download_started_at:
+			self._download_started_at, self._download_started_bytes = now, done
+		mb = 1024 * 1024
+		text = _tr('Downloading… %1 / %2 MB').replace('%1', '%.1f' % (done / mb)).replace(
+			'%2', ('%.1f' % (total / mb)) if total else '?')
+		elapsed = now - self._download_started_at
+		if elapsed >= 1.0 and done > self._download_started_bytes:
+			text += ' · %.1f MB/s' % ((done - self._download_started_bytes) / mb / elapsed)
+		self.install_progress_bar.set_fraction(done / total if total else 0.0)
+		self.install_status_lbl.setText(text)
 
-			pattern2 = re.compile(r'(v\d+\.\d+\.\d+)\sLatest')
-			result = pattern2.findall(plain_text_utf8)
-			result = ''.join(result)
-			nowversion = 'v' + VERSION
-			if result == nowversion:
-				alertupdate = result + self.tr(' (up-to-date)')
-				self.lbl2.setText(alertupdate)
-				self.lbl2.adjustSize()
-			else:
-				alertupdate = result + self.tr(' is ready!')
-				self.lbl2.setText(alertupdate)
-				self.lbl2.adjustSize()
-		except:
-			alertupdate = self.tr('No Intrenet')
-			self.lbl2.setText(alertupdate)
-			self.lbl2.adjustSize()
+	def _on_install_status(self, text):
+		# verify / mount / copy / signature: no percentage and no way back
+		self._install_can_cancel = False
+		self.install_btn.setEnabled(False)
+		self.install_btn.setText(_tr('Installing…'))
+		self.install_progress_bar.set_busy(True)
+		self.install_status_lbl.setText(str(text or ''))
+
+	def _reset_install_controls(self):
+		self._install_busy = False
+		self._install_can_cancel = False
+		self._install_cancel = None
+		self.install_progress_bar.set_busy(False)
+		self.install_progress_bar.hide()
+		self.install_btn.setText(_tr('Update Now'))
+		self.install_btn.setEnabled(self._update_available and bool((self._release_info or {}).get('dmg_url')))
+
+	def _on_install_failed(self, message):
+		self._reset_install_controls()
+		self.install_status_lbl.setText(str(message or ''))
+		if not self.isVisible():
+			self.show()
+
+	def _on_install_ready(self, pending):
+		pending = dict(pending or {})
+		if pending.get('manual'):
+			self._reset_install_controls()
+			self.install_status_lbl.setText(
+				_tr("Can't install automatically (%1). The installer is open: drag Tomato into Applications.").replace(
+					'%1', str(pending.get('reason', ''))))
+			return
+		global _TOMATO_PENDING_UPDATE_INSTALL
+		_TOMATO_PENDING_UPDATE_INSTALL = pending
+		self.install_progress_bar.set_fraction(1.0)
+		self.install_status_lbl.setText(_tr('Restarting Tomato to finish the update…'))
+		if not self.isVisible():
+			self.show()
+		QTimer.singleShot(800, self._quit_for_install)
+
+	def _quit_for_install(self):
+		# Tomato's normal Quit (totalquit: today's diary line, the sync / auto-record threads and the tools
+		# service stopped, then app.quit()); the swap itself runs after app.exec() returns
+		main = globals().get('w3')
+		if main is not None and hasattr(main, 'totalquit'):
+			main.totalquit()
+		else:
+			app.quit()
+
+	@classmethod
+	def fetch_latest_release_info(cls):
+		"""Release info (tag + DMG asset) from the API; when the API is unavailable, the tag alone from the
+		releases page (no one-click install then — the Github button still works)."""
+		try:
+			info = tomato_fetch_latest_release()
+			if info:
+				return info
+		except Exception:
+			pass
+		tag = cls.extract_latest_tag(cls.fetch_latest_version_text())
+		return {'tag': tag} if tag else None
 
 	@staticmethod
 	def fetch_latest_version_text():
-		# 返回页面纯文本，或直接返回最新版本字符串
-		targetURL = 'https://github.com/Ryan-the-hito/Tomato/releases'
+		# the releases page as plain text (the fallback when the API is unavailable)
 		try:
-			urllib3.disable_warnings()
-			logging.captureWarnings(True)
 			s = requests.session()
 			s.keep_alive = False
-			response = s.get(targetURL, verify=False, timeout=15)
+			response = s.get(TOMATO_UPDATE_RELEASES_URL, timeout=(4, 8))
 			response.encoding = 'utf-8'
-			html_content = response.text
-
-			soup = BeautifulSoup(html_content, "html.parser")
+			soup = BeautifulSoup(response.text, "html.parser")
 			for img in soup.find_all("img"):
 				img.decompose()
 			text_maker = html2text.HTML2Text()
@@ -2339,7 +2931,6 @@ class WindowUpdate(QWidget):  # 增加更新页面（Check for Updates）
 			text_maker.ignore_images = True
 			plain_text = text_maker.handle(str(soup))
 			plain_text_utf8 = plain_text.encode(response.encoding).decode("utf-8")
-
 			for _ in range(10):
 				plain_text_utf8 = (plain_text_utf8
 								   .replace('\n\n\n\n', '\n\n')
@@ -2351,15 +2942,12 @@ class WindowUpdate(QWidget):  # 增加更新页面（Check for Updates）
 			return None
 
 	@staticmethod
-	def extract_latest_tag(plain_text_utf8: str) -> str | None:
-		# 返回类似 'v0.0.12' 的字符串
+	def extract_latest_tag(plain_text_utf8):
+		# e.g. 'v1.2.13'
 		if not plain_text_utf8:
 			return None
-		pattern2 = re.compile(r'(v\d+\.\d+\.\d+)\sLatest')
-		result = pattern2.findall(plain_text_utf8)
-		if result:
-			return result[0]
-		return None
+		result = re.compile(r'(v\d+\.\d+\.\d+)\sLatest').findall(plain_text_utf8)
+		return result[0] if result else None
 
 
 class CustomDialog_warn(QDialog):  # 提醒检查路径
@@ -2462,27 +3050,183 @@ class CustomDialog_warn(QDialog):  # 提醒检查路径
 		self.close()
 
 
+class SyncIndicatorDialog(QDialog):
+	"""The small "syncing" card over the main window: a floating glass card (window glass, corner 16), never
+	modal; the main window puts it where it belongs."""
+	_no_auto_place = True
+
+	def __init__(self, parent=None):
+		super().__init__(parent)
+		self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
+		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+		self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+		self.radius = glass_kit.MAIN_WINDOW_SMOOTH_RADIUS
+
+
+install_glass_dialog_class(SyncIndicatorDialog)
+
+
 class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 	def __init__(self):
 		super().__init__()
 		self.radius = 16
 		self.dragPosition = self.pos()
 		self._diary_text_edits = []
+		self._diary_box_base = {}        # diary box → (day, the file as the box loaded it), see _save_diary_box
 		self._diary_viewport_owner = {}
 		self._suppress_diary_write = False
 		self._last_local_reminder_change = 0.0
 		self._last_safety_notification_time = {}  # Track last notification time per function
 		self._safety_notification_cooldown = 60  # Cooldown in seconds to prevent spam
 		self.initUI()
+		# the screen changes its resolution / Dock / menu bar, or a screen is plugged in or out: the window
+		# takes its place again at once (as Broccoli's main window: the screens' own signals restart one
+		# 300 ms timer; nothing polls)
+		self._screen_fit_timer = QTimer(self)
+		self._screen_fit_timer.setSingleShot(True)
+		self._screen_fit_timer.setInterval(300)
+		self._screen_fit_timer.timeout.connect(self._fit_to_current_screen)
+		self._connect_screen_fit_signals()
+
+	def _connect_screen_fit_signals(self):
+		gui_app = QGuiApplication.instance()
+		if gui_app is None:
+			return
+		try:
+			gui_app.screenAdded.connect(self._on_screen_fit_screen_added)
+			gui_app.screenRemoved.connect(self._schedule_screen_fit)
+			gui_app.primaryScreenChanged.connect(self._schedule_screen_fit)
+		except Exception:
+			pass
+		for screen in QGuiApplication.screens() or []:
+			self._connect_screen_fit_screen(screen)
+
+	def _connect_screen_fit_screen(self, screen):
+		# the marker lives on the screen object: a replacement one (unplug / replug) is connected afresh
+		if screen is None or screen.property('_tomato_fit_connected'):
+			return
+		screen.setProperty('_tomato_fit_connected', True)
+		try:
+			screen.geometryChanged.connect(self._schedule_screen_fit)
+			screen.availableGeometryChanged.connect(self._schedule_screen_fit)
+		except Exception:
+			pass
+
+	def _on_screen_fit_screen_added(self, screen):
+		self._connect_screen_fit_screen(screen)
+		self._schedule_screen_fit()
+
+	def _connect_screen_fit_handle(self):
+		# setWindowFlags() makes a new native window: connect its "moved to another screen" again
+		handle = self.windowHandle()
+		if handle is None or handle is getattr(self, '_screen_fit_handle', None):
+			return
+		self._screen_fit_handle = handle
+		try:
+			handle.screenChanged.connect(self._schedule_screen_fit)
+		except Exception:
+			pass
+
+	def showEvent(self, event):
+		super().showEvent(event)
+		self._connect_screen_fit_handle()
+		keep_out_of_stage_manager(self)
+
+	def _apply_window_flags(self):
+		flags = Qt.WindowType.FramelessWindowHint
+		if getattr(self, '_always_on_top', True):
+			flags |= Qt.WindowType.WindowStaysOnTopHint
+		self.setWindowFlags(flags)
+
+	def set_always_on_top(self, enabled):
+		"""(Broccoli's.) The main window — the strip at the screen edge too — above every other window, or
+		an ordinary window that other windows can cover. Changing the flags makes a new native window: it is
+		shown again where it was, without taking the keyboard."""
+		enabled = bool(enabled)
+		if enabled == getattr(self, '_always_on_top', True):
+			return
+		was_visible = self.isVisible()
+		geom = self.geometry()
+		self._always_on_top = enabled
+		self._apply_window_flags()
+		if was_visible:
+			self.show()
+			self.setGeometry(geom)
+			if enabled:
+				self.raise_()
+
+	def is_always_on_top(self):
+		return bool(getattr(self, '_always_on_top', True))
+
+	def _toggle_all_spaces(self, checked):
+		self._app_settings['show_on_all_spaces'] = bool(checked)
+		self._save_app_settings()
+		set_show_on_all_spaces(checked)
+
+	def _toggle_dock_icon(self, checked):
+		self._app_settings['dock_icon'] = bool(checked)
+		self._save_app_settings()
+		set_dock_icon_visible(bool(checked), activate=bool(checked))
+
+	def _toggle_always_on_top(self, checked):
+		self._app_settings['always_on_top'] = bool(checked)
+		self._save_app_settings()
+		self.set_always_on_top(checked)
+
+	def _strip_top(self, area):
+		"""Where the 120-high strip window goes so that the strip's middle is the middle between the top of
+		the screen and the top of the Dock (Ryan 2026-11-16: "始终处于屏幕上下的正中间 … 去掉 dock 高度的
+		正中间"). `area` = the screen's available geometry (it ends where the Dock begins)."""
+		screen = QGuiApplication.screenAt(area.center())
+		top = screen.geometry().y() if screen is not None else area.y()
+		bottom = area.y() + area.height()
+		return int(round((top + bottom) / 2 - 60))
+
+	def _schedule_screen_fit(self, *_args):
+		timer = getattr(self, '_screen_fit_timer', None)
+		if timer is not None:
+			timer.start()
+
+	def _fit_to_current_screen(self):
+		"""Size and place as pin_a_tab does, from the screen as it is now: out = half the screen wide and
+		as tall as it, at the left; in = the thin strip at the left edge, at the screen's middle height."""
+		if not self.isVisible():
+			return 'hidden'   # the next show / pin_a_tab sizes from the screen of that moment
+		animation = getattr(self, '_geometry_animation', None)
+		try:
+			running = animation is not None and animation.state() == QPropertyAnimation.State.Running
+		except RuntimeError:
+			running = False
+		if running:
+			self._schedule_screen_fit()   # once the slide has settled
+			return 'deferred'
+		handle = self.windowHandle()
+		screen = (handle.screen() if handle is not None else None) or self.screen() or QGuiApplication.primaryScreen()
+		if screen is None:
+			return 'no screen'
+		area = screen.availableGeometry()
+		height = int(area.height())
+		if self.tab_bar.isVisible():
+			state = 'out'
+			target = QRect(3, 0, int(area.width() / 2), height)
+			self.setMinimumSize(0, 0)
+			self.setMaximumSize(16777215, 16777215)
+		else:
+			state = 'in'
+			target = QRect(0, self._strip_top(area), self.new_width, 120)
+			self.setFixedSize(self.new_width, 120)
+		if self.geometry() != target:
+			self.setGeometry(target)
+		logging.info('Main window screen fit (%s): available %dx%d at (%d,%d) -> window %dx%d at (%d,%d)',
+					 state, area.width(), area.height(), area.x(), area.y(),
+					 target.width(), target.height(), target.x(), target.y())
+		return state
 
 	def initUI(self):  # 设置窗口内布局
 		self._init_sync_indicator()
 		self.newlist()
-		home_dir = str(Path.home())
-		tarname1 = "TomatoAppPath"
-		fulldir1 = os.path.join(home_dir, tarname1)
-		if not os.path.exists(fulldir1):
-			os.mkdir(fulldir1)
+		fulldir1 = TOMATO_DATA_DIR
+		os.makedirs(fulldir1, exist_ok=True)
 		tarname2 = "All.csv"
 		self.fulldirall = os.path.join(fulldir1, tarname2)
 		tarname_dia = "Diary"
@@ -2511,52 +3255,78 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		BIGGIST_HEIGHT = int(self.screen().availableGeometry().height())
 
 		self.resize(HALF_WEIGHT, DE_HEIGHT)
-		self.move(self.width() + 3, int((DE_HEIGHT - 70) / 2))
-		self.move_window2(0, int((DE_HEIGHT - 70) / 2))
-		self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+		self.move(self.width() + 3, self._strip_top(self.screen().availableGeometry()))
+		self.move_window2(0, self._strip_top(self.screen().availableGeometry()))
+		self._always_on_top = True
+		self._apply_window_flags()
 		self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 		self.show()
 		self.tab_bar.setVisible(False)
 		self.new_width = 10
 		self.setFixedSize(self.new_width, 120)
-		if is_dark_theme(app):
-			app.setStyleSheet(style_sheet_dark)
-		else:
-			app.setStyleSheet(style_sheet_ori)
-		self.assigntoall()
+		self._style_edge_strip()
 		self.auto_record_thread = None
-		self.reminder_sync_thread = None
-		self.calendar_sync_thread = None
-		self.reminder_sync_queue = queue.Queue()
-		self.calendar_sync_queue = queue.Queue()
+		self.system_sync_thread = None
+		self.system_sync_queue = queue.Queue()
 		self._sync_processing = False
-		self._last_calendar_snapshot_ts = 0.0
-		self._last_reminder_snapshot_ts = 0.0
 		self.reminder_sync_timer = QTimer(self)
 		self.reminder_sync_timer.setInterval(3000)
 		self.reminder_sync_timer.timeout.connect(self._process_sync_messages)
 		self.reminder_sync_timer.start()
-		self._start_reminder_sync_worker()
-		self._start_calendar_sync_worker()
-
-		# 启动自动更新线程（24h = 86400秒）
-		self.update_check_worker = UpdateCheckWorker(current_version='v' + VERSION, interval_seconds=86400)
-		self.update_check_worker.update_available.connect(self.on_update_available)  # 主线程槽
-		self.update_check_worker.checked_ok.connect(self.on_update_checked_ok)  # 可选：日志或无感刷新
-		self.update_check_worker.checked_error.connect(self.on_update_checked_error)  # 可选：日志
-		self.update_check_worker.start()
+		self._start_system_sync_worker()
+		# an item named "@Broccoli …" is sent to Broccoli when its time comes (tomato_broccoli.py): one single-shot
+		# timer for the nearest one, set again when the table file changes, on wake and on a clock change
+		self.broccoli_scheduler = tomato_broccoli.Scheduler(self, self._broccoli_entries, self._broccoli_complete_row,
+															self.fulldirall, self._broccoli_notice)
+		QTimer.singleShot(3000, self.broccoli_scheduler.rearm)
+		# long instructions: task folders (task.md + schedule.json) in Broccoli's data folder; "@" in the item box
+		# lists them; a folder that holds both files is put on the table (also when Broccoli wrote it)
+		self.broccoli_store = tomato_broccoli.TaskStore()
+		self.broccoli_scheduler.store = self.broccoli_store
+		self.broccoli_tasks = tomato_broccoli.TaskSync(self, self.broccoli_store, os.path.join(os.path.dirname(self.fulldirall), 'broccoli_tasks.json'),
+													 self._broccoli_add_rows, self._broccoli_remove_rows)
+		self.broccoli_tasks.changed.connect(self._broccoli_tasks_changed)
+		self.broccoli_suggest = tomato_broccoli_ui.TaskSuggest(self.le1, self.broccoli_store, self.open_broccoli_tasks)
+		self._broccoli_manager = None
+		self._broccoli_editors = []
+		self.broccoli_store.write_manifest()
+		tomato_broccoli.install_skill()
+		self.broccoli_discussion = tomato_broccoli.Discussion(self)
+		tomato_broccoli.PLAIN_GROUP = _tr('Scheduled tasks')
+		self.broccoli_discussion.finished.connect(self._broccoli_discussion_finished)
+		QTimer.singleShot(3500, self.broccoli_tasks.sync)
+		self._tools_host = None
+		self._main_runner = _MainThreadRunner()      # made here, on the main thread: what it is handed runs here
+		QTimer.singleShot(2500, self._start_tools_service)
+		self._feed_watcher = None
+		QTimer.singleShot(3000, self._start_feed_watcher)
+		self._report_dialog = None
+		self._report_waiting = {}        # (kind, key) → (when Broccoli was asked for the written part, meta)
+		self._report_slot_cache = {}     # the calendar's days, by file (tomato_report.day_slots)
+		try:
+			tomato_report.move_old_layout(TOMATO_DATA_DIR)      # the first version's Reports/<day>.md → Reports/day/
+		except Exception:
+			logging.exception('The old reports could not be moved.')
+		self._report_sender = tomato_broccoli.send
+		self._report_timer = QTimer(self)
+		self._report_timer.setSingleShot(True)
+		self._report_timer.timeout.connect(self._report_time_came)
+		QTimer.singleShot(6000, self._report_time_came)
 
 	def setUpMainWindow(self):
-		self.tab_bar = QTabWidget()
+		# The window body with the glass tab bar on top (style book 5.6 / 5.12); each page is a stage: its
+		# table fills it and the edit panel floats on the table's lower part.
+		self.tab_bar = GlassTabWidget(kind='body')
 		self.word_tab = QWidget()
 		self.art_tab = QWidget()
 		self.insp_tab = QWidget()
 		self.collect_tab = QWidget()
+		self._edit_stages = []
 
-		self.tab_bar.addTab(self.word_tab, "Time")
-		self.tab_bar.addTab(self.art_tab, "Frequency")
-		self.tab_bar.addTab(self.insp_tab, "Memory")
-		self.tab_bar.addTab(self.collect_tab, "Collection")
+		self.tab_bar.addTab(self.word_tab, _tr("Time"))
+		self.tab_bar.addTab(self.art_tab, _tr("Frequency"))
+		self.tab_bar.addTab(self.insp_tab, _tr("Memory"))
+		self.tab_bar.addTab(self.collect_tab, _tr("Collection"))
 		self.tab_bar.setCurrentIndex(0)
 		self.tab_bar.tabBarClicked.connect(self.clickbarss)
 
@@ -2592,16 +3362,104 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		self.to_done = 0
 		self.memo_to_done = 0
 
+		# date / time boxes: normal inputs; the calendar a date box opens = a small glass pop-up (5.4.1)
+		for field in self.findChildren(QDateEdit):
+			style_date_time_field(field, 'calendar')
+			glass_calendar_popup(field)
+		for field in self.findChildren(QTimeEdit):
+			style_date_time_field(field, 'clock')
+		self._install_quick_edit()
+
+		self.set_edit_panel_open(self._app_settings.get('edit_panel_open', True), animate=False, save=False)
+
+	def _page_stage(self, page, content, panel):
+		"""One page: `content` (its table) fills it, `panel` (the edit part) floats on the table's lower
+		part as a Liquid Glass drawer (style book 5.12)."""
+		stage = FloatPanelStage(content, panel, on_toggle=self.set_edit_panel_open)
+		layout = QVBoxLayout()
+		layout.setContentsMargins(0, 0, 0, 0)
+		layout.addWidget(stage)
+		page.setLayout(layout)
+		self._edit_stages.append(stage)
+		return stage
+
+	def set_edit_panel_open(self, open_, animate=True, save=True):
+		"""The edit panels of all four pages are pushed in / pulled out together; only the page on screen
+		slides. The choice is remembered (app_settings.json)."""
+		open_ = bool(open_)
+		current = self.tab_bar.currentWidget()
+		for stage in self._edit_stages:
+			on_screen = current is not None and current.isAncestorOf(stage) and stage.isVisible()
+			stage.set_open(open_, animate=bool(animate and on_screen))
+		if save and self._app_settings.get('edit_panel_open', True) != open_:
+			self._app_settings['edit_panel_open'] = open_
+			self._save_app_settings()
+
+	def _style_edge_strip(self):
+		"""The thin strip that shows / hides the window (not glass, style book 5.10): filled with the system
+		accent while the window is out, white (dark: #3A3A3A) with a hairline while it is in."""
+		shown = self.i % 2 == 0
+		dark = is_dark_theme(app)
+		if shown:
+			fill, edge = get_accent_color_hex(), 'transparent'
+		else:
+			fill, edge = ('#3A3A3A', '#4A4B4F') if dark else ('#FFFFFF', '#D9D9DE')
+		self.btn_00.setStyleSheet(
+			'QPushButton { border: 1px solid %s; background-color: %s; border-radius: 4px; padding: 1px; }' % (edge, fill))
+
 	def move_window(self, width, height):
 		animation = QPropertyAnimation(self, b"geometry", self)
+		self._geometry_animation = animation
 		animation.setDuration(250)
 		new_pos = QRect(width, height, self.width(), self.height())
 		animation.setEndValue(new_pos)
+		# Stage Manager (measured 2026-11-25 on the real screen): while the window slides out the system
+		# sometimes fits it into the room right of its strip — it ended at x 188, 924 × 1198 instead of
+		# x 3, 1028 × 1218 — and Tomato never heard of it. Once the slide has settled: is it where it was sent?
+		self._slide_serial = getattr(self, '_slide_serial', 0) + 1
+		serial = self._slide_serial
+		animation.finished.connect(lambda: QTimer.singleShot(self.SLIDE_LANDING_CHECK_MS, lambda: self._check_slide_landing(serial, QRect(new_pos))))
 		animation.start()
 		self.i += 1
+		self._style_edge_strip()
+
+	SLIDE_LANDING_CHECK_MS = 450
+	SLIDE_LANDING_TOLERANCE = 8
+
+	def _slide_landing_off(self, got, wanted):
+		"""Away from where it was sent: the left edge elsewhere, or made SMALLER. (Wider / taller than asked is
+		the window's own smallest size on a small screen, not somebody moving it.)"""
+		tolerance = self.SLIDE_LANDING_TOLERANCE
+		return (abs(got.x() - wanted.x()) > tolerance or got.width() < wanted.width() - tolerance
+				or got.height() < wanted.height() - tolerance)
+
+	def _check_slide_landing(self, serial, wanted):
+		"""After a slide: put the window back where it was sent when something else moved or resized it — once
+		per slide, so nothing is fought over. (The height from the top is the system's: a window cannot go
+		under the menu bar, so only left edge, width and height are compared.)"""
+		if serial != getattr(self, '_slide_serial', 0) or not self.isVisible():
+			return 'stale'
+		got = self.geometry()
+		if not self._slide_landing_off(got, wanted):
+			return 'in place'
+		logging.info('Main window was moved after its slide: wanted %dx%d at (%d,%d), found %dx%d at (%d,%d) -> put back once',
+					 wanted.width(), wanted.height(), wanted.x(), wanted.y(), got.width(), got.height(), got.x(), got.y())
+		self.setGeometry(QRect(wanted))
+		self._slide_put_back = getattr(self, '_slide_put_back', 0) + 1
+		QTimer.singleShot(700, lambda: self._log_slide_landing(serial, QRect(wanted)))
+		return 'put back'
+
+	def _log_slide_landing(self, serial, wanted):
+		if serial != getattr(self, '_slide_serial', 0) or not self.isVisible():
+			return
+		got = self.geometry()
+		stayed = not self._slide_landing_off(got, wanted)
+		logging.info('Main window after being put back: %dx%d at (%d,%d) — %s', got.width(), got.height(), got.x(), got.y(),
+					 'stayed' if stayed else 'moved again (left as it is)')
 
 	def move_window2(self, width, height):
 		animation = QPropertyAnimation(self, b"geometry", self)
+		self._geometry_animation = animation
 		animation.setDuration(400)
 		new_pos = QRect(width, height, self.width(), self.height())
 		animation.setEndValue(new_pos)
@@ -2628,6 +3486,108 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 			if vp:
 				vp.installEventFilter(self)
 				self._diary_viewport_owner[vp] = widget
+
+	# ── a Collection row dragged into the diary (2026-11-23) ─────────────────────────────────────────────
+	# Ryan 2026-11-23: "把选中的这个食物直接拖到这个日志里面，然后就直接就记上了"; no meal label, only the time ("你就加
+	# 个时间，自动加个时间就行。然后后面再自己归总"). The line is "- HH:MM:SS [collection] name"; the collection itself
+	# is not changed, and the report looks the row's numbers up by that name.
+	def _collection_drag_filter(self, event):
+		"""Press on a row and move further than the system's drag distance: the row is dragged (as a copy)."""
+		kind = event.type()
+		if kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+			index = self.collection_table.indexAt(event.position().toPoint())
+			self._collection_drag_from = (event.position().toPoint(), index.row()) if index.isValid() else None
+		elif kind == QEvent.Type.MouseButtonRelease:
+			self._collection_drag_from = None
+		elif kind == QEvent.Type.MouseMove and self._collection_drag_from is not None and event.buttons() & Qt.MouseButton.LeftButton:
+			start, row = self._collection_drag_from
+			if (event.position().toPoint() - start).manhattanLength() >= QApplication.startDragDistance() \
+					and self.collection_table.state() != QAbstractItemView.State.EditingState:
+				self._collection_drag_from = None
+				mime = self._collection_row_mime(row)
+				if mime is not None:
+					drag = QDrag(self.collection_table)
+					drag.setMimeData(mime)
+					rect = self.collection_table.visualRect(self.collection_table.model().index(row, 0))
+					rect.setLeft(0)
+					rect.setWidth(min(self.collection_table.viewport().width(), 360))
+					picture = self.collection_table.viewport().grab(rect)
+					if not picture.isNull():
+						faded = QPixmap(picture.size())
+						faded.setDevicePixelRatio(picture.devicePixelRatio())
+						faded.fill(Qt.GlobalColor.transparent)
+						painter = QPainter(faded)
+						painter.setOpacity(0.7)
+						painter.drawPixmap(0, 0, picture)
+						painter.end()
+						drag.setPixmap(faded)
+						drag.setHotSpot(QPoint(min(start.x(), rect.width() - 1), rect.height() // 2))
+					drag.exec(Qt.DropAction.CopyAction)
+					return True
+		return False
+
+	def _collection_row_mime(self, row):
+		if not self.collection_current_file or not (0 <= row < self.collection_table.rowCount()):
+			return None
+		values = [self._collection_item_text(row, column) for column in range(self.collection_table.columnCount())]
+		title = tomato_tools.row_title(self._collection_headers(), values)
+		if not title:
+			return None
+		name = os.path.splitext(os.path.basename(self.collection_current_file))[0]
+		mime = QMimeData()
+		mime.setData(COLLECTION_ROW_MIME, json.dumps({'collection': name, 'name': title}, ensure_ascii=False).encode('utf-8'))
+		mime.setText(title)                    # dropped into another app: the row's name
+		return mime
+
+	def _collection_row_dropped(self, mime, box=None):
+		try:
+			data = json.loads(bytes(mime.data(COLLECTION_ROW_MIME)).decode('utf-8'))
+			text = tomato_diary.collection_line(data['collection'], data['name'])
+		except Exception:
+			logging.exception('The dropped Collection row could not be read.')
+			return None
+		line = self.add_diary_line(text)
+		if box is not None:                    # the box it was dropped on shows it at once, at its end
+			self._refresh_diary_text_widget(box)
+		return line
+
+	def _save_diary_box(self, widget):
+		"""A diary box changed. Loaded by the program (it shows the file) → only remembered as what the box knows.
+		Typed in by the person → saved without losing what was written into the file behind the box
+		(tomato_diary.merge_box): the front-app record, a line from Broccoli, another box. The lines the box did
+		not have yet are added at its end; the caret stays where the person is typing."""
+		box = widget.toPlainText()
+		today = tomato_diary.day_name()
+		if self._suppress_diary_write:
+			self._diary_box_base[widget] = (today, box)
+			return
+		if box == '':
+			return
+		if box == tomato_diary.read(self.fulldir_dia, today):
+			self._diary_box_base[widget] = (today, box)
+			return
+		day, base = self._diary_box_base.get(widget, (today, None))
+		try:
+			text, extra = tomato_diary.save_box(self.fulldir_dia, day, base, box)
+		except Exception:
+			logging.exception('The diary could not be saved.')
+			return
+		if extra:
+			self._suppress_diary_write = True
+			try:
+				own = widget.textCursor()
+				anchor, position = own.anchor(), own.position()
+				cursor = QTextCursor(widget.document())
+				cursor.movePosition(QTextCursor.MoveOperation.End)
+				cursor.insertText(extra)
+				if widget.textCursor().position() != position:     # typing at the very end: stay before the added lines
+					own.setPosition(anchor)
+					own.setPosition(position, QTextCursor.MoveMode.KeepAnchor)
+					widget.setTextCursor(own)
+			finally:
+				self._suppress_diary_write = False
+			text = widget.toPlainText()
+		self._diary_box_base[widget] = (day, text)
 
 	def _load_today_diary_content(self):
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
@@ -2659,11 +3619,16 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 			target = self._diary_viewport_owner.get(obj)
 		if target in self._diary_text_edits and event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.FocusIn):
 			self._refresh_diary_text_widget(target)
-		if obj == getattr(self, 'collection_view_toggle_btn', None):
-			if event.type() == QEvent.Type.Enter:
-				self._collection_toggle_opacity.setOpacity(1.0)
-			elif event.type() == QEvent.Type.Leave:
-				self._collection_toggle_opacity.setOpacity(0.2)
+		if target in self._diary_text_edits and event.type() in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop) \
+				and event.mimeData().hasFormat(COLLECTION_ROW_MIME):
+			# a Collection row dropped on a diary box is a diary line of its own, not text put in at the caret
+			if event.type() == QEvent.Type.Drop:
+				self._collection_row_dropped(event.mimeData(), target)
+			event.setDropAction(Qt.DropAction.CopyAction)
+			event.accept()
+			return True
+		if obj is getattr(self, '_collection_viewport', None) and self._collection_drag_filter(event):
+			return True
 		if obj == getattr(self, 'collection_view_stack', None) and event.type() == QEvent.Type.Resize:
 			self._position_collection_toggle_button()
 		# Handle time_edit hover for clock picker (all time edits)
@@ -2698,7 +3663,46 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 			mapping[self.memo_time_edit] = self.memo_clock_picker_popup
 		if hasattr(self, 'collect_time_edit') and hasattr(self, 'collect_clock_picker_popup'):
 			mapping[self.collect_time_edit] = self.collect_clock_picker_popup
+		mapping.update(getattr(self, '_extra_clock_popups', {}))
 		return mapping
+
+	def _attach_clock(self, time_edit):
+		"""A time box made after the four pages (the end boxes, the quick-edit card's): the same hover clock
+		pop-up as the start boxes have (style book 5.4.1)."""
+		if not hasattr(self, '_extra_clock_popups'):
+			self._extra_clock_popups = {}
+		popup = ClockPickerPopup()
+		popup.set_target_widget(time_edit)
+		popup.time_changed.connect(lambda t, edit=time_edit: edit.setTime(t))
+		time_edit.installEventFilter(self)
+		self._extra_clock_popups[time_edit] = popup
+		return popup
+
+	def _detach_clock(self, time_edit):
+		popup = getattr(self, '_extra_clock_popups', {}).pop(time_edit, None)
+		timers = getattr(self, '_clock_hover_timers', {})
+		timer = timers.pop(time_edit, None)
+		if timer is not None:
+			timer.stop()
+		if popup is not None:
+			popup.hide()
+			popup.deleteLater()
+
+	def _end_time_row(self, prefix, start_date, start_time, length_edit, length_unit):
+		"""The row under a page's start date / time: '→' + end date + end time, kept in step with start +
+		length (style book 5.12 "结束时间", 2026-11-22)."""
+		arrow, end_date, end_time = end_time_boxes(self, start_date, start_time)
+		self._attach_clock(end_time)
+		link = EndTimeLink(start_date, start_time, length_edit, length_unit, end_date, end_time, self._time_unit_hours_index)
+		setattr(self, prefix + '_end_date_edit', end_date)
+		setattr(self, prefix + '_end_time_edit', end_time)
+		setattr(self, prefix + '_end_time_link', link)
+		row = QHBoxLayout()
+		row.setContentsMargins(0, 0, 0, 0)
+		row.addWidget(arrow)
+		row.addWidget(end_date)
+		row.addWidget(end_time)
+		return row
 
 	def _show_clock_picker_for(self, time_edit, popup):
 		"""Show the clock picker popup above the time_edit widget"""
@@ -2708,20 +3712,6 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		top_left = time_edit.mapToGlobal(time_edit.rect().topLeft())
 		global_pos = PyQt6.QtCore.QPoint(top_left.x(), top_left.y() - popup.height())
 		popup.showAt(global_pos)
-
-	def assigntoall(self):
-		cmd = """osascript -e '''on run
-	tell application "System Events" to set activeApp to "Tomato"
-	tell application "System Events" to tell UI element activeApp of list 1 of process "Dock"
-		perform action "AXShowMenu"
-		click menu item "Options" of menu 1
-		click menu item "All Desktops" of menu 1 of menu item "Options" of menu 1
-	end tell
-end run'''"""
-		try:
-			os.system(cmd)
-		except Exception as e:
-			pass
 
 	def newlist(self):
 		CMD = """tell application "System Events"
@@ -2759,11 +3749,8 @@ tell application "System Events"
 	end repeat
 end tell"""
 		self._run_osascript_batch([CMD, CMD2])
-		home_dir = str(Path.home())
-		tarname1 = "TomatoAppPath"
-		fulldir1 = os.path.join(home_dir, tarname1)
-		if not os.path.exists(fulldir1):
-			os.mkdir(fulldir1)
+		fulldir1 = TOMATO_DATA_DIR
+		os.makedirs(fulldir1, exist_ok=True)
 		tarname2 = "newlist.txt"
 		fulldir2 = os.path.join(fulldir1, tarname2)
 		if not os.path.exists(fulldir2):
@@ -2886,8 +3873,6 @@ end tell
 			self._suppress_diary_write = False
 
 	def wordTab(self):
-		conLayout = QVBoxLayout()
-
 		self.tableWidget = QTableWidget()
 		self.tableWidget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 		self.tableWidget.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -2952,21 +3937,21 @@ end tell
 
 		t1 = QWidget()
 		self.le1 = QLineEdit(self)
-		self.le1.setPlaceholderText('Item (with notes in {})')
-		self.le1.setFixedHeight(20)
+		self.le1.setPlaceholderText(_tr('Item (with notes in {})'))
+		self.le1.setFixedHeight(MAIN_ROW_HEIGHT)
 
 		self.date_edit = QDateEdit(self)
 		self.date_edit.setCalendarPopup(True)
 		self.date_edit.setDisplayFormat('yyyy-MM-dd')
 		self.date_edit.setDate(QDate.currentDate())
-		self.date_edit.setFixedHeight(20)
-		self.date_edit.setToolTip('Choose Date')
+		self.date_edit.setFixedHeight(GREY_ROW_HEIGHT)
+		self.date_edit.setToolTip(_tr('Choose Date'))
 
 		self.time_edit = QTimeEdit(self)
 		self.time_edit.setDisplayFormat('HH:mm')
 		self.time_edit.setTime(QTime.currentTime())
-		self.time_edit.setFixedHeight(20)
-		self.time_edit.setToolTip('Hover to open clock picker')
+		self.time_edit.setFixedHeight(GREY_ROW_HEIGHT)
+		self.time_edit.setToolTip(_tr('Hover to open clock picker'))
 		self.time_edit.installEventFilter(self)
 
 		# Clock picker popup (hover triggered)
@@ -2990,31 +3975,31 @@ end tell
 				self._time_unit_hours_index = idx
 
 		self.le3 = QLineEdit(self)
-		self.le3.setPlaceholderText('Length')
-		self.le3.setFixedHeight(20)
+		self.le3.setPlaceholderText(_tr('Length'))
+		self.le3.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.length_unit = QComboBox(self)
+		self.length_unit = compact_dropdown(self)
 		for label, factor in self._time_unit_items:
-			self.length_unit.addItem(label, factor)
+			self.length_unit.addItem(_tr(label), factor)
 		self.length_unit.setCurrentIndex(self._time_unit_hours_index)
 
 		self.le4 = QLineEdit(self)
-		self.le4.setPlaceholderText('Repeat')
-		self.le4.setFixedHeight(20)
-		self.le4.textChanged.connect(self.refresh)
+		self.le4.setPlaceholderText(_tr('Repeat'))
+		self.le4.setFixedHeight(GREY_ROW_HEIGHT)
+		self._refresh_on_program_change(self.le4, self.refresh)
 
-		self.repeat_unit = QComboBox(self)
+		self.repeat_unit = compact_dropdown(self)
 		for label, factor in self._time_unit_items:
-			self.repeat_unit.addItem(label, factor)
+			self.repeat_unit.addItem(_tr(label), factor)
 		self.repeat_unit.setCurrentIndex(self._time_unit_hours_index + 1)
 
-		self.repeat_until_check = QCheckBox('Repeat until', self)
+		self.repeat_until_check = QCheckBox(_tr('Repeat until'), self)
 		self.repeat_until_check.setChecked(False)
 		self.repeat_until_date = QDateEdit(self)
 		self.repeat_until_date.setCalendarPopup(True)
 		self.repeat_until_date.setDisplayFormat('yyyy-MM-dd')
 		self.repeat_until_date.setDate(QDate.currentDate())
-		self.repeat_until_date.setFixedHeight(20)
+		self.repeat_until_date.setFixedHeight(GREY_ROW_HEIGHT)
 		self.repeat_until_date.setEnabled(False)
 		self.repeat_until_check.toggled.connect(lambda _: self._apply_repeat_until_enable(self.repeat_until_check, self.repeat_until_date))
 
@@ -3024,74 +4009,95 @@ end tell
 		
 		b1_row2 = QHBoxLayout()
 		b1_row2.setContentsMargins(0, 0, 0, 0)
+		# two rows, so every box keeps a readable width in a window half the screen wide:
+		# when + how long, then how often + until when
+		self.date_edit.setFixedWidth(118)
+		self.time_edit.setFixedWidth(76)
+		self.repeat_until_date.setFixedWidth(118)
+		self.length_unit.setFixedWidth(132)
+		self.repeat_unit.setFixedWidth(132)
+		# start → end (2026-11-22, style book 5.12 "结束时间"): the end follows start + length, and a new end
+		# gives a new length; so the length and the repeat share the next row, repeat-until the one after
+		self.end_arrow, self.end_date_edit, self.end_time_edit = end_time_boxes(self, self.date_edit, self.time_edit)
+		self._attach_clock(self.end_time_edit)
+		self.end_time_link = EndTimeLink(self.date_edit, self.time_edit, self.le3, self.length_unit,
+										  self.end_date_edit, self.end_time_edit, self._time_unit_hours_index)
 		b1_row2.addWidget(self.date_edit)
 		b1_row2.addWidget(self.time_edit)
-		b1_row2.addWidget(self.le3)
-		b1_row2.addWidget(self.length_unit)
-		b1_row2.addWidget(self.le4)
-		b1_row2.addWidget(self.repeat_unit)
-		b1_row2.addWidget(self.repeat_until_check)
-		b1_row2.addWidget(self.repeat_until_date)
+		b1_row2.addWidget(self.end_arrow)
+		b1_row2.addWidget(self.end_date_edit)
+		b1_row2.addWidget(self.end_time_edit)
+		b1_row2.addStretch(1)
 
-		# b1_row3 = QHBoxLayout()
-		# b1_row3.setContentsMargins(0, 0, 0, 0)
-		# b1_row3.addWidget(self.repeat_until_check)
-		# b1_row3.addWidget(self.repeat_until_date)
+		b1_row3 = QHBoxLayout()
+		b1_row3.setContentsMargins(0, 0, 0, 0)
+		b1_row3.addWidget(self.le3, 1)
+		b1_row3.addWidget(self.length_unit)
+		b1_row3.addWidget(self.le4, 1)
+		b1_row3.addWidget(self.repeat_unit)
+
+		b1_row4 = QHBoxLayout()
+		b1_row4.setContentsMargins(0, 0, 0, 0)
+		b1_row4.addWidget(self.repeat_until_check)
+		b1_row4.addWidget(self.repeat_until_date)
+		b1_row4.addStretch(1)
 
 		b1 = QVBoxLayout()
 		b1.setContentsMargins(0, 0, 0, 0)
 		b1.addLayout(b1_row1)
 		b1.addLayout(b1_row2)
-		# b1.addLayout(b1_row3)
+		b1.addLayout(b1_row3)
+		b1.addLayout(b1_row4)
 		t1.setLayout(b1)
 
+		# the block's main action: a glass white capsule in the row of the item box (style book 5.1 / 5.12)
 		t1_5 = QWidget()
-		btn_t1 = QPushButton('Add!', self)
+		btn_t1 = WhiteButton(_tr('Add!'), self)
 		btn_t1.clicked.connect(self.add_to_list)
 		btn_t1.setShortcut("Ctrl+Return")
-		btn_t1.setFixedHeight(20)
+		btn_t1.setMinimumWidth(96)
 		b1_5 = QHBoxLayout()
 		b1_5.setContentsMargins(0, 0, 0, 0)
 		b1_5.addWidget(btn_t1)
 		t1_5.setLayout(b1_5)
+		t1_5.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
+		b1_row1.addWidget(t1_5)
+		b1.setSpacing(8)
 		t1_6 = QWidget()
 		b1_6 = QVBoxLayout()
 		b1_6.setContentsMargins(0, 0, 0, 0)
 		b1_6.addWidget(t1)
-		b1_6.addWidget(t1_5)
 		t1_6.setLayout(b1_6)
 
 		t2 = QWidget()
-		self.widget0 = QComboBox(self)
+		self.widget0 = compact_dropdown(self)
 		self.widget0.setCurrentIndex(0)
 		self.widget0.currentIndexChanged.connect(self.index_changed)
-		self.widget0.addItems(['All', 'Today', 'To-do', 'Overdue', 'Done'])
+		self.widget0.addItems([_tr('All'), _tr('Today'), _tr('To-do'), _tr('Overdue'), _tr('Done')])
 
-		btn_t2 = QPushButton('Delete selected item', self)
+		btn_t2 = MacNormalButton(_tr('Delete selected item'), self)
 		btn_t2.clicked.connect(self.delete_item)
-		btn_t2.setFixedHeight(20)
+		btn_t2.setFixedHeight(GREY_ROW_HEIGHT)
 		# self.widget0.setFixedWidth(btn_t2.width() * 2)
 
-		btn_t3 = QPushButton('Export plan', self)
+		btn_t3 = MacNormalButton(_tr('Export plan'), self)
 		btn_t3.clicked.connect(self.export_plan)
-		btn_t3.setFixedHeight(20)
+		btn_t3.setFixedHeight(GREY_ROW_HEIGHT)
 
-		btn_t5 = QPushButton('Export diary', self)
+		btn_t5 = MacNormalButton(_tr('Export diary'), self)
 		btn_t5.clicked.connect(self.export_diary)
-		btn_t5.setFixedHeight(20)
+		btn_t5.setFixedHeight(GREY_ROW_HEIGHT)
 
-		btn_t6 = QPushButton('Export records', self)
+		btn_t6 = MacNormalButton(_tr('Export records'), self)
 		btn_t6.clicked.connect(self.export_record)
-		btn_t6.setFixedHeight(20)
+		btn_t6.setFixedHeight(GREY_ROW_HEIGHT)
 
-		btn_t7 = QPushButton('Delete all DONEs', self)
+		btn_t7 = MacNormalButton(_tr('Delete all DONEs'), self)
 		btn_t7.clicked.connect(self.delete_all_dones)
-		btn_t7.setFixedHeight(20)
+		btn_t7.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.frame2 = QFrame(self)
-		self.frame2.setFrameShape(QFrame.Shape.HLine)
-		self.frame2.setFrameShadow(QFrame.Shadow.Sunken)
+		self.frame2 = panel_line(self)
 		b2 = QVBoxLayout()
 		b2.setContentsMargins(0, 0, 0, 0)
 		b2.addWidget(self.widget0)
@@ -3113,14 +4119,14 @@ end tell
 		self.textw1 = QPlainTextEdit(self)
 		self.textw1.setReadOnly(False)
 		self.textw1.setObjectName("edit")
-		self.textw1.setPlaceholderText('Comments')
+		self.textw1.setPlaceholderText(_tr('Comments'))
 
-		btn_t4 = QPushButton('Save + Done', self)
+		btn_t4 = WhiteButton(_tr('Save + Done'), self)
 		btn_t4.clicked.connect(self.save_and_done)
-		btn_t4.setFixedHeight(20)
 		btn_t4.setShortcut("Ctrl+Shift+Return")
 		b3 = QVBoxLayout()
 		b3.setContentsMargins(0, 0, 0, 0)
+		b3.setSpacing(6)
 		b3.addWidget(self.textw1)
 		b3.addWidget(btn_t4)
 		t3.setLayout(b3)
@@ -3197,26 +4203,39 @@ end tell
 		b5.addWidget(t3, 2)
 		b5.addWidget(t4, 2)
 		t5.setLayout(b5)
-		t5.setFixedHeight(int(self.height() / 2))
+		t5.setFixedHeight(EDIT_PANEL_COLUMNS_HEIGHT)
 
-		conLayout.addWidget(self.tableWidget)
-		conLayout.addWidget(t1_6)
-		conLayout.addWidget(t5)
-		self.word_tab.setLayout(conLayout)
+		style_table(self.tableWidget)
+		style_table(self.tableWidget_record, kind='card')
+		self.time_panel = edit_panel(t1_6, t5)
+		self.time_stage = self._page_stage(self.word_tab, self.tableWidget, self.time_panel)
 
 	def to_stamp(self, date):
 		return datetime.datetime.strptime(date, "%Y-%m-%d %H:%M").timestamp()
 
+	def _time_text_ok(self, text):
+		try:
+			self.to_stamp(text)
+			return True
+		except Exception:
+			return False
+
 	def write_table_time(self):
+		# a time cell that was given something that is not a time ("tomorrow 9"): the old time stays. (Before
+		# 2026-11-17 this emptied All.csv down to its header line and stopped the program.)
+		if self.changing_bool == 1 and getattr(self, 'changing_column', None) == 1 and 0 <= self.changing_row < self.tableWidget.rowCount():
+			edited = self.tableWidget.item(self.changing_row, 1)
+			if edited is not None and not self._time_text_ok(edited.text()) and self._time_text_ok(self.changing_date):
+				edited.setText(self.changing_date)
+		self._repeat_time_scope = self._repeat_time_scope_for_edit() if self.changing_bool == 1 else 'one'
 		ori = [['Item', 'Time', 'Length', 'Repeat', 'Status', 'Target times', 'Progress', 'Type', 'Stamp']]
-		with open(self.fulldirall, 'w', encoding='utf8') as csv_file:
-			csv_writer = csv.writer(csv_file)
-			csv_writer.writerows(ori)
 		rownum = int(self.tableWidget.rowCount())
 		col = int(self.tableWidget.columnCount())
 		for n in range(rownum):
 			if self.tableWidget.item(n, 1) != None and self.tableWidget.item(n, 1).text() != '':
 				oricon = self.tableWidget.item(n, 1).text()
+				if not self._time_text_ok(oricon):      # an unreadable time keeps the stamp it has; the file is still written whole
+					continue
 				self.tableWidget.setItem(n, 8, QTableWidgetItem(str(self.to_stamp(oricon))))
 		if self.widget0.currentIndex() == 2:
 			text = 'DONE'  # 筛选 含有 “test” 的所有行
@@ -3225,6 +4244,9 @@ end tell
 				for m in range(len(items)):
 					item = items[m].row()
 					self.tableWidget.setRowHidden(item, True)  # 隐藏对应的行
+		with open(self.fulldirall, 'w', encoding='utf8') as csv_file:
+			csv_writer = csv.writer(csv_file)
+			csv_writer.writerows(ori)
 		t = 0
 		while 0 <= t <= rownum - 1:
 			outrow = []
@@ -3380,10 +4402,10 @@ end tell
 						new_time = self.tableWidget.item(self.changing_row, 1).text()
 						old_stamp_val = self.to_stamp(self.changing_date)
 						new_stamp_val = self.to_stamp(new_time)
-						if abs(float(new_stamp_val) - float(old_stamp_val)) >= 1:
+						if abs(float(new_stamp_val) - float(old_stamp_val)) >= 1 and self._repeat_time_scope == 'later':
 							sync_cmds = self._sync_repeat_task_time_changes(
 								self.changing_text, self.changing_repeat, self.changing_progress,
-								old_stamp_val, new_stamp_val, self.changing_row)
+								old_stamp_val, new_stamp_val, self.changing_row, after_stamp=float(old_stamp_val))
 							for del_rem, del_cal, add_rem, add_cal in sync_cmds:
 								self._run_osascript_batch([del_rem, del_cal, add_rem, add_cal])
 							_repeat_sync_done = True
@@ -3459,7 +4481,7 @@ end tell
 				end tell
 				''' % (otherStyleTime, escaped_old_text, escaped_old_text, otherStyleTime, otherStyleTime, old_length)
 				self._run_osascript_batch([cmd, cmd2])
-				if self.tableWidget.item(self.changing_row, 3).text() != '-':
+				if self.tableWidget.item(self.changing_row, 3).text() != '-' and not self._next_repeat_is_past_until(self.changing_row):
 					outlist = []
 					new_time_sns = []
 					new_things_list = []
@@ -3634,7 +4656,121 @@ end tell
 		"""Called when a cell in tableWidget finishes being edited (keyboard or mouse)"""
 		# Same logic as write_table_time - save changes
 		if self.changing_bool == 1:
+			if self._repeat_time_question_rows():
+				QTimer.singleShot(0, self._finish_table_edit_later)
+				return
 			self.write_table_time()
+
+	def _finish_table_edit_later(self, tries=0):
+		"""The save of an edit that has a question to ask, one turn after its editor closed. While the table is
+		being read in again (its header line is a row for a moment) it waits."""
+		if self.changing_bool != 1:
+			return
+		first = self.tableWidget.item(0, 1) if self.tableWidget.rowCount() else None
+		if first is not None and first.text() == 'Time' and tries < 20:
+			QTimer.singleShot(150, lambda: self._finish_table_edit_later(tries + 1))
+			return
+		self.write_table_time()
+
+	def _repeat_later_rows(self, name, repeat, until, stamp, skip_row=None):
+		"""The rows of the same repeating item (same name, repeat and repeat-until) that are still to do
+		and later than `stamp`."""
+		rows = []
+		if repeat in ('', '-'):
+			return rows
+		for row in range(self.tableWidget.rowCount()):
+			if row == skip_row:
+				continue
+			name_item, repeat_item, status_item = self.tableWidget.item(row, 0), self.tableWidget.item(row, 3), self.tableWidget.item(row, 4)
+			if name_item is None or repeat_item is None or status_item is None or status_item.text() != 'UNDONE':
+				continue
+			until_item = self.tableWidget.item(row, 6)
+			if name_item.text() != name or repeat_item.text() != repeat or (until_item.text() if until_item else '-') != until:
+				continue
+			row_stamp = self._stamp_from_items(self.tableWidget.item(row, 8), self.tableWidget.item(row, 1))
+			if row_stamp and float(row_stamp) > float(stamp):
+				rows.append(row)
+		return rows
+
+	def _ask_repeat_scope(self, title, text, name, count):
+		"""'one' / 'later' / 'cancel' — the system question for a change to one of a repeating item's rows
+		(style book 5.12; Cancel is the default button and Esc)."""
+		if getattr(self, '_tool_repeat_scope', None):      # a tool call said which (no question on the screen)
+			return self._tool_repeat_scope
+		one, later, cancel = _tr('Only this one'), _tr('This and later ones'), _tr('Cancel')
+		chosen = tomato_choice(self, title, text.replace('%1', name).replace('%n', str(count)), [one, later, cancel], cancel)
+		return 'one' if chosen == one else 'later' if chosen == later else 'cancel'
+
+	def _repeat_time_question_rows(self):
+		"""The later rows a time change of the row being edited could take along ([] = nothing to ask)."""
+		if self.changing_bool != 1 or getattr(self, 'changing_column', None) != 1:
+			return []
+		row = self.changing_row
+		if not (0 <= row < self.tableWidget.rowCount()):
+			return []
+		time_item, status_item = self.tableWidget.item(row, 1), self.tableWidget.item(row, 4)
+		if time_item is None or status_item is None or status_item.text() != 'UNDONE':
+			return []
+		try:
+			old, new = float(self.to_stamp(self.changing_date)), float(self.to_stamp(time_item.text()))
+		except Exception:
+			return []
+		if abs(new - old) < 1:
+			return []
+		return self._repeat_later_rows(self.changing_text, getattr(self, 'changing_repeat', '-'), getattr(self, 'changing_progress', '-'), old, row)
+
+	def _repeat_time_scope_for_edit(self):
+		"""Asked once, before the edit is written: does a new time move only this row, or the later ones of the
+		same repeating item too? Cancel puts the old time back."""
+		later = self._repeat_time_question_rows()
+		if not later:
+			return 'one'
+		scope = self._ask_repeat_scope(
+			_tr('Change the time'),
+			_tr('"%1" repeats, and %n later ones are still to do. Move the later ones by the same amount too?'),
+			self.changing_text, len(later))
+		if scope == 'cancel':
+			item = self.tableWidget.item(self.changing_row, 1)
+			if item is not None:
+				item.setText(self.changing_date)
+			return 'one'
+		return scope
+
+	def _next_repeat_is_past_until(self, row):
+		"""True when the occurrence after this row would fall after the row's repeat-until."""
+		until = self._read_repeat_until_from_row(row)
+		if until is None:
+			return False
+		try:
+			return self.to_stamp(self.tableWidget.item(row, 1).text()) + 3600 * float(self.tableWidget.item(row, 3).text()) > until
+		except Exception:
+			return False
+
+	def _delete_repeat_from(self, row, later_rows):
+		"""Deletes this row and the later rows of its repeating item, and ends the repetition there: what is
+		left of it gets a repeat-until just before this row, so ticking an earlier one makes no new ones."""
+		name = self.tableWidget.item(row, 0).text()
+		repeat = self.tableWidget.item(row, 3).text()
+		until_item = self.tableWidget.item(row, 6)
+		until = until_item.text() if until_item else '-'
+		stamp = self._stamp_from_items(self.tableWidget.item(row, 8), self.tableWidget.item(row, 1))
+		commands = []
+		for gone in sorted([row] + list(later_rows), reverse=True):
+			key = (self.tableWidget.item(gone, 0).text(), self._stamp_from_items(self.tableWidget.item(gone, 8), self.tableWidget.item(gone, 1)))
+			if key[1]:
+				commands += [self._sync_delete_reminder_script(key), self._sync_delete_event_script(key)]
+			self.tableWidget.removeRow(gone)
+		if stamp:
+			for left in range(self.tableWidget.rowCount()):
+				name_item, repeat_item, status_item = self.tableWidget.item(left, 0), self.tableWidget.item(left, 3), self.tableWidget.item(left, 4)
+				left_until = self.tableWidget.item(left, 6)
+				if (name_item is not None and repeat_item is not None and status_item is not None and status_item.text() == 'UNDONE'
+						and name_item.text() == name and repeat_item.text() == repeat and (left_until.text() if left_until else '-') == until):
+					self._set_time_cell(left, 6, str(int(float(stamp)) - 1))
+		self._refresh_stamp_column()
+		self._write_time_csv_from_table()
+		self._mark_local_reminder_change()
+		self._run_osascript_batch(commands)
 
 	def _get_selected_rows(self, table_widget):
 		selection = table_widget.selectionModel()
@@ -3643,7 +4779,7 @@ end tell
 		return sorted({index.row() for index in selection.selectedRows() if index.row() >= 0})
 
 	def _warn_selection_required(self, message):
-		QMessageBox.warning(self, 'Error', message)
+		tomato_alert(self, _tr('Error'), message)
 	
 	def _clear_table_selection(self, table_widget):
 		if table_widget is None:
@@ -3657,38 +4793,47 @@ end tell
 		self._active_workers = []  # Track active AppleScript workers
 		self._applescript_signals = AppleScriptWorkerSignals()
 		self._applescript_signals.finished.connect(self._on_applescript_finished)
-		self.sync_dialog = QDialog(self)
-		self.sync_dialog.setWindowTitle('Syncing...')
+		self.sync_dialog = SyncIndicatorDialog(self)
+		self.sync_dialog.setWindowTitle(_tr('Syncing...'))
 		self.sync_dialog.setModal(False)
-		self.sync_dialog.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
-		self.sync_dialog.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 		layout = QVBoxLayout()
 		layout.setContentsMargins(20, 15, 20, 15)
-		label = QLabel('Synchronizing with Reminders / Calendar…\nPlease wait for a second.', self.sync_dialog)
+		label = QLabel(_tr('Synchronizing with Reminders / Calendar…\nPlease wait for a second.'), self.sync_dialog)
 		label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 		layout.addWidget(label)
 		self.sync_dialog.setLayout(layout)
 		self.sync_dialog.adjustSize()
 		self.sync_dialog.hide()
+		# changes sent through the system interface are over in hundredths of a second: the notice comes up
+		# only when the sending is still going on after a moment (it used to flash up for every change)
+		self._sync_dialog_timer = QTimer(self)
+		self._sync_dialog_timer.setSingleShot(True)
+		self._sync_dialog_timer.setInterval(400)
+		self._sync_dialog_timer.timeout.connect(self._show_sync_dialog_now)
 
 	def _show_sync_indicator(self):
 		self._sync_counter += 1
 		if self._sync_counter == 1:
 			# Lock all tables to prevent editing during sync
 			self._lock_all_tables()
-			parent_geom = self.frameGeometry()
-			dialog_size = self.sync_dialog.size()
-			target_x = parent_geom.center().x() - dialog_size.width() // 2
-			target_y = parent_geom.center().y() - dialog_size.height() // 2
-			self.sync_dialog.move(int(target_x), int(target_y))
-			self.sync_dialog.show()
-			QApplication.processEvents()
+			self._sync_dialog_timer.start()
+
+	def _show_sync_dialog_now(self):
+		if self._sync_counter <= 0:
+			return
+		parent_geom = self.frameGeometry()
+		dialog_size = self.sync_dialog.size()
+		target_x = parent_geom.center().x() - dialog_size.width() // 2
+		target_y = parent_geom.center().y() - dialog_size.height() // 2
+		self.sync_dialog.move(int(target_x), int(target_y))
+		self.sync_dialog.show()
 
 	def _hide_sync_indicator(self):
 		if self._sync_counter > 0:
 			self._sync_counter -= 1
 		if self._sync_counter <= 0:
 			self._sync_counter = 0
+			self._sync_dialog_timer.stop()
 			self.sync_dialog.hide()
 			# Unlock all tables when sync is complete
 			self._unlock_all_tables()
@@ -3988,9 +5133,10 @@ end tell""" % (escaped_new, otherStyleTime, otherStyleTime, old_length)
 				repeat_item.setText(new_repeat)
 		return commands
 
-	def _sync_repeat_task_time_changes(self, task_name, repeat_interval, repeat_until_stamp, old_stamp, new_stamp, current_row):
+	def _sync_repeat_task_time_changes(self, task_name, repeat_interval, repeat_until_stamp, old_stamp, new_stamp, current_row, after_stamp=None):
 		"""
-		When time changes on a repeat task, shift all future UNDONE related tasks by the same delta.
+		When time changes on a repeat task, shift the UNDONE related tasks by the same delta
+		(after_stamp: only the ones later than that time).
 		Returns list of (del_reminder, del_calendar, add_reminder, add_calendar) tuples.
 		"""
 		delta = float(new_stamp) - float(old_stamp)
@@ -4015,6 +5161,8 @@ end tell""" % (escaped_new, otherStyleTime, otherStyleTime, old_length)
 			row_status = status_item.text()
 			row_stamp = float(stamp_item.text()) if stamp_item.text() else 0
 			row_length = length_item.text() if length_item else '1'
+			if after_stamp is not None and row_stamp <= after_stamp:
+				continue
 			if (row_name == task_name and row_repeat == repeat_interval and
 				row_progress == repeat_until_stamp and row_status == 'UNDONE'):
 				old_time_array = time.localtime(row_stamp)
@@ -4251,29 +5399,532 @@ end tell""" % (other_style, escaped_name)
 		except ValueError:
 			return None
 
-	def _start_reminder_sync_worker(self):
-		if self.reminder_sync_thread and self.reminder_sync_thread.is_alive():
+	def _broccoli_entries(self):
+		return [(key[0], key[1], info.get('status')) for key, info in self._collect_time_entries().items()]
+
+	def _broccoli_complete_row(self, name, stamp):
+		"""The row of a question that was just sent to Broccoli is ticked off the way Save does it (a repeating
+		item gets its next occurrence from that). False = not now, the scheduler asks again in a few seconds."""
+		if getattr(self, '_sync_counter', 0) > 0 or getattr(self, '_repeat_sync_in_progress', False):
+			return False
+		focused = QApplication.focusWidget()
+		if focused is not None and focused is not self.tableWidget and self.tableWidget.isAncestorOf(focused):
+			return False   # a cell is being edited
+		row = self._find_time_row_by_key(name, stamp)
+		if row is None:
+			return True   # deleted meanwhile
+		reminder_cmds, calendar_cmds, done = self._complete_time_row(row, _tr('Sent to Broccoli'))
+		if done:
+			self._refresh_stamp_column()
+			self._write_time_csv_from_table()
+			with contextlib.suppress(Exception):
+				self.tableWidget.sortByColumn(8, Qt.SortOrder.AscendingOrder)
+		self._run_osascript_batch(reminder_cmds + calendar_cmds)
+		self.tableWidget.clearSelection()
+		self.tableWidget.setCurrentItem(None)
+		return True
+
+	def _broccoli_busy(self):
+		if getattr(self, '_sync_counter', 0) > 0 or getattr(self, '_repeat_sync_in_progress', False):
+			return True
+		focused = QApplication.focusWidget()
+		return focused is not None and focused is not self.tableWidget and self.tableWidget.isAncestorOf(focused)
+
+	def _broccoli_item_name(self, task):
+		return tomato_broccoli.MARKER + ' ' + task
+
+	def _broccoli_task_rows(self, task, undone_only=True):
+		"""Table rows of the timed items that name this task."""
+		wanted = self._broccoli_item_name(task).casefold()
+		rows = []
+		for row in range(self.tableWidget.rowCount()):
+			type_item, name_item, status_item = self.tableWidget.item(row, 7), self.tableWidget.item(row, 0), self.tableWidget.item(row, 4)
+			if type_item is None or type_item.text() != 'TIME_SNS' or name_item is None:
+				continue
+			if ' '.join(name_item.text().split()).casefold() != wanted:
+				continue
+			if undone_only and (status_item is None or status_item.text() != 'UNDONE'):
+				continue
+			rows.append(row)
+		return rows
+
+	def _broccoli_after_table_change(self, commands):
+		self._refresh_stamp_column()
+		self._write_time_csv_from_table()
+		with contextlib.suppress(Exception):
+			self.tableWidget.sortByColumn(8, Qt.SortOrder.AscendingOrder)
+		self._mark_local_reminder_change()
+		self._run_osascript_batch(commands)
+
+	def _broccoli_add_rows(self, task, schedule):
+		"""A task folder asked for its rows (tomato_broccoli.TaskSync): the first one and, for a repeating task, the
+		next ones as Add makes them. False = the table is busy, asked again in a few seconds."""
+		if self._broccoli_busy():
+			return False
+		name = self._broccoli_item_name(task)
+		start = int(schedule['start'])
+		length = self._format_hours(float(schedule.get('length_hours') or 1.0))
+		repeat_hours = schedule.get('repeat_hours')
+		repeat = self._format_hours(float(repeat_hours)) if repeat_hours else '-'
+		until = schedule.get('repeat_until')
+		until_text = str(int(until)) if until else '-'
+		commands = []
+		first = [name, time.strftime("%Y-%m-%d %H:%M", time.localtime(start)), length, repeat, 'UNDONE', '-', until_text, 'TIME_SNS', str(start)]
+		if self._find_time_row_by_key(name, start) is None:
+			self._append_time_row_to_table(first)
+			commands += [self._sync_make_reminder_script((name, start)), self._sync_make_event_script((name, start))]
+		if repeat_hours:
+			base_values = [name, '', length, repeat, 'UNDONE', '-', until_text, 'TIME_SNS', '']
+			for row_values, reminder_cmd, calendar_cmd in self._generate_repeat_occurrences(
+					base_values, self._get_repeat_pregenerate_count() - 1, float(start), float(repeat_hours), float(until) if until else None):
+				self._append_time_row_to_table(row_values)
+				commands += [reminder_cmd, calendar_cmd]
+		self._broccoli_after_table_change(commands)
+		return True
+
+	def _broccoli_remove_rows(self, task):
+		"""The undone rows of a task leave the table (its folder is gone, or its schedule was rewritten)."""
+		if self._broccoli_busy():
+			return False
+		commands = []
+		for row in reversed(self._broccoli_task_rows(task)):
+			key = (self.tableWidget.item(row, 0).text(), self._stamp_from_items(self.tableWidget.item(row, 8), self.tableWidget.item(row, 1)))
+			if key[1]:
+				commands += [self._sync_delete_reminder_script(key), self._sync_delete_event_script(key)]
+			self.tableWidget.removeRow(row)
+		if commands:
+			self._broccoli_after_table_change(commands)
+		return True
+
+	def _broccoli_tasks_changed(self):
+		self.broccoli_scheduler.tasks_changed()
+		if self._broccoli_manager is not None and self._broccoli_manager.isVisible():
+			self._broccoli_manager.refresh()
+
+	def _broccoli_begin_task(self, item_name, stamp_text, length_hours, repeat_hours, until_text):
+		"""Add was clicked on "@Broccoli <a new task's name>" (chosen as "New task" in the @ list): the time is kept as
+		a draft in the task's folder and the instructions are asked for. The rows come when the instructions are saved.
+		True = handled here, Add does nothing more."""
+		target = tomato_broccoli.prompt_of(item_name)
+		if target is None or not self.broccoli_suggest.is_new_task() or self.broccoli_store.find(target) is not None:
+			return False
+		name = tomato_broccoli.valid_task_name(target)
+		if name is None:
+			tomato_alert(self, _tr('New task'), _tr('Use a name that is not taken, without / \\ : and at most 80 characters.'))
+			return True
+		def number(value):
+			try:
+				return float(value)
+			except (TypeError, ValueError):
+				return None
+		try:
+			self.broccoli_store.write_schedule(name, int(float(stamp_text)), number(length_hours) or 1.0, number(repeat_hours), number(until_text))
+			self.broccoli_store.write_manifest()
+		except Exception:
+			logging.exception("Could not write the task's folder")
+			tomato_alert(self, _tr('New task'), _tr('The task folder could not be written.'))
+			return True
+		self.le1.clear()
+		self.le3.clear()
+		self.le4.clear()
+		self.repeat_until_check.setChecked(False)
+		self.broccoli_tasks.look()
+		if tomato_broccoli.broccoli_installed():
+			# the instructions are worked out with Broccoli (its "tomato-schedule" skill); the rows come when it saves task.md
+			tomato_broccoli.install_skill()
+			self.broccoli_discussion.start(name, self.broccoli_store.read_schedule(name))
+		else:
+			# no Broccoli: first its download is offered (Ryan 2026-11-21: "先推荐下载"), then the instructions are
+			# written by hand as before (the task runs once Broccoli is there)
+			download, by_hand = _tr('Download Broccoli…'), _tr('Write by Hand')
+			if tomato_choice(self, _tr('Broccoli is not on this Mac'),
+							 _tr('Tasks are carried out by Broccoli, an AI assistant app for Mac. Download it and open it once; '
+								 'until then, write what this task should do by hand.'),
+							 [by_hand, download], download) == download:
+				threading.Thread(target=tomato_broccoli.open_download_page, daemon=True).start()
+			self.edit_broccoli_task(name)
+		return True
+
+	def _broccoli_discussion_finished(self, name, ok, reason):
+		if ok:
+			tomato_broccoli.activate_broccoli()
+			self._broccoli_notice('discuss_started', name)
+		else:
+			logging.warning('Broccoli: the draft "%s" could not be handed over: %s', name, reason)
+			self._broccoli_notice('discuss_failed', name)
+			self.edit_broccoli_task(name)
+
+	def edit_broccoli_task(self, name):
+		"""The window in which the instructions of one task are written by hand."""
+		text, _error = self.broccoli_store.read_spec(name)
+		dialog = tomato_broccoli_ui.TaskEditorDialog(name, text or '', None)
+		dialog.saved.connect(self._broccoli_save_instructions)
+		dialog.finished.connect(lambda _result, d=dialog: self._broccoli_editors.remove(d) if d in self._broccoli_editors else None)
+		self._broccoli_editors.append(dialog)
+		dialog.show()
+		return dialog
+
+	def _broccoli_save_instructions(self, name, text):
+		try:
+			self.broccoli_store.write_spec(name, text)
+		except Exception:
+			logging.exception("Could not write the task's instructions")
+			tomato_alert(self, _tr('Instructions for Broccoli'), _tr('This file cannot be saved.'))
+			return
+		self.broccoli_tasks.look()
+
+	def open_broccoli_tasks(self):
+		if self._broccoli_manager is None:
+			self._broccoli_manager = tomato_broccoli_ui.TaskManagerDialog(self.broccoli_store, self, None)
+		self._broccoli_manager.refresh()
+		self._broccoli_manager.show()
+		self._broccoli_manager.raise_()
+		return self._broccoli_manager
+
+	# what the manager window asks of the table
+	def task_info(self, task):
+		stamps = []
+		for row in self._broccoli_task_rows(task):
+			stamp = self._stamp_from_items(self.tableWidget.item(row, 8), self.tableWidget.item(row, 1))
+			if stamp:
+				stamps.append(int(stamp))
+		return (min(stamps) if stamps else None), len(stamps)
+
+	def format_time(self, stamp):
+		return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(stamp)))
+
+	def rename_task(self, old, new):
+		if self._broccoli_busy() or not self.broccoli_store.rename(old, new):
+			return False
+		commands = []
+		new_name = self._broccoli_item_name(new)
+		for row in self._broccoli_task_rows(old):
+			stamp = self._stamp_from_items(self.tableWidget.item(row, 8), self.tableWidget.item(row, 1))
+			old_key = (self.tableWidget.item(row, 0).text(), stamp)
+			self._set_time_cell(row, 0, new_name)
+			if stamp:
+				commands += [self._sync_delete_reminder_script(old_key), self._sync_delete_event_script(old_key),
+							 self._sync_make_reminder_script((new_name, stamp)), self._sync_make_event_script((new_name, stamp))]
+		self.broccoli_tasks.forget(old, renamed_to=new)
+		if commands:
+			self._broccoli_after_table_change(commands)
+		self.broccoli_tasks.look()
+		return True
+
+	def delete_task(self, task):
+		if self._broccoli_remove_rows(task) is False:
+			return False
+		self.broccoli_tasks.forget(task)
+		deleted = self.broccoli_store.delete(task)
+		self.broccoli_tasks.look()
+		return deleted
+
+	def _broccoli_notice(self, kind, name):
+		if kind == 'discuss_started':
+			message = _tr('Broccoli has opened a conversation for this task. Tell it what the task should do; the task appears here once Broccoli saves it:')
+		elif kind == 'discuss_failed':
+			message = _tr('Broccoli could not be reached, so write the instructions here:')
+		elif kind.startswith('task_file'):
+			message = {
+				'task_file_too_big': _tr('The instructions of this task are too large to send, so it was not sent to Broccoli:'),
+				'task_file_empty': _tr('This task has no instructions yet, so it was not sent to Broccoli:'),
+				'task_file_missing': _tr('This task has no instructions yet, so it was not sent to Broccoli:'),
+			}.get(kind, _tr('The instructions of this task cannot be read, so it was not sent to Broccoli:'))
+		elif kind == 'missed':
+			message = _tr('Its time passed more than a day ago, so it was not sent to Broccoli:')
+		elif kind == 'not_installed':
+			message = _tr('Broccoli was not found on this Mac. Tomato will try again in 5 minutes:')
+		else:
+			message = _tr('Broccoli did not answer. Tomato will try again in 5 minutes:')
+		if kind == 'not_installed':     # first its download is offered (Ryan 2026-11-21: "先推荐下载")
+			notification = AutoCloseNotification(_tr('Send to Broccoli'), message + "\n\n" + name, auto_close_seconds=20,
+												 action=(_tr('Download Broccoli…'), lambda: threading.Thread(
+													 target=tomato_broccoli.open_download_page, daemon=True).start()))
+		else:
+			notification = AutoCloseNotification(_tr('Send to Broccoli'), message + "\n\n" + name, auto_close_seconds=8)
+		self._broccoli_notification = notification   # keep it alive while it is on screen
+		notification.show()
+
+	def _start_system_sync_worker(self):
+		if self.system_sync_thread and self.system_sync_thread.is_alive():
 			return
 		try:
-			self.reminder_sync_thread = ReminderSyncThread(self.reminder_sync_queue)
-			self.reminder_sync_thread.start()
+			if not hasattr(self, '_system_sync_signals'):
+				self._system_sync_signals = SystemSyncSignals()
+				self._system_sync_signals.ready.connect(self._process_sync_messages)
+			self.system_sync_thread = SystemSyncThread(self.system_sync_queue, on_reading=self._system_sync_signals.ready.emit)
+			self.system_sync_thread.start()
+			# the system tells when reminders / events changed: read a moment later instead of waiting for the next timed pass
+			tomato_eventkit.STORE.watch(self._system_store_changed)
 		except Exception:
-			logging.exception("Failed to start reminder sync thread.")
-			self.reminder_sync_thread = None
+			logging.exception("Failed to start the Reminders / Calendar sync thread.")
+			self.system_sync_thread = None
 			if self.reminder_sync_timer.isActive():
 				self.reminder_sync_timer.stop()
 
-	def _start_calendar_sync_worker(self):
-		if self.calendar_sync_thread and self.calendar_sync_thread.is_alive():
+	def _system_store_changed(self):
+		thread = self.system_sync_thread
+		if thread is not None:
+			thread.note_change()
+
+	def _time_cell_being_edited(self):
+		"""A cell of the main table is open for typing: the table must not be moved or sorted under it. The
+		quick-edit card counts too (its Save looks the row up again)."""
+		if self._quick_edit_open():
+			return True
+		focused = QApplication.focusWidget()
+		if focused is not None and focused is not self.tableWidget and self.tableWidget.isAncestorOf(focused):
+			return True
+		delegate = getattr(self, '_table_delegate', None)
+		if delegate is not None and getattr(delegate, '_current_edit_index', None) is not None:
+			viewport = self.tableWidget.viewport()
+			return any(child.isVisible() for child in viewport.findChildren(QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly))
+		return False
+
+	def _process_sync_messages(self):
+		if self._sync_processing:
+			return
+		self._sync_processing = True
+		try:
+			self._drain_system_sync_queue()
+		except Exception as e:
+			# Catch all exceptions to prevent PyQt6 abort() crash
+			# Skip this round and try again next time
+			logging.exception("Error in _process_sync_messages, skipping this round: %s", e)
+		finally:
+			self._sync_processing = False
+
+	def _drain_system_sync_queue(self):
+		if getattr(self, '_sync_counter', 0) > 0:
+			return   # Tomato's own commands are still running: what was read is looked at afterwards
+		if getattr(self, '_repeat_sync_in_progress', False):
+			return
+		if self._time_cell_being_edited():
+			return   # looked at again in a few seconds; what the edit then sends out makes this reading an old one
+		message = None
+		while True:
+			try:
+				latest = self.system_sync_queue.get_nowait()
+			except queue.Empty:
+				break
+			if isinstance(latest, dict):
+				message = latest   # only the newest reading counts
+		if message is None:
+			return
+		if float(message.get('timestamp') or 0.0) < getattr(self, '_last_local_reminder_change', 0.0):
+			# read before Tomato's own last change went out: it would look like "changed over there".
+			# Read again now (it used to wait for the next two-minute poll).
+			if self.system_sync_thread:
+				self.system_sync_thread.request()
+			return
+		self._handle_system_snapshot(message)
+
+	def _sync_base_path(self):
+		return os.path.join(os.path.dirname(self.fulldirall), 'sync_base.json')
+
+	def _handle_system_snapshot(self, message):
+		"""One joint decision for the table, the Reminders list and the Calendar (tomato_sync.reconcile)."""
+		if not hasattr(self, 'tableWidget') or self.tableWidget is None:
+			logging.warning("_handle_system_snapshot: tableWidget not available, skipping")
+			self._show_safety_notification("_handle_system_snapshot")
 			return
 		try:
-			self.calendar_sync_thread = CalendarSyncThread(self.calendar_sync_queue)
-			self.calendar_sync_thread.start()
-		except Exception:
-			logging.exception("Failed to start calendar sync thread.")
-			self.calendar_sync_thread = None
-			if self.reminder_sync_timer.isActive():
-				self.reminder_sync_timer.stop()
+			reminders = tomato_sync.snapshot_map(message.get('reminders'))
+			calendar = tomato_sync.snapshot_map(message.get('calendar'))
+			if reminders is None:
+				return
+			local = {(key[0].strip(), key[1]): info.get('status') for key, info in self._collect_time_entries().items()}
+			base_path = self._sync_base_path()
+			stamp = int(float(message.get('timestamp') or time.time()))
+			# what the Reminders read covers (30 days back, a year ahead), a day in from both ends
+			window = (stamp - 29 * 86400, stamp + 364 * 86400)
+			actions, new_base = tomato_sync.reconcile(local, reminders, calendar, tomato_sync.load_base(base_path), window, message.get('event_window'))
+			if actions is None:
+				logging.warning("System sync: this pass would delete most of the table (%d rows, %d reminders, %s events); nothing was changed.",
+								len(local), len(reminders), 'no' if calendar is None else len(calendar))
+				return
+			commands = []
+			table_changed = False
+			for action in actions:
+				commands.extend(self._apply_sync_action(action))
+				if action[0] in ('move_row', 'add_row', 'delete_row', 'complete_row', 'reopen_row'):
+					table_changed = True
+			tomato_sync.save_base(base_path, new_base)
+			if actions:
+				logging.info("System sync: %s", ', '.join('%s %s' % (a[0], a[1][0]) for a in actions[:12]))
+			if table_changed:
+				self._refresh_stamp_column()
+				self._write_time_csv_from_table()
+				with contextlib.suppress(Exception):
+					self.tableWidget.sortByColumn(8, Qt.SortOrder.AscendingOrder)
+			if commands:
+				self._run_osascript_batch(commands)
+		except Exception as e:
+			logging.exception("Error in _handle_system_snapshot: %s", e)
+
+	def _set_time_cell(self, row, column, text):
+		item = QTableWidgetItem(str(text))
+		item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+		self.tableWidget.setItem(row, column, item)
+
+	def _sync_script_time(self, stamp):
+		return time.strftime("%m/%d/%Y %H:%M", time.localtime(int(stamp)))
+
+	def _sync_row_hours(self, key):
+		row = self._find_time_row_by_key(*key)
+		item = self.tableWidget.item(row, 2) if row is not None else None
+		try:
+			hours = float(item.text()) if item is not None else 1.0
+		except ValueError:
+			hours = 1.0
+		return self._format_hours(hours) if hours > 0 else '1'
+
+	def _sync_make_reminder_script(self, key):
+		return """tell application "Reminders"
+	set eachLine to "%s"
+	set mylist to list "Tomato"
+	tell mylist
+		make new reminder at end with properties {name:eachLine, remind me date:date "%s"}
+	end tell
+end tell""" % (self._escape_applescript_string(key[0]), self._sync_script_time(key[1]))
+
+	def _sync_delete_reminder_script(self, key):
+		return """tell application "Reminders"
+	set mylist to list "Tomato"
+	tell mylist
+		delete (reminders whose (name is "%s") and (remind me date is date "%s"))
+	end tell
+end tell""" % (self._escape_applescript_string(key[0]), self._sync_script_time(key[1]))
+
+	def _sync_make_event_script(self, key):
+		when = self._sync_script_time(key[1])
+		return """tell application "Calendar"
+	tell calendar "Tomato"
+		make new event at end with properties {summary:"%s", start date:date "%s", end date:date "%s" + (%s * hours)}
+	end tell
+end tell""" % (self._escape_applescript_string(key[0]), when, when, self._sync_row_hours(key))
+
+	def _sync_delete_event_script(self, key):
+		return """tell application "Calendar"
+	tell calendar "Tomato"
+		delete (events whose (start date is date "%s") and (summary is "%s"))
+	end tell
+end tell""" % (self._sync_script_time(key[1]), self._escape_applescript_string(key[0]))
+
+	def _apply_sync_action(self, action):
+		"""Carry out one action of tomato_sync.reconcile on the table; returns the AppleScript commands
+		for Reminders / Calendar it needs."""
+		kind = action[0]
+		if kind == 'move_row':
+			_, old, new, duration = action
+			row = self._find_time_row_by_key(*old)
+			if row is None:
+				return []
+			self._set_time_cell(row, 0, new[0])
+			self._set_time_cell(row, 1, datetime.datetime.fromtimestamp(int(new[1])).strftime("%Y-%m-%d %H:%M"))
+			self._set_time_cell(row, 8, new[1])
+			if duration:
+				self._set_time_cell(row, 2, self._format_hours(round(duration / 3600, 6)))
+			return []
+		if kind == 'add_row':
+			_, key, duration = action
+			length = self._format_hours(round(duration / 3600, 6)) if duration else '1'
+			when = datetime.datetime.fromtimestamp(int(key[1])).strftime("%Y-%m-%d %H:%M")
+			self._append_time_row_to_table([key[0], when, length, '-', 'UNDONE', '-', '-', 'TIME_SNS', key[1]])
+			return []
+		if kind == 'delete_row':
+			row = self._find_time_row_by_key(*action[1])
+			if row is not None:
+				self.tableWidget.removeRow(row)
+			return []
+		if kind == 'complete_row':
+			row = self._find_time_row_by_key(*action[1])
+			if row is None:
+				return []
+			reminder_cmds, calendar_cmds, _done = self._complete_time_row(row, '')
+			return reminder_cmds + calendar_cmds
+		if kind == 'reopen_row':
+			return self._reopen_time_row(action[1], action[2])
+		if kind == 'make_reminder':
+			return [self._sync_make_reminder_script(action[1])]
+		if kind == 'delete_reminder':
+			return [self._sync_delete_reminder_script(action[1])]
+		if kind == 'move_reminder':
+			_, old, new = action
+			if old[0] == new[0]:
+				return self._build_reminder_update_command(new[0], old[1], new[1])
+			return [self._sync_delete_reminder_script(old), self._sync_make_reminder_script(new)]
+		if kind == 'make_event':
+			return [self._sync_make_event_script(action[1])]
+		if kind == 'delete_event':
+			return [self._sync_delete_event_script(action[1])]
+		if kind == 'move_event':
+			_, old, new = action
+			return [self._sync_delete_event_script(old), self._sync_make_event_script(new)]
+		return []
+
+	def _reopen_time_row(self, key, make_event):
+		"""The tick of a completed item was taken off again in Reminders: the row is UNDONE again, its event
+		comes back from "Tomato-old", the diary says so, and the line its completion left in the item's
+		record goes. (Occurrences of a repeating item made when it was completed stay.)"""
+		row = self._find_time_row_by_key(*key)
+		status_item = self.tableWidget.item(row, 4) if row is not None else None
+		if status_item is None or status_item.text() != 'DONE':
+			return []
+		self._set_time_cell(row, 4, 'UNDONE')
+		view = self.widget0.currentIndex()
+		if view == 2:
+			self.tableWidget.setRowHidden(row, False)
+		elif view == 4:
+			self.tableWidget.setRowHidden(row, True)
+		elif view == 3:
+			with contextlib.suppress(ValueError, TypeError):
+				self.tableWidget.setRowHidden(row, int(key[1]) >= time.time())
+		when = self._sync_script_time(key[1])
+		commands = ["""tell application "Calendar"
+	tell calendar "Tomato-old"
+		delete (events whose (start date is date "%s") and (summary is "%s"))
+	end tell
+end tell""" % (when, self._escape_applescript_string(key[0]))]
+		if make_event:
+			commands.append(self._sync_make_event_script(key))
+		time_item = self.tableWidget.item(row, 1)
+		date_text = time_item.text() if time_item else ''
+		with contextlib.suppress(Exception):
+			self._append_diary_line('Reopened ' + key[0] + ' scheduled for ' + date_text)
+		repeat_item = self.tableWidget.item(row, 3)
+		if repeat_item and repeat_item.text() not in ('', '-'):
+			with contextlib.suppress(Exception):
+				self._drop_last_record_line(self._record_file_path(key[0]), date_text)
+		return commands
+
+	def _append_diary_line(self, text):
+		diary_file = os.path.join(self.fulldir_dia, datetime.datetime.now().strftime('%Y-%m-%d diary') + '.md')
+		if not os.path.exists(diary_file):
+			os.makedirs(self.fulldir_dia, exist_ok=True)
+			with open(diary_file, 'a', encoding='utf-8') as f0:
+				f0.write('# ' + datetime.datetime.now().strftime('%Y-%m-%d diary'))
+		with open(diary_file, 'a', encoding='utf-8') as f0:
+			f0.write('\n\n- ' + datetime.datetime.now().strftime('%H:%M:%S ') + text)
+		contm = codecs.open(diary_file, 'r', encoding='utf-8').read()
+		self.textii1.setText(contm)
+		cursor = self.textii1.textCursor()
+		cursor.setPosition(len(self.textii1.toPlainText()))
+		self.textii1.setTextCursor(cursor)
+
+	def _drop_last_record_line(self, record_file, date_text):
+		"""Takes the newest line with this date out of an item's record file."""
+		if not date_text or not os.path.exists(record_file):
+			return False
+		with open(record_file, 'r', encoding='utf8', newline='') as csv_file:
+			lines = list(csv.reader(csv_file))
+		for index in range(len(lines) - 1, -1, -1):
+			if lines[index] and lines[index][0] == date_text:
+				del lines[index]
+				with open(record_file, 'w', encoding='utf8', newline='') as csv_file:
+					csv.writer(csv_file).writerows(lines)
+				return True
+		return False
 
 	def _show_safety_notification(self, function_name):
 		"""Show auto-closing notification when safety check fails"""
@@ -4292,248 +5943,17 @@ end tell""" % (other_style, escaped_name)
 
 			# Show the notification
 			notification = AutoCloseNotification(
-				"Safety Check Warning",
-				f"Unable to access table widget in {function_name}.\n\n"
-				f"The operation will be skipped this round and retried in the next sync cycle.\n\n"
-				f"This is a protective measure to prevent crashes.",
+				_tr("Safety Check Warning"),
+				_tr("Unable to access table widget in %n.").replace('%n', str(function_name)) + "\n\n"
+				+ _tr("The operation will be skipped this round and retried in the next sync cycle.") + "\n\n"
+				+ _tr("This is a protective measure to prevent crashes."),
 				auto_close_seconds=5
 			)
+			self._safety_notification = notification  # keep it alive while it is on screen
 			notification.show()
 		except Exception as e:
 			# If we can't even show the notification, just log it
 			logging.exception("Failed to show safety notification: %s", e)
-
-	def _process_sync_messages(self):
-		if self._sync_processing:
-			return
-		self._sync_processing = True
-		try:
-			self._drain_reminder_queue()
-			self._drain_calendar_queue()
-		except Exception as e:
-			# Catch all exceptions to prevent PyQt6 abort() crash
-			# Skip this round and try again next time
-			logging.exception("Error in _process_sync_messages, skipping this round: %s", e)
-		finally:
-			self._sync_processing = False
-
-	def _drain_reminder_queue(self):
-		if not self.reminder_sync_queue:
-			return
-		if getattr(self, '_sync_counter', 0) > 0:
-			return
-		if getattr(self, '_repeat_sync_in_progress', False):
-			return
-		while True:
-			try:
-				message = self.reminder_sync_queue.get_nowait()
-			except queue.Empty:
-				break
-			if message is None:
-				continue
-			snapshot, snapshot_timestamp = self._parse_reminder_sync_message(message)
-			if snapshot is None:
-				continue
-			last_change = getattr(self, '_last_local_reminder_change', 0.0)
-			if snapshot_timestamp is not None:
-				if snapshot_timestamp < last_change:
-					continue
-				self._last_reminder_snapshot_ts = snapshot_timestamp
-			elif last_change > 0 and time.time() - last_change < 5:
-				continue
-			self._handle_reminder_snapshot(snapshot)
-
-	def _drain_calendar_queue(self):
-		if not self.calendar_sync_queue:
-			return
-		if getattr(self, '_sync_counter', 0) > 0:
-			return
-		if getattr(self, '_repeat_sync_in_progress', False):
-			return
-		while True:
-			try:
-				message = self.calendar_sync_queue.get_nowait()
-			except queue.Empty:
-				break
-			if message is None:
-				continue
-			snapshot, snapshot_timestamp = self._parse_calendar_sync_message(message)
-			if snapshot is None:
-				continue
-			last_change = getattr(self, '_last_local_reminder_change', 0.0)
-			if snapshot_timestamp is not None:
-				if snapshot_timestamp < last_change:
-					continue
-				self._last_calendar_snapshot_ts = snapshot_timestamp
-			elif last_change > 0 and time.time() - last_change < 5:
-				continue
-			self._handle_calendar_snapshot(snapshot, snapshot_timestamp)
-
-	def _parse_reminder_sync_message(self, message):
-		if isinstance(message, dict):
-			return message.get('snapshot'), message.get('timestamp')
-		if isinstance(message, (tuple, list)) and len(message) == 2:
-			first, second = message
-			if isinstance(first, (int, float)):
-				return second, first
-			if isinstance(second, (int, float)):
-				return first, second
-		return message, None
-
-	def _parse_calendar_sync_message(self, message):
-		if isinstance(message, dict):
-			return message.get('snapshot'), message.get('timestamp')
-		if isinstance(message, (tuple, list)) and len(message) == 2:
-			first, second = message
-			if isinstance(first, (int, float)):
-				return second, first
-			if isinstance(second, (int, float)):
-				return first, second
-		return message, None
-
-	def _handle_reminder_snapshot(self, snapshot):
-		# Safety check: ensure tableWidget exists
-		if not hasattr(self, 'tableWidget') or self.tableWidget is None:
-			logging.warning("_handle_reminder_snapshot: tableWidget not available, skipping")
-			self._show_safety_notification("_handle_reminder_snapshot")
-			return
-
-		if not isinstance(snapshot, list):
-			return
-
-		try:
-			remote_map = {}
-			for entry in snapshot:
-				name = entry.get('name', '').strip()
-				stamp_value = self._normalize_stamp(entry.get('stamp'))
-				if not name or not stamp_value:
-					continue
-				remote_map[(name, stamp_value)] = entry
-			local_entries = self._collect_time_entries()
-			commands = []
-			table_changed = False
-
-			for key, entry in remote_map.items():
-				local_entry = local_entries.get(key)
-				if not local_entry:
-					continue
-				if entry.get('completed') and local_entry.get('status') == 'UNDONE':
-					row = self._find_time_row_by_key(*key)
-					if row is None:
-						continue
-					rcmds, ccmds, row_done = self._complete_time_row(row, '')
-					commands.extend(rcmds + ccmds)
-					if row_done:
-						table_changed = True
-
-			for key, entry in remote_map.items():
-				if key in local_entries:
-					continue
-				add_cmds = self._add_time_row_from_reminder(entry)
-				if add_cmds is not None:
-					if add_cmds:
-						commands.extend(add_cmds)
-					table_changed = True
-
-			for key in list(local_entries.keys()):
-				if key in remote_map:
-					continue
-				if local_entries[key].get('status') == 'DONE':
-					continue
-				delete_cmds = self._delete_time_row_by_key(*key)
-				if delete_cmds is not None:
-					if delete_cmds:
-						commands.extend(delete_cmds)
-					table_changed = True
-
-			if table_changed:
-				self._refresh_stamp_column()
-				self._write_time_csv_from_table()
-				with contextlib.suppress(Exception):
-					self.tableWidget.sortByColumn(8, Qt.SortOrder.AscendingOrder)
-			if commands:
-				self._run_osascript_batch(commands)
-		except Exception as e:
-			logging.exception("Error in _handle_reminder_snapshot: %s", e)
-
-	def _handle_calendar_snapshot(self, snapshot, snapshot_ts=None):
-		# Safety check: ensure tableWidget exists
-		if not hasattr(self, 'tableWidget') or self.tableWidget is None:
-			logging.warning("_handle_calendar_snapshot: tableWidget not available, skipping")
-			self._show_safety_notification("_handle_calendar_snapshot")
-			return
-
-		if not isinstance(snapshot, list):
-			return
-		if snapshot_ts and self._last_reminder_snapshot_ts:
-			if snapshot_ts + 300 < self._last_reminder_snapshot_ts:
-				return
-
-		try:
-			calendar_map = {}
-			for entry in snapshot:
-				name = (entry.get('name') or '').strip()
-				stamp_value = self._normalize_stamp(entry.get('stamp'))
-				if not name or not stamp_value:
-					continue
-				calendar_map[(name, stamp_value)] = entry
-			local_entries = self._collect_time_entries()
-			if not local_entries and not calendar_map:
-				return
-
-			commands = []
-			table_changed = False
-
-			# Handle time change (same name, different stamp) when unique
-			name_to_local = {}
-			for (lname, lstamp), info in local_entries.items():
-				name_to_local.setdefault(lname, []).append((lstamp, info))
-
-			for (cname, cstamp), entry in calendar_map.items():
-				locals_for_name = name_to_local.get(cname, [])
-				if (cname, cstamp) in local_entries:
-					continue
-				if len(locals_for_name) == 1:
-					old_stamp, info = locals_for_name[0]
-					row = info.get('row')
-					if row is not None and self._update_time_row_from_calendar(row, entry):
-						commands.extend(self._build_reminder_update_command(cname, old_stamp, cstamp))
-						table_changed = True
-						local_entries.pop((cname, old_stamp), None)
-						local_entries[(cname, cstamp)] = info
-
-			# Additions
-			for key, entry in calendar_map.items():
-				if key in local_entries:
-					continue
-				add_cmds = self._add_time_row_from_calendar(entry)
-				if add_cmds is not None:
-					if add_cmds:
-						commands.extend(add_cmds)
-					table_changed = True
-
-			# Deletions
-			for key, info in list(local_entries.items()):
-				if key in calendar_map:
-					continue
-				row = info.get('row')
-				if row is None:
-					continue
-				del_cmds = self._delete_time_row_by_key(key[0], key[1])
-				if del_cmds is not None:
-					if del_cmds:
-						commands.extend(del_cmds)
-					table_changed = True
-
-			if table_changed:
-				self._refresh_stamp_column()
-				self._write_time_csv_from_table()
-				with contextlib.suppress(Exception):
-					self.tableWidget.sortByColumn(8, Qt.SortOrder.AscendingOrder)
-			if commands:
-				self._run_osascript_batch(commands)
-		except Exception as e:
-			logging.exception("Error in _handle_calendar_snapshot: %s", e)
 
 	def _collect_time_entries(self):
 		# Safety check: ensure tableWidget exists and is valid
@@ -4599,112 +6019,13 @@ end tell""" % (other_style, escaped_name)
 				if name_item is None:
 					continue
 				row_stamp = self._stamp_from_items(self.tableWidget.item(row, 8), self.tableWidget.item(row, 1))
-				if name_item.text() == name and row_stamp == target_stamp:
+				# names are compared without the spaces around them, as the system's own are read
+				if name_item.text().strip() == (name or '').strip() and row_stamp == target_stamp:
 					return row
 			return None
 		except Exception as e:
 			logging.exception("Error in _find_time_row_by_key: %s", e)
 			return None
-
-	def _add_time_row_from_reminder(self, entry):
-		name = entry.get('name', '').strip()
-		stamp_value = self._normalize_stamp(entry.get('stamp'))
-		if not name or not stamp_value:
-			return None
-		try:
-			stamp_int = int(stamp_value)
-		except ValueError:
-			return None
-		dt = datetime.datetime.fromtimestamp(stamp_int)
-		time_text = dt.strftime("%Y-%m-%d %H:%M")
-		otherStyleTime = dt.strftime("%m/%d/%Y %H:%M")
-		row_values = [name, time_text, '1', '-', 'UNDONE', '-', '-', 'TIME_SNS', stamp_value]
-		self._append_time_row_to_table(row_values)
-		escaped_name = self._escape_applescript_string(name)
-		cmd = """tell application "Calendar"
-	tell calendar "Tomato"
-		make new event at end with properties {summary:"%s", start date:date "%s", end date:date "%s" + (1 * hours)}
-	end tell
-end tell""" % (escaped_name, otherStyleTime, otherStyleTime)
-		return [cmd]
-
-	def _delete_time_row_by_key(self, name, stamp_value):
-		row = self._find_time_row_by_key(name, stamp_value)
-		if row is None:
-			return []
-		time_item = self.tableWidget.item(row, 1)
-		otherStyleTime = None
-		stamp_to_use = stamp_value or self._stamp_from_items(self.tableWidget.item(row, 8), time_item)
-		if stamp_to_use:
-			with contextlib.suppress(Exception):
-				time_struct = time.localtime(int(stamp_to_use))
-				otherStyleTime = time.strftime("%m/%d/%Y %H:%M", time_struct)
-		if otherStyleTime is None and time_item and time_item.text():
-			with contextlib.suppress(Exception):
-				time_struct = time.localtime(int(self.to_stamp(time_item.text())))
-				otherStyleTime = time.strftime("%m/%d/%Y %H:%M", time_struct)
-		self.tableWidget.removeRow(row)
-		if otherStyleTime is None:
-			return []
-		escaped_name = self._escape_applescript_string(name)
-		cmd1 = """tell application "Reminders"
-	set mylist to list "Tomato"
-	tell mylist
-		delete (reminders whose (name is "%s") and (remind me date is date "%s"))
-	end tell
-end tell""" % (escaped_name, otherStyleTime)
-		cmd2 = """tell application "Calendar"
-	tell calendar "Tomato"
-		delete (events whose (start date is date "%s") and (summary is "%s"))
-	end tell
-end tell""" % (otherStyleTime, escaped_name)
-		return [cmd1, cmd2]
-
-	def _add_time_row_from_calendar(self, entry):
-		name = (entry.get('name') or '').strip()
-		stamp_value = self._normalize_stamp(entry.get('stamp'))
-		if not name or not stamp_value:
-			return None
-		try:
-			stamp_int = int(stamp_value)
-		except ValueError:
-			return None
-		dt = datetime.datetime.fromtimestamp(stamp_int)
-		time_text = dt.strftime("%Y-%m-%d %H:%M")
-		duration = entry.get('duration') or 0
-		length_hours = self._format_hours(round(duration / 3600, 6)) if duration else '1'
-		row_values = [name, time_text, length_hours, '-', 'UNDONE', '-', '-', 'TIME_SNS', stamp_value]
-		self._append_time_row_to_table(row_values)
-		escaped_name = self._escape_applescript_string(name)
-		otherStyleTime = dt.strftime("%m/%d/%Y %H:%M")
-		cmd = """tell application "Reminders"
-	set eachLine to "%s"
-	set mylist to list "Tomato"
-	tell mylist
-		make new reminder at end with properties {name:eachLine, remind me date:date "%s"}
-	end tell
-end tell""" % (escaped_name, otherStyleTime)
-		return [cmd]
-
-	def _update_time_row_from_calendar(self, row, entry):
-		name = (entry.get('name') or '').strip()
-		stamp_value = self._normalize_stamp(entry.get('stamp'))
-		if not name or not stamp_value:
-			return False
-		try:
-			stamp_int = int(stamp_value)
-		except ValueError:
-			return False
-		dt = datetime.datetime.fromtimestamp(stamp_int)
-		time_text = dt.strftime("%Y-%m-%d %H:%M")
-		duration = entry.get('duration') or 0
-		length_hours = self.tableWidget.item(row, 2).text() if self.tableWidget.item(row, 2) else '1'
-		if duration:
-			length_hours = self._format_hours(round(duration / 3600, 6))
-		self.tableWidget.setItem(row, 1, QTableWidgetItem(time_text))
-		self.tableWidget.setItem(row, 8, QTableWidgetItem(stamp_value))
-		self.tableWidget.setItem(row, 2, QTableWidgetItem(str(length_hours)))
-		return True
 
 	def _build_reminder_update_command(self, name, old_stamp, new_stamp):
 		escaped_name = self._escape_applescript_string(name)
@@ -4876,6 +6197,8 @@ end tell""" % (escaped_name, old_time, new_time)
 				sta9_inp = str(self.to_stamp(tim2_inp))
 			except Exception as e:
 				pass
+			if sta9_inp != '' and self._broccoli_begin_task(ite1_inp, sta9_inp, length_hours, repeat_hours, pro7_inp):
+				return
 			if sta9_inp != '':
 				new_time_sns.append(ite1_inp)
 				new_time_sns.append(tim2_inp)
@@ -4997,6 +6320,23 @@ end tell""" % (escaped_item, otherStyleTime, otherStyleTime, length_hours)
 
 	def delete_item(self):
 		if self.tableWidget.currentItem() != None:
+			ask_row = self.tableWidget.currentIndex().row()
+			ask_items = [self.tableWidget.item(ask_row, col) for col in (0, 3, 6, 4)]
+			if ask_items[0] is not None and ask_items[1] is not None and ask_items[3] is not None and ask_items[3].text() == 'UNDONE':
+				ask_stamp = self._stamp_from_items(self.tableWidget.item(ask_row, 8), self.tableWidget.item(ask_row, 1))
+				later_rows = self._repeat_later_rows(ask_items[0].text(), ask_items[1].text(), ask_items[2].text() if ask_items[2] else '-', ask_stamp, ask_row) if ask_stamp else []
+				if later_rows:
+					scope = self._ask_repeat_scope(
+						_tr('Delete'),
+						_tr('"%1" repeats, and %n later ones are still to do. Delete the later ones too?'),
+						ask_items[0].text(), len(later_rows))
+					if scope == 'cancel':
+						return
+					if scope == 'later':
+						self._delete_repeat_from(ask_row, later_rows)
+						self.le4.setText('-')
+						self.le4.setText('')
+						return
 			del_row = self.tableWidget.currentIndex().row() + 1
 			with open(self.fulldirall, 'r', encoding='utf8') as csv_file:
 				csv_reader = csv.reader(csv_file)
@@ -5082,28 +6422,14 @@ end tell""" % (escaped_item, otherStyleTime, otherStyleTime, length_hours)
 		home_dir = str(Path.home())
 		fj = QFileDialog.getExistingDirectory(self, 'Open', home_dir)
 		if fj != '':
-			tarname1 = "TomatoAppPath"
-			fulldir1 = os.path.join(home_dir, tarname1)
-			if not os.path.exists(fulldir1):
-				os.mkdir(fulldir1)
+			fulldir1 = TOMATO_DATA_DIR
+			os.makedirs(fulldir1, exist_ok=True)
 			tarname2 = "All.csv"
 			fulldir2 = os.path.join(fulldir1, tarname2)
 			shutil.copy(fulldir2, fj)
 
 	def on_text_change(self):
-		if self._suppress_diary_write:
-			return
-		if self.textii1.toPlainText() != '':
-			ISOTIMEFORMAT = '%Y-%m-%d diary'
-			theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
-			diary_name = str(theTime) + ".md"
-			diary_file = os.path.join(self.fulldir_dia, diary_name)
-			if not os.path.exists(diary_file):
-				with open(diary_file, 'a', encoding='utf-8') as f0:
-					f0.write(f'# {theTime}')
-			new_content = self.textii1.toPlainText()
-			with open(diary_file, 'w', encoding='utf-8') as f0:
-				f0.write(new_content)
+		self._save_diary_box(self.textii1)
 
 	def export_diary(self):
 		home_dir = str(Path.home())
@@ -5292,7 +6618,7 @@ end tell
 		if not selected_rows and self.tableWidget.currentItem() is not None:
 			selected_rows = [self.tableWidget.currentRow()]
 		if not selected_rows:
-			self._warn_selection_required('Please select the items to be completed first, then click save.')
+			self._warn_selection_required(_tr('Please select the items to be completed first, then click save.'))
 			return
 		comment_text = self.textw1.toPlainText()
 		processed = False
@@ -5426,66 +6752,66 @@ end tell
 
 		t1 = QWidget()
 		self.lf1 = QLineEdit(self)
-		self.lf1.setPlaceholderText('Item')
-		self.lf1.setFixedHeight(20)
+		self.lf1.setPlaceholderText(_tr('Item'))
+		self.lf1.setFixedHeight(MAIN_ROW_HEIGHT)
 
 		self.lf2 = QLineEdit(self)
-		self.lf2.setPlaceholderText('Target')
-		self.lf2.setFixedHeight(20)
-		self.lf2.textChanged.connect(self.freq_refresh)
+		self.lf2.setPlaceholderText(_tr('Target'))
+		self.lf2.setFixedHeight(MAIN_ROW_HEIGHT)
+		self._refresh_on_program_change(self.lf2, self.freq_refresh)
 		b1 = QHBoxLayout()
 		b1.setContentsMargins(0, 0, 0, 0)
 		b1.addWidget(self.lf1)
 		b1.addWidget(self.lf2)
 		t1.setLayout(b1)
 
+		# the block's main action: a glass white capsule in the row of the item box (style book 5.1 / 5.12)
 		t1_5 = QWidget()
-		btn_t1 = QPushButton('Add!', self)
+		btn_t1 = WhiteButton(_tr('Add!'), self)
 		btn_t1.clicked.connect(self.add_to_freq)
 		btn_t1.setShortcut("Ctrl+Return")
-		btn_t1.setFixedHeight(20)
+		btn_t1.setMinimumWidth(96)
 		b1_5 = QHBoxLayout()
 		b1_5.setContentsMargins(0, 0, 0, 0)
 		b1_5.addWidget(btn_t1)
 		t1_5.setLayout(b1_5)
+		t1_5.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
 		t1_6 = QWidget()
-		b1_6 = QVBoxLayout()
+		b1_6 = QHBoxLayout()
 		b1_6.setContentsMargins(0, 0, 0, 0)
-		b1_6.addWidget(t1)
+		b1_6.addWidget(t1, 1)
 		b1_6.addWidget(t1_5)
 		t1_6.setLayout(b1_6)
 
 		t2 = QWidget()
-		self.widget1 = QComboBox(self)
+		self.widget1 = compact_dropdown(self)
 		self.widget1.setCurrentIndex(0)
 		self.widget1.currentIndexChanged.connect(self.freq_index)
-		self.widget1.addItems(['All', 'To-do', 'Done'])
+		self.widget1.addItems([_tr('All'), _tr('To-do'), _tr('Done')])
 
-		btn_t2 = QPushButton('Delete selected item', self)
+		btn_t2 = MacNormalButton(_tr('Delete selected item'), self)
 		btn_t2.clicked.connect(self.freq_delete)
-		btn_t2.setFixedHeight(20)
+		btn_t2.setFixedHeight(GREY_ROW_HEIGHT)
 		# self.widget1.setFixedWidth(btn_t2.width() * 2)
 
-		btn_t7 = QPushButton('Delete all DONEs', self)
+		btn_t7 = MacNormalButton(_tr('Delete all DONEs'), self)
 		btn_t7.clicked.connect(self.freq_delete_dones)
-		btn_t7.setFixedHeight(20)
+		btn_t7.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.freq1 = QFrame(self)
-		self.freq1.setFrameShape(QFrame.Shape.HLine)
-		self.freq1.setFrameShadow(QFrame.Shadow.Sunken)
+		self.freq1 = panel_line(self)
 
-		btn_t3 = QPushButton('Export plan', self)
+		btn_t3 = MacNormalButton(_tr('Export plan'), self)
 		btn_t3.clicked.connect(self.export_plan)
-		btn_t3.setFixedHeight(20)
+		btn_t3.setFixedHeight(GREY_ROW_HEIGHT)
 
-		btn_t5 = QPushButton('Export diary', self)
+		btn_t5 = MacNormalButton(_tr('Export diary'), self)
 		btn_t5.clicked.connect(self.export_diary)
-		btn_t5.setFixedHeight(20)
+		btn_t5.setFixedHeight(GREY_ROW_HEIGHT)
 
-		btn_t6 = QPushButton('Export records', self)
+		btn_t6 = MacNormalButton(_tr('Export records'), self)
 		btn_t6.clicked.connect(self.export_record)
-		btn_t6.setFixedHeight(20)
+		btn_t6.setFixedHeight(GREY_ROW_HEIGHT)
 		b2 = QVBoxLayout()
 		b2.setContentsMargins(0, 0, 0, 0)
 		b2.addWidget(self.widget1)
@@ -5507,30 +6833,27 @@ end tell
 		self.textw2= QPlainTextEdit(self)
 		self.textw2.setReadOnly(False)
 		self.textw2.setObjectName("edit")
-		self.textw2.setPlaceholderText('Comments')
+		self.textw2.setPlaceholderText(_tr('Comments'))
 		#self.textw2.setMaximumHeight(44)
 
-		btn_t4 = QPushButton('Add 1 time!', self)
+		btn_t4 = WhiteButton(_tr('Add 1 time!'), self)
 		btn_t4.clicked.connect(self.freq_add_time)
-		btn_t4.setFixedHeight(20)
 		btn_t4.setShortcut("Ctrl+Shift+Return")
 
-		self.freq2 = QFrame(self)
-		self.freq2.setFrameShape(QFrame.Shape.HLine)
-		self.freq2.setFrameShadow(QFrame.Shadow.Sunken)
+		self.freq2 = panel_line(self)
 
 		self.freq_date_edit = QDateEdit(self)
 		self.freq_date_edit.setCalendarPopup(True)
 		self.freq_date_edit.setDisplayFormat('yyyy-MM-dd')
 		self.freq_date_edit.setDate(QDate.currentDate())
-		self.freq_date_edit.setFixedHeight(20)
-		self.freq_date_edit.setToolTip('Choose Date')
+		self.freq_date_edit.setFixedHeight(GREY_ROW_HEIGHT)
+		self.freq_date_edit.setToolTip(_tr('Choose Date'))
 
 		self.freq_time_edit = QTimeEdit(self)
 		self.freq_time_edit.setDisplayFormat('HH:mm')
 		self.freq_time_edit.setTime(QTime.currentTime())
-		self.freq_time_edit.setFixedHeight(20)
-		self.freq_time_edit.setToolTip('Hover to open clock picker')
+		self.freq_time_edit.setFixedHeight(GREY_ROW_HEIGHT)
+		self.freq_time_edit.setToolTip(_tr('Hover to open clock picker'))
 		self.freq_time_edit.installEventFilter(self)
 
 		self.freq_clock_picker_popup = ClockPickerPopup()
@@ -5538,33 +6861,33 @@ end tell
 		self.freq_clock_picker_popup.time_changed.connect(lambda t: self.freq_time_edit.setTime(t))
 
 		self.lf4 = QLineEdit(self)
-		self.lf4.setPlaceholderText('Length')
-		self.lf4.setFixedHeight(20)
+		self.lf4.setPlaceholderText(_tr('Length'))
+		self.lf4.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.freq_length_unit = QComboBox(self)
+		self.freq_length_unit = compact_dropdown(self)
 		for label, factor in self._time_unit_items:
-			self.freq_length_unit.addItem(label, factor)
+			self.freq_length_unit.addItem(_tr(label), factor)
 		self.freq_length_unit.setCurrentIndex(self._time_unit_hours_index)
 		self.freq_length_unit.setFixedWidth(100)
 
 		self.lf5 = QLineEdit(self)
-		self.lf5.setPlaceholderText('Repeat')
-		self.lf5.setFixedHeight(20)
+		self.lf5.setPlaceholderText(_tr('Repeat'))
+		self.lf5.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.freq_repeat_unit = QComboBox(self)
+		self.freq_repeat_unit = compact_dropdown(self)
 		for label, factor in self._repeat_unit_items:
-			self.freq_repeat_unit.addItem(label, factor)
+			self.freq_repeat_unit.addItem(_tr(label), factor)
 		self.freq_repeat_unit.setCurrentIndex(0)
 		self.freq_repeat_unit.setFixedWidth(100)
 
-		self.freq_repeat_until_check = QCheckBox('Repeat until', self)
+		self.freq_repeat_until_check = QCheckBox(_tr('Repeat until'), self)
 		self.freq_repeat_until_check.setChecked(False)
 		self.freq_repeat_until_check.setFixedWidth(100)
 		self.freq_repeat_until_date = QDateEdit(self)
 		self.freq_repeat_until_date.setCalendarPopup(True)
 		self.freq_repeat_until_date.setDisplayFormat('yyyy-MM-dd')
 		self.freq_repeat_until_date.setDate(QDate.currentDate())
-		self.freq_repeat_until_date.setFixedHeight(20)
+		self.freq_repeat_until_date.setFixedHeight(GREY_ROW_HEIGHT)
 		self.freq_repeat_until_date.setEnabled(False)
 		self.freq_repeat_until_check.toggled.connect(lambda _: self._apply_repeat_until_enable(self.freq_repeat_until_check, self.freq_repeat_until_date))
 
@@ -5580,20 +6903,23 @@ end tell
 		freq_until_row.addWidget(self.freq_repeat_until_check)
 		freq_until_row.addWidget(self.freq_repeat_until_date)
 
-		btn_t5 = QPushButton('Copy to Time-sensitive list', self)
+		btn_t5 = MacNormalButton(_tr('Copy to Time-sensitive list'), self)
 		btn_t5.clicked.connect(self.freq_move_time)
-		btn_t5.setFixedHeight(20)
+		btn_t5.setFixedHeight(GREY_ROW_HEIGHT)
 		freq_datetime_row = QHBoxLayout()
 		freq_datetime_row.setContentsMargins(0, 0, 0, 0)
 		freq_datetime_row.addWidget(self.freq_date_edit)
 		freq_datetime_row.addWidget(self.freq_time_edit)
+		freq_end_row = self._end_time_row('freq', self.freq_date_edit, self.freq_time_edit, self.lf4, self.freq_length_unit)
 
 		b3 = QVBoxLayout()
 		b3.setContentsMargins(0, 0, 0, 0)
+		b3.setSpacing(6)
 		b3.addWidget(self.textw2)
 		b3.addWidget(btn_t4)
 		b3.addWidget(self.freq2)
 		b3.addLayout(freq_datetime_row)
+		b3.addLayout(freq_end_row)
 		b3.addLayout(length_repeat_row)
 		b3.addLayout(freq_until_row)
 		b3.addWidget(btn_t5)
@@ -5671,13 +6997,12 @@ end tell
 		b5.addWidget(t3, 2)
 		b5.addWidget(t4, 2)
 		t5.setLayout(b5)
-		t5.setFixedHeight(int(self.height() / 2))
+		t5.setFixedHeight(EDIT_PANEL_COLUMNS_HEIGHT)
 
-		self.page2_box_h = QVBoxLayout()
-		self.page2_box_h.addWidget(self.tableWidget_freq)
-		self.page2_box_h.addWidget(t1_6)
-		self.page2_box_h.addWidget(t5)
-		self.art_tab.setLayout(self.page2_box_h)
+		style_table(self.tableWidget_freq)
+		style_table(self.tableWidget_record2, kind='card')
+		self.freq_panel = edit_panel(t1_6, t5)
+		self.freq_stage = self._page_stage(self.art_tab, self.tableWidget_freq, self.freq_panel)
 
 	def add_to_freq(self):
 		if self.lf1.text() != '' and self.lf2.text() != '':
@@ -6181,19 +7506,7 @@ end tell
 		self.lf2.clear()
 
 	def freq_text_change(self):
-		if self._suppress_diary_write:
-			return
-		if self.textii2.toPlainText() != '':
-			ISOTIMEFORMAT = '%Y-%m-%d diary'
-			theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
-			diary_name = str(theTime) + ".md"
-			diary_file = os.path.join(self.fulldir_dia, diary_name)
-			if not os.path.exists(diary_file):
-				with open(diary_file, 'a', encoding='utf-8') as f0:
-					f0.write(f'# {theTime}')
-			new_content = self.textii2.toPlainText()
-			with open(diary_file, 'w', encoding='utf-8') as f0:
-				f0.write(new_content)
+		self._save_diary_box(self.textii2)
 
 	def freq_record_write(self):
 		if self.tableWidget_freq.currentItem() != None:
@@ -6234,18 +7547,18 @@ end tell
 		if self.tableWidget_freq.currentItem() != None:
 			current_row = self.tableWidget_freq.currentIndex().row()
 			if current_row < 0:
-				self._warn_selection_required('Please select the frequency items to be summed first.')
+				self._warn_selection_required(_tr('Please select the frequency items to be summed first.'))
 				return
 
 			target_item = self.tableWidget_freq.item(current_row, 5)
 			target_text = target_item.text().strip() if target_item else ''
 			if target_text in ('', '-'):
-				self._warn_selection_required('Please fill in the number first.')
+				self._warn_selection_required(_tr('Please fill in the number first.'))
 				return
 			try:
 				self.freq_target = int(target_text)
 			except ValueError:
-				self._warn_selection_required('"The target must be a number."')
+				self._warn_selection_required(_tr('"The target must be a number."'))
 				return
 
 			process_item = self.tableWidget_freq.item(current_row, 6)
@@ -6404,7 +7717,7 @@ end tell
 		if not selected_rows and self.tableWidget_freq.currentItem() != None:
 			selected_rows = [self.tableWidget_freq.currentRow()]
 		if not selected_rows:
-			self._warn_selection_required('Please select the frequency items to be summed first.')
+			self._warn_selection_required(_tr('Please select the frequency items to be summed first.'))
 			return
 		comment_text = self.textw2.toPlainText()
 		for index, row in enumerate(selected_rows):
@@ -6559,62 +7872,62 @@ end tell
 
 		t1 = QWidget()
 		self.lm1 = QLineEdit(self)
-		self.lm1.setPlaceholderText('Item')
-		self.lm1.setFixedHeight(20)
-		self.lm1.textChanged.connect(self.memo_refresh)
+		self.lm1.setPlaceholderText(_tr('Item'))
+		self.lm1.setFixedHeight(MAIN_ROW_HEIGHT)
+		self._refresh_on_program_change(self.lm1, self.memo_refresh)
 
 		b1 = QVBoxLayout()
 		b1.setContentsMargins(0, 0, 0, 0)
 		b1.addWidget(self.lm1)
 		t1.setLayout(b1)
 
+		# the block's main action: a glass white capsule in the row of the item box (style book 5.1 / 5.12)
 		t1_5 = QWidget()
-		btn_t1 = QPushButton('Add!', self)
+		btn_t1 = WhiteButton(_tr('Add!'), self)
 		btn_t1.clicked.connect(self.memo_add)
 		btn_t1.setShortcut("Ctrl+Return")
-		btn_t1.setFixedHeight(20)
+		btn_t1.setMinimumWidth(96)
 		b1_5 = QHBoxLayout()
 		b1_5.setContentsMargins(0, 0, 0, 0)
 		b1_5.addWidget(btn_t1)
 		t1_5.setLayout(b1_5)
+		t1_5.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
 		t1_6 = QWidget()
-		b1_6 = QVBoxLayout()
+		b1_6 = QHBoxLayout()
 		b1_6.setContentsMargins(0, 0, 0, 0)
-		b1_6.addWidget(t1)
+		b1_6.addWidget(t1, 1)
 		b1_6.addWidget(t1_5)
 		t1_6.setLayout(b1_6)
 
 		t2 = QWidget()
-		self.widget2 = QComboBox(self)
+		self.widget2 = compact_dropdown(self)
 		self.widget2.setCurrentIndex(0)
 		self.widget2.currentIndexChanged.connect(self.memo_index_change)
-		self.widget2.addItems(['All', 'To-do', 'Done'])
+		self.widget2.addItems([_tr('All'), _tr('To-do'), _tr('Done')])
 
-		btn_t2 = QPushButton('Delete selected item', self)
+		btn_t2 = MacNormalButton(_tr('Delete selected item'), self)
 		btn_t2.clicked.connect(self.memo_delete)
-		btn_t2.setFixedHeight(20)
+		btn_t2.setFixedHeight(GREY_ROW_HEIGHT)
 		# self.widget2.setFixedWidth(btn_t2.width() * 2)
 
-		btn_t7 = QPushButton('Delete all DONEs', self)
+		btn_t7 = MacNormalButton(_tr('Delete all DONEs'), self)
 		btn_t7.clicked.connect(self.memo_delete_dones)
-		btn_t7.setFixedHeight(20)
+		btn_t7.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.memo1 = QFrame(self)
-		self.memo1.setFrameShape(QFrame.Shape.HLine)
-		self.memo1.setFrameShadow(QFrame.Shadow.Sunken)
+		self.memo1 = panel_line(self)
 
-		btn_t3 = QPushButton('Export plan', self)
+		btn_t3 = MacNormalButton(_tr('Export plan'), self)
 		btn_t3.clicked.connect(self.export_plan)
-		btn_t3.setFixedHeight(20)
+		btn_t3.setFixedHeight(GREY_ROW_HEIGHT)
 
-		btn_t5 = QPushButton('Export diary', self)
+		btn_t5 = MacNormalButton(_tr('Export diary'), self)
 		btn_t5.clicked.connect(self.export_diary)
-		btn_t5.setFixedHeight(20)
+		btn_t5.setFixedHeight(GREY_ROW_HEIGHT)
 
-		btn_t6 = QPushButton('Export records', self)
+		btn_t6 = MacNormalButton(_tr('Export records'), self)
 		btn_t6.clicked.connect(self.export_record)
-		btn_t6.setFixedHeight(20)
+		btn_t6.setFixedHeight(GREY_ROW_HEIGHT)
 		b2 = QVBoxLayout()
 		b2.setContentsMargins(0, 0, 0, 0)
 		b2.addWidget(self.widget2)
@@ -6636,30 +7949,27 @@ end tell
 		self.textw3 = QPlainTextEdit(self)
 		self.textw3.setReadOnly(False)
 		self.textw3.setObjectName("edit")
-		self.textw3.setPlaceholderText('Comments')
+		self.textw3.setPlaceholderText(_tr('Comments'))
 		#self.textw3.setMaximumHeight(44)
 
-		btn_t4 = QPushButton('Done this memo!', self)
+		btn_t4 = WhiteButton(_tr('Done this memo!'), self)
 		btn_t4.clicked.connect(self.memo_done_memo)
-		btn_t4.setFixedHeight(20)
 		btn_t4.setShortcut("Ctrl+Shift+Return")
 
-		self.memo2 = QFrame(self)
-		self.memo2.setFrameShape(QFrame.Shape.HLine)
-		self.memo2.setFrameShadow(QFrame.Shadow.Sunken)
+		self.memo2 = panel_line(self)
 
 		self.memo_date_edit = QDateEdit(self)
 		self.memo_date_edit.setCalendarPopup(True)
 		self.memo_date_edit.setDisplayFormat('yyyy-MM-dd')
 		self.memo_date_edit.setDate(QDate.currentDate())
-		self.memo_date_edit.setFixedHeight(20)
-		self.memo_date_edit.setToolTip('Choose Date')
+		self.memo_date_edit.setFixedHeight(GREY_ROW_HEIGHT)
+		self.memo_date_edit.setToolTip(_tr('Choose Date'))
 
 		self.memo_time_edit = QTimeEdit(self)
 		self.memo_time_edit.setDisplayFormat('HH:mm')
 		self.memo_time_edit.setTime(QTime.currentTime())
-		self.memo_time_edit.setFixedHeight(20)
-		self.memo_time_edit.setToolTip('Hover to open clock picker')
+		self.memo_time_edit.setFixedHeight(GREY_ROW_HEIGHT)
+		self.memo_time_edit.setToolTip(_tr('Hover to open clock picker'))
 		self.memo_time_edit.installEventFilter(self)
 
 		self.memo_clock_picker_popup = ClockPickerPopup()
@@ -6667,33 +7977,33 @@ end tell
 		self.memo_clock_picker_popup.time_changed.connect(lambda t: self.memo_time_edit.setTime(t))
 
 		self.lm4 = QLineEdit(self)
-		self.lm4.setPlaceholderText('Length')
-		self.lm4.setFixedHeight(20)
+		self.lm4.setPlaceholderText(_tr('Length'))
+		self.lm4.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.memo_length_unit = QComboBox(self)
+		self.memo_length_unit = compact_dropdown(self)
 		for label, factor in self._time_unit_items:
-			self.memo_length_unit.addItem(label, factor)
+			self.memo_length_unit.addItem(_tr(label), factor)
 		self.memo_length_unit.setCurrentIndex(self._time_unit_hours_index)
 		self.memo_length_unit.setFixedWidth(100)
 
 		self.lm5 = QLineEdit(self)
-		self.lm5.setPlaceholderText('Repeat')
-		self.lm5.setFixedHeight(20)
+		self.lm5.setPlaceholderText(_tr('Repeat'))
+		self.lm5.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.memo_repeat_unit = QComboBox(self)
+		self.memo_repeat_unit = compact_dropdown(self)
 		for label, factor in self._repeat_unit_items:
-			self.memo_repeat_unit.addItem(label, factor)
+			self.memo_repeat_unit.addItem(_tr(label), factor)
 		self.memo_repeat_unit.setCurrentIndex(0)
 		self.memo_repeat_unit.setFixedWidth(100)
 
-		self.memo_repeat_until_check = QCheckBox('Repeat until', self)
+		self.memo_repeat_until_check = QCheckBox(_tr('Repeat until'), self)
 		self.memo_repeat_until_check.setChecked(False)
 		self.memo_repeat_until_check.setFixedWidth(100)
 		self.memo_repeat_until_date = QDateEdit(self)
 		self.memo_repeat_until_date.setCalendarPopup(True)
 		self.memo_repeat_until_date.setDisplayFormat('yyyy-MM-dd')
 		self.memo_repeat_until_date.setDate(QDate.currentDate())
-		self.memo_repeat_until_date.setFixedHeight(20)
+		self.memo_repeat_until_date.setFixedHeight(GREY_ROW_HEIGHT)
 		self.memo_repeat_until_date.setEnabled(False)
 		self.memo_repeat_until_check.toggled.connect(lambda _: self._apply_repeat_until_enable(self.memo_repeat_until_check, self.memo_repeat_until_date))
 
@@ -6709,20 +8019,23 @@ end tell
 		memo_until_row.addWidget(self.memo_repeat_until_check)
 		memo_until_row.addWidget(self.memo_repeat_until_date)
 
-		btn_t5 = QPushButton('Copy to Time-sensitive list', self)
+		btn_t5 = MacNormalButton(_tr('Copy to Time-sensitive list'), self)
 		btn_t5.clicked.connect(self.memo_copy_to_time)
-		btn_t5.setFixedHeight(20)
+		btn_t5.setFixedHeight(GREY_ROW_HEIGHT)
 		memo_datetime_row = QHBoxLayout()
 		memo_datetime_row.setContentsMargins(0, 0, 0, 0)
 		memo_datetime_row.addWidget(self.memo_date_edit)
 		memo_datetime_row.addWidget(self.memo_time_edit)
+		memo_end_row = self._end_time_row('memo', self.memo_date_edit, self.memo_time_edit, self.lm4, self.memo_length_unit)
 
 		b3 = QVBoxLayout()
 		b3.setContentsMargins(0, 0, 0, 0)
+		b3.setSpacing(6)
 		b3.addWidget(self.textw3)
 		b3.addWidget(btn_t4)
 		b3.addWidget(self.memo2)
 		b3.addLayout(memo_datetime_row)
+		b3.addLayout(memo_end_row)
 		b3.addLayout(memo_length_repeat_row)
 		b3.addLayout(memo_until_row)
 		b3.addWidget(btn_t5)
@@ -6756,13 +8069,11 @@ end tell
 		b5.addWidget(t3, 2)
 		b5.addWidget(t4, 2)
 		t5.setLayout(b5)
-		t5.setFixedHeight(int(self.height() / 2))
+		t5.setFixedHeight(EDIT_PANEL_COLUMNS_HEIGHT)
 
-		self.page3_v_box = QVBoxLayout()
-		self.page3_v_box.addWidget(self.tableWidget_memo)
-		self.page3_v_box.addWidget(t1_6)
-		self.page3_v_box.addWidget(t5)
-		self.insp_tab.setLayout(self.page3_v_box)
+		style_table(self.tableWidget_memo)
+		self.memo_panel = edit_panel(t1_6, t5)
+		self.memo_stage = self._page_stage(self.insp_tab, self.tableWidget_memo, self.memo_panel)
 
 	def collectTab(self):
 		self.collection_current_file = None
@@ -6780,43 +8091,30 @@ end tell
 		self.collection_table.verticalHeader().setVisible(True)
 		self.collection_table.itemSelectionChanged.connect(self._update_collection_markdown_preview)
 		self.collection_table.itemChanged.connect(self._handle_collection_item_changed)
+		self._collection_viewport = self.collection_table.viewport()
+		self._collection_viewport.installEventFilter(self)             # a row can be dragged into a diary box
+		self._collection_drag_from = None
 
 		self.collection_md_editor = QPlainTextEdit(self)
-		self.collection_md_editor.setPlaceholderText('Select a row to view it as Markdown.')
+		self.collection_md_editor.setPlaceholderText(_tr('Select a row to view it as Markdown.'))
 		self.collection_md_editor.setReadOnly(True)
 		self.collection_md_editor.textChanged.connect(self._handle_collection_markdown_change)
 
-		self.collection_md_preview = QTextBrowser(self)
-		self.collection_md_preview.setOpenExternalLinks(True)
-		self.collection_md_preview.setReadOnly(True)
+		# a web page (formulas are typeset; see tomato_preview.py) — it answers the calls the QTextBrowser got
+		self.collection_md_preview = tomato_preview.MarkdownWebPreview(self, base_folder=TOMATO_MATHJAX_DIR)
+		self.collection_md_preview.set_background('#F3F2EE')
 
 		self.collection_view_stack = QStackedWidget(self)
 		self.collection_view_stack.addWidget(self.collection_md_editor)
 		self.collection_view_stack.addWidget(self.collection_md_preview)
 		self.collection_view_stack.setCurrentWidget(self.collection_md_editor)
 
-		self.collection_view_toggle_btn = QPushButton('Preview', self.collection_view_stack)
+		# Preview / Edit: a glass white capsule floating at the top right of the Markdown box (style book 5.1;
+		# its old place, the bottom right, now lies under the edit panel)
+		self.collection_view_toggle_btn = WhiteButton(_tr('Preview'), self.collection_view_stack)
 		self.collection_view_toggle_btn.setCheckable(True)
-		self.collection_view_toggle_btn.setFixedSize(90, 28)
-		self.collection_view_toggle_btn.setStyleSheet("""
-			QPushButton {
-				border: 1px solid rgba(40, 40, 40, 0.35);
-				background-color: rgba(255, 255, 255, 0.05);
-				color: rgba(20, 20, 20, 0.35);
-				border-radius: 6px;
-			}
-			QPushButton:hover {
-				background-color: #f0f0f0;
-				color: #111111;
-				border: 1px solid #5a5a5a;
-				border-radius: 6px;
-			}
-		""")
+		self.collection_view_toggle_btn.setFixedWidth(96)
 		self.collection_view_toggle_btn.toggled.connect(self._toggle_collection_view_mode)
-		self._collection_toggle_opacity = QGraphicsOpacityEffect(self.collection_view_toggle_btn)
-		self._collection_toggle_opacity.setOpacity(0.2)
-		self.collection_view_toggle_btn.setGraphicsEffect(self._collection_toggle_opacity)
-		self.collection_view_toggle_btn.installEventFilter(self)
 		self.collection_view_stack.installEventFilter(self)
 		self._position_collection_toggle_button()
 
@@ -6828,50 +8126,49 @@ end tell
 		right_view_container.setLayout(right_view_layout)
 
 		splitter = QSplitter(Qt.Orientation.Horizontal)
+		splitter.setHandleWidth(8)
 		splitter.addWidget(self.collection_table)
 		splitter.addWidget(right_view_container)
 		splitter.setStretchFactor(0, 2)
 		splitter.setStretchFactor(1, 1)
 
-		self.collection_file_combo = QComboBox(self)
+		self.collection_file_combo = compact_dropdown(self)
 		self.collection_file_combo.currentIndexChanged.connect(self._collection_file_changed)
 
-		btn_new_csv = QPushButton('New', self)
+		btn_new_csv = MacNormalButton(_tr('New'), self)
 		btn_new_csv.clicked.connect(self._collection_new_file)
-		btn_delete_csv = QPushButton('Delete', self)
+		btn_delete_csv = MacNormalButton(_tr('Delete'), self)
 		btn_delete_csv.clicked.connect(self._collection_delete_file)
-		btn_open_dir = QPushButton('Open Folder', self)
+		btn_open_dir = MacNormalButton(_tr('Open Folder'), self)
 		btn_open_dir.clicked.connect(self._open_collection_dir)
 
-		btn_t3 = QPushButton('Export plan', self)
+		btn_t3 = MacNormalButton(_tr('Export plan'), self)
 		btn_t3.clicked.connect(self.export_plan)
-		btn_t3.setFixedHeight(20)
+		btn_t3.setFixedHeight(GREY_ROW_HEIGHT)
 
-		btn_t5 = QPushButton('Export diary', self)
+		btn_t5 = MacNormalButton(_tr('Export diary'), self)
 		btn_t5.clicked.connect(self.export_diary)
-		btn_t5.setFixedHeight(20)
+		btn_t5.setFixedHeight(GREY_ROW_HEIGHT)
 
-		btn_t6 = QPushButton('Export records', self)
+		btn_t6 = MacNormalButton(_tr('Export records'), self)
 		btn_t6.clicked.connect(self.export_record)
-		btn_t6.setFixedHeight(20)
+		btn_t6.setFixedHeight(GREY_ROW_HEIGHT)
 
 		t4 = QWidget()
-		t4.setFixedHeight(20)
+		t4.setFixedHeight(GREY_ROW_HEIGHT)
 		b4 = QHBoxLayout()
 		b4.setContentsMargins(0, 0, 0, 0)
 		b4.addWidget(btn_new_csv)
 		b4.addWidget(btn_delete_csv)
 		t4.setLayout(b4)
 
-		self.frame21 = QFrame(self)
-		self.frame21.setFrameShape(QFrame.Shape.HLine)
-		self.frame21.setFrameShadow(QFrame.Shadow.Sunken)
+		self.frame21 = panel_line(self)
 
 		t2 = QWidget()
 		file_bar = QVBoxLayout()
 		file_bar.setContentsMargins(0, 0, 0, 0)
 		#file_bar.addStretch()
-		# file_bar.addWidget(QLabel('CSV File:', self))
+		# file_bar.addWidget(QLabel(_tr('CSV File:'), self))
 		file_bar.addWidget(self.collection_file_combo, 1)
 		# file_bar.addWidget(btn_new_csv)
 		# file_bar.addWidget(btn_delete_csv)
@@ -6892,41 +8189,40 @@ end tell
 		t2.setLayout(file_bar)
 
 		self.collection_search_input = QLineEdit(self)
-		self.collection_search_input.setPlaceholderText('Search…')
+		self.collection_search_input.setPlaceholderText(_tr('Search…'))
+		self.collection_search_input.setClearButtonEnabled(True)  # replaces the old separate "Clear" button
+		self.collection_search_input.setStyleSheet(glass_kit._search_input_stylesheet(is_dark_theme(app)))
+		glass_kit.glass_search_field(self.collection_search_input)
 		self.collection_search_input.textChanged.connect(self._collection_apply_search)
-		btn_clear_search = QPushButton('Clear', self)
-		btn_clear_search.setFixedWidth(120)
-		btn_clear_search.clicked.connect(self._collection_clear_search)
 		search_bar = QHBoxLayout()
 		search_bar.setContentsMargins(0, 0, 0, 0)
-		# search_bar.addWidget(QLabel('Search:', self))
 		search_bar.addWidget(self.collection_search_input, 1)
-		search_bar.addWidget(btn_clear_search)
 
-		self.collection_sort_column_combo = QComboBox(self)
-		self.collection_sort_column_combo.setFixedHeight(20)
-		self.collection_sort_mode_combo = QComboBox(self)
-		self.collection_sort_mode_combo.setFixedHeight(20)
-		self.collection_sort_mode_combo.addItem('Text', 'text')
-		self.collection_sort_mode_combo.addItem('Number', 'number')
-		self.collection_sort_mode_combo.addItem('Date/Time', 'datetime')
-		self.collection_sort_mode_combo.addItem('Boolean', 'bool')
-		btn_sort_asc = QPushButton('Sort ↑', self)
+		self.collection_sort_column_combo = compact_dropdown(self)
+		self.collection_sort_column_combo.setFixedHeight(GREY_ROW_HEIGHT)
+		self.collection_sort_mode_combo = compact_dropdown(self)
+		self.collection_sort_mode_combo.setFixedHeight(GREY_ROW_HEIGHT)
+		self.collection_sort_mode_combo.setMinimumWidth(104)
+		self.collection_sort_mode_combo.addItem(_tr('Text'), 'text')
+		self.collection_sort_mode_combo.addItem(_tr('Number'), 'number')
+		self.collection_sort_mode_combo.addItem(_tr('Date/Time'), 'datetime')
+		self.collection_sort_mode_combo.addItem(_tr('Boolean'), 'bool')
+		btn_sort_asc = MacNormalButton(_tr('Sort ↑'), self)
 		btn_sort_asc.setFixedSize(100, 20)
 		btn_sort_asc.clicked.connect(lambda: self._collection_sort(False))
-		btn_sort_desc = QPushButton('Sort ↓', self)
+		btn_sort_desc = MacNormalButton(_tr('Sort ↓'), self)
 		btn_sort_desc.setFixedSize(100, 20)
 		btn_sort_desc.clicked.connect(lambda: self._collection_sort(True))
-		# btn_sort_reset = QPushButton('Reset Order', self)
+		# btn_sort_reset = MacNormalButton(_tr('Reset Order'), self)
 		# btn_sort_reset.clicked.connect(self._collection_reset_order)
-		btn_manage_columns = QPushButton('Hide Columns', self)
-		btn_manage_columns.setFixedHeight(20)
+		btn_manage_columns = MacNormalButton(_tr('Hide Columns'), self)
+		btn_manage_columns.setFixedHeight(GREY_ROW_HEIGHT)
 		btn_manage_columns.clicked.connect(self._collection_manage_columns)
 
 		t10 = QWidget()
 		b10 = QHBoxLayout()
 		b10.setContentsMargins(0, 0, 0, 0)
-		b10.addWidget(QLabel('Sort column:', self))
+		b10.addWidget(QLabel(_tr('Sort column:'), self))
 		b10.addWidget(self.collection_sort_column_combo, 1)
 		b10.addWidget(self.collection_sort_mode_combo)
 		t10.setLayout(b10)
@@ -6941,7 +8237,7 @@ end tell
 
 		sort_bar = QVBoxLayout()
 		sort_bar.setContentsMargins(0, 0, 0, 0)
-		# sort_bar.addWidget(QLabel('Sort column:', self))
+		# sort_bar.addWidget(QLabel(_tr('Sort column:'), self))
 		# sort_bar.addWidget(self.collection_sort_column_combo, 1)
 		# sort_bar.addWidget(self.collection_sort_mode_combo)
 		# sort_bar.addWidget(btn_sort_asc)
@@ -6951,17 +8247,17 @@ end tell
 		sort_bar.addWidget(t11)
 		# sort_bar.addWidget(btn_sort_reset)
 
-		btn_add_row = QPushButton('Add Row', self)
-		btn_add_row.setFixedHeight(20)
+		btn_add_row = MacNormalButton(_tr('Add Row'), self)
+		btn_add_row.setFixedHeight(GREY_ROW_HEIGHT)
 		btn_add_row.clicked.connect(self._collection_add_row)
-		btn_delete_row = QPushButton('Delete Row', self)
-		btn_delete_row.setFixedHeight(20)
+		btn_delete_row = MacNormalButton(_tr('Delete Row'), self)
+		btn_delete_row.setFixedHeight(GREY_ROW_HEIGHT)
 		btn_delete_row.clicked.connect(self._collection_delete_row)
-		btn_row_up = QPushButton('Row ↑', self)
-		btn_row_up.setFixedHeight(20)
+		btn_row_up = MacNormalButton(_tr('Row ↑'), self)
+		btn_row_up.setFixedHeight(GREY_ROW_HEIGHT)
 		btn_row_up.clicked.connect(lambda: self._collection_move_row(-1))
-		btn_row_down = QPushButton('Row ↓', self)
-		btn_row_down.setFixedHeight(20)
+		btn_row_down = MacNormalButton(_tr('Row ↓'), self)
+		btn_row_down.setFixedHeight(GREY_ROW_HEIGHT)
 		btn_row_down.clicked.connect(lambda: self._collection_move_row(1))
 		
 		row_bar = QHBoxLayout()
@@ -6972,19 +8268,19 @@ end tell
 		row_bar.addWidget(btn_row_down)
 		#row_bar.addStretch()
 
-		btn_add_col = QPushButton('Add Col', self)
-		btn_add_col.setFixedHeight(20)
+		btn_add_col = MacNormalButton(_tr('Add Col'), self)
+		btn_add_col.setFixedHeight(GREY_ROW_HEIGHT)
 		btn_add_col.clicked.connect(self._collection_add_column)
-		btn_delete_col = QPushButton('Delete Col', self)
-		btn_delete_col.setFixedHeight(20)
+		btn_delete_col = MacNormalButton(_tr('Delete Col'), self)
+		btn_delete_col.setFixedHeight(GREY_ROW_HEIGHT)
 		btn_delete_col.clicked.connect(self._collection_delete_column)
-		btn_col_left = QPushButton('Col ←', self)
-		btn_col_left.setFixedHeight(20)
+		btn_col_left = MacNormalButton(_tr('Col ←'), self)
+		btn_col_left.setFixedHeight(GREY_ROW_HEIGHT)
 		btn_col_left.clicked.connect(lambda: self._collection_move_column(-1))
-		btn_col_right = QPushButton('Col →', self)
-		btn_col_right.setFixedHeight(20)
+		btn_col_right = MacNormalButton(_tr('Col →'), self)
+		btn_col_right.setFixedHeight(GREY_ROW_HEIGHT)
 		btn_col_right.clicked.connect(lambda: self._collection_move_column(1))
-		btn_rename_col = QPushButton('Rename Column', self)
+		btn_rename_col = MacNormalButton(_tr('Rename Column'), self)
 		btn_rename_col.clicked.connect(self._collection_rename_column)
 
 		col_bar = QHBoxLayout()
@@ -7000,14 +8296,14 @@ end tell
 		self.collect_date_edit.setCalendarPopup(True)
 		self.collect_date_edit.setDisplayFormat('yyyy-MM-dd')
 		self.collect_date_edit.setDate(QDate.currentDate())
-		self.collect_date_edit.setFixedHeight(20)
-		self.collect_date_edit.setToolTip('Choose Date')
+		self.collect_date_edit.setFixedHeight(GREY_ROW_HEIGHT)
+		self.collect_date_edit.setToolTip(_tr('Choose Date'))
 
 		self.collect_time_edit = QTimeEdit(self)
 		self.collect_time_edit.setDisplayFormat('HH:mm')
 		self.collect_time_edit.setTime(QTime.currentTime())
-		self.collect_time_edit.setFixedHeight(20)
-		self.collect_time_edit.setToolTip('Hover to open clock picker')
+		self.collect_time_edit.setFixedHeight(GREY_ROW_HEIGHT)
+		self.collect_time_edit.setToolTip(_tr('Hover to open clock picker'))
 		self.collect_time_edit.installEventFilter(self)
 
 		self.collect_clock_picker_popup = ClockPickerPopup()
@@ -7015,46 +8311,48 @@ end tell
 		self.collect_clock_picker_popup.time_changed.connect(lambda t: self.collect_time_edit.setTime(t))
 
 		self.collect_length_input = QLineEdit(self)
-		self.collect_length_input.setPlaceholderText('Length')
-		self.collect_length_input.setFixedHeight(20)
+		self.collect_length_input.setPlaceholderText(_tr('Length'))
+		self.collect_length_input.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.collect_length_unit = QComboBox(self)
+		self.collect_length_unit = compact_dropdown(self)
 		for label, factor in self._time_unit_items:
-			self.collect_length_unit.addItem(label, factor)
+			self.collect_length_unit.addItem(_tr(label), factor)
 		self.collect_length_unit.setCurrentIndex(self._time_unit_hours_index)
 		self.collect_length_unit.setFixedWidth(100)
-		self.collect_length_unit.setFixedHeight(20)
+		self.collect_length_unit.setFixedHeight(GREY_ROW_HEIGHT)
 
 		self.collect_repeat_input = QLineEdit(self)
-		self.collect_repeat_input.setPlaceholderText('Repeat')
-		self.collect_repeat_input.setFixedHeight(20)
+		self.collect_repeat_input.setPlaceholderText(_tr('Repeat'))
+		self.collect_repeat_input.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.collect_repeat_unit = QComboBox(self)
+		self.collect_repeat_unit = compact_dropdown(self)
 		for label, factor in self._repeat_unit_items:
-			self.collect_repeat_unit.addItem(label, factor)
+			self.collect_repeat_unit.addItem(_tr(label), factor)
 		self.collect_repeat_unit.setCurrentIndex(0)
 		self.collect_repeat_unit.setFixedWidth(100)
-		self.collect_repeat_unit.setFixedHeight(20)
+		self.collect_repeat_unit.setFixedHeight(GREY_ROW_HEIGHT)
 
-		self.collect_repeat_until_check = QCheckBox('Repeat until', self)
+		self.collect_repeat_until_check = QCheckBox(_tr('Repeat until'), self)
 		self.collect_repeat_until_check.setChecked(False)
 		self.collect_repeat_until_check.setFixedWidth(100)
 		self.collect_repeat_until_date = QDateEdit(self)
 		self.collect_repeat_until_date.setCalendarPopup(True)
 		self.collect_repeat_until_date.setDisplayFormat('yyyy-MM-dd')
 		self.collect_repeat_until_date.setDate(QDate.currentDate())
-		self.collect_repeat_until_date.setFixedHeight(20)
+		self.collect_repeat_until_date.setFixedHeight(GREY_ROW_HEIGHT)
 		self.collect_repeat_until_date.setEnabled(False)
 		self.collect_repeat_until_check.toggled.connect(lambda _: self._apply_repeat_until_enable(self.collect_repeat_until_check, self.collect_repeat_until_date))
 
-		btn_collect_copy = QPushButton('Copy to Time-sensitive list', self)
+		btn_collect_copy = MacNormalButton(_tr('Copy to Time-sensitive list'), self)
 		btn_collect_copy.clicked.connect(self._collect_copy_to_time)
-		btn_collect_copy.setFixedHeight(20)
+		btn_collect_copy.setFixedHeight(GREY_ROW_HEIGHT)
 
 		collect_time_row = QHBoxLayout()
 		collect_time_row.setContentsMargins(0, 0, 0, 0)
 		collect_time_row.addWidget(self.collect_date_edit)
 		collect_time_row.addWidget(self.collect_time_edit)
+		collect_end_row = self._end_time_row('collect', self.collect_date_edit, self.collect_time_edit,
+											 self.collect_length_input, self.collect_length_unit)
 		#collect_time_row.addWidget(btn_collect_copy)
 		#collect_time_row.addStretch()
 
@@ -7075,9 +8373,7 @@ end tell
 		# self.frame22.setFrameShape(QFrame.Shape.HLine)
 		# self.frame22.setFrameShadow(QFrame.Shadow.Sunken)
 
-		self.frame23 = QFrame(self)
-		self.frame23.setFrameShape(QFrame.Shape.HLine)
-		self.frame23.setFrameShadow(QFrame.Shadow.Sunken)
+		self.frame23 = panel_line(self)
 
 		mid_widget = QWidget()
 		mid_bar = QVBoxLayout()
@@ -7095,6 +8391,7 @@ end tell
 		mid_bar.addWidget(self.frame23)
 		mid_bar.addStretch()
 		mid_bar.addLayout(collect_time_row)
+		mid_bar.addLayout(collect_end_row)
 		mid_bar.addStretch()
 		mid_bar.addLayout(collect_length_row)
 		mid_bar.addLayout(collect_until_row)
@@ -7106,7 +8403,7 @@ end tell
 		right_widget = QWidget()
 		self.textiii1 = QTextEdit(self)
 		self.textiii1.setReadOnly(False)
-		self.textiii1.textChanged.connect(self.on_text_change)
+		self.textiii1.textChanged.connect(lambda: self._save_diary_box(self.textiii1))   # was on_text_change: that saved the Time page's box
 		self._register_diary_refresh(self.textiii1)
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
@@ -7133,21 +8430,12 @@ end tell
 		#b5.addWidget(t3, 2)
 		#b5.addWidget(t4, 2)
 		t5.setLayout(b5)
-		t5.setFixedHeight(int(self.height() / 2))
+		t5.setFixedHeight(EDIT_PANEL_COLUMNS_HEIGHT)
 
-		main_layout = QVBoxLayout()
-		#main_layout.setContentsMargins(20, 12, 20, 20)
-		main_layout.addWidget(splitter, 1)
-		main_layout.addLayout(search_bar)
-		main_layout.addWidget(t5)
+		style_table(self.collection_table)
+		self.collect_panel = edit_panel(search_bar, t5)
+		self.collect_stage = self._page_stage(self.collect_tab, splitter, self.collect_panel)
 
-		# main_layout.addLayout(file_bar)
-		# main_layout.addLayout(sort_bar)
-		# main_layout.addLayout(row_bar)
-		# main_layout.addLayout(col_bar)
-		# main_layout.addLayout(collect_time_row)
-		# main_layout.addLayout(collect_length_row)
-		self.collect_tab.setLayout(main_layout)
 
 		self._ensure_default_collection_file()
 		self._refresh_collection_files()
@@ -7176,7 +8464,7 @@ end tell
 			self.collection_table.setRowCount(0)
 			self.collection_table.setColumnCount(0)
 			self.collection_md_editor.setReadOnly(True)
-			self.collection_md_editor.setPlainText('No CSV found. Create one to get started.')
+			self.collection_md_editor.setPlainText(_tr('No CSV found. Create one to get started.'))
 			self.collection_file_combo.blockSignals(False)
 			return
 		if current_path and os.path.exists(current_path):
@@ -7255,7 +8543,7 @@ end tell
 		return headers
 
 	def _collection_new_file(self):
-		name, ok = QInputDialog.getText(self, 'New CSV', 'File name (without extension):')
+		name, ok = ask_text(self, _tr('New CSV'), _tr('File name (without extension):'))
 		if not ok or name.strip() == '':
 			return
 		name = name.strip()
@@ -7263,7 +8551,7 @@ end tell
 			name += '.csv'
 		target = os.path.join(self.fulldir_collection, name)
 		if os.path.exists(target):
-			QMessageBox.warning(self, 'File exists', 'A file with this name already exists.')
+			tomato_alert(self, _tr('File exists'), _tr('A file with this name already exists.'))
 			return
 		with open(target, 'w', encoding='utf-8', newline='') as csv_file:
 			csv_writer = csv.writer(csv_file)
@@ -7272,7 +8560,7 @@ end tell
 
 	def _collection_add_row(self):
 		if self.collection_table.columnCount() == 0:
-			QMessageBox.information(self, 'No columns', 'Add a column before inserting rows.')
+			tomato_alert(self, _tr('No columns'), _tr('Add a column before inserting rows.'))
 			return
 		row = self.collection_table.rowCount()
 		self.collection_table.insertRow(row)
@@ -7318,7 +8606,7 @@ end tell
 		self._collection_apply_search()
 
 	def _collection_add_column(self):
-		name, ok = QInputDialog.getText(self, 'Add Column', 'Column name:')
+		name, ok = ask_text(self, _tr('Add Column'), _tr('Column name:'))
 		if not ok:
 			return
 		name = name.strip() or f'Column {self.collection_table.columnCount() + 1}'
@@ -7378,7 +8666,7 @@ end tell
 		if col < 0:
 			return
 		current_name = self._collection_headers()[col]
-		name, ok = QInputDialog.getText(self, 'Rename Column', 'Column name:', text=current_name)
+		name, ok = ask_text(self, _tr('Rename Column'), _tr('Column name:'), text=current_name)
 		if not ok or name.strip() == '':
 			return
 		self.collection_table.setHorizontalHeaderItem(col, QTableWidgetItem(name.strip()))
@@ -7392,16 +8680,13 @@ end tell
 			return
 		if not os.path.exists(self.collection_current_file):
 			return
-		reply = QMessageBox.question(self, 'Delete CSV',
-									 f'Delete "{os.path.basename(self.collection_current_file)}"?',
-									 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-									 QMessageBox.StandardButton.No)
-		if reply != QMessageBox.StandardButton.Yes:
+		if not tomato_confirm(self, _tr('Delete CSV'),
+							  _tr('Delete "%n"?').replace('%n', os.path.basename(self.collection_current_file))):
 			return
 		try:
 			os.remove(self.collection_current_file)
 		except OSError as exc:
-			QMessageBox.warning(self, 'Delete failed', f'Cannot delete file:\n{exc}')
+			tomato_alert(self, _tr('Delete failed'), _tr('Cannot delete file:') + '\n' + str(exc))
 			return
 		self.collection_current_file = None
 		self._ensure_default_collection_file()
@@ -7411,22 +8696,20 @@ end tell
 		col_count = self.collection_table.columnCount()
 		if col_count == 0:
 			return
-		dialog = QDialog(self)
-		dialog.setWindowTitle('Column Visibility')
-		layout = QVBoxLayout(dialog)
+		dialog = GlassFormDialog(_tr('Column Visibility'), self)
 		list_widget = QListWidget(dialog)
+		list_widget.setItemDelegate(CheckRowDelegate(list_widget))
+		list_widget.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+		list_widget.setMouseTracking(True)
+		list_widget.setMinimumHeight(220)
 		for idx, header in enumerate(self._collection_headers()):
-			item = QListWidgetItem(header if header else f'Column {idx + 1}')
+			item = QListWidgetItem(header if header else _tr('Column %n').replace('%n', str(idx + 1)))
 			item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
 			item.setCheckState(Qt.CheckState.Unchecked if self.collection_table.isColumnHidden(idx)
 							   else Qt.CheckState.Checked)
 			item.setData(Qt.ItemDataRole.UserRole, idx)
 			list_widget.addItem(item)
-		buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=dialog)
-		buttons.accepted.connect(dialog.accept)
-		buttons.rejected.connect(dialog.reject)
-		layout.addWidget(list_widget)
-		layout.addWidget(buttons)
+		dialog.body.addWidget(list_widget)
 		if dialog.exec() == QDialog.DialogCode.Accepted:
 			for i in range(list_widget.count()):
 				item = list_widget.item(i)
@@ -7473,7 +8756,7 @@ end tell
 		self.collection_sort_column_combo.clear()
 		headers = self._collection_headers()
 		for idx, header in enumerate(headers):
-			label = header if header else f'Column {idx + 1}'
+			label = header if header else _tr('Column %n').replace('%n', str(idx + 1))
 			self.collection_sort_column_combo.addItem(label, idx)
 		self.collection_sort_column_combo.blockSignals(False)
 
@@ -7598,7 +8881,7 @@ end tell
 		if self.collection_table.rowCount() == 0 or row < 0:
 			self._collection_preview_updating = True
 			self.collection_md_editor.setReadOnly(True)
-			self.collection_md_editor.setPlainText('Select a row to view its Markdown.')
+			self.collection_md_editor.setPlainText(_tr('Select a row to view its Markdown.'))
 			self._collection_preview_updating = False
 			self._collection_last_markdown = self.collection_md_editor.toPlainText()
 			self._update_collection_html_preview()
@@ -7641,7 +8924,7 @@ end tell
 			self.collection_md_editor.setPlainText(self._collection_last_markdown)
 			self.collection_md_editor.blockSignals(False)
 			self._collection_preview_updating = False
-			QMessageBox.warning(self, 'Invalid Markdown', 'Please keep the \"# Header\" lines unchanged.')
+			tomato_alert(self, _tr('Invalid Markdown'), _tr('Please keep the "# Header" lines unchanged.'))
 			return
 		self._collection_table_block = True
 		for col, (_, value) in enumerate(sections):
@@ -7662,11 +8945,11 @@ end tell
 		if self._collection_preview_mode:
 			self._update_collection_html_preview()
 			self.collection_view_stack.setCurrentWidget(self.collection_md_preview)
-			self.collection_view_toggle_btn.setText('Edit')
+			self.collection_view_toggle_btn.setText(_tr('Edit'))
 			self._collection_apply_scroll_ratio(self.collection_md_preview, self._collection_scroll_ratio)
 		else:
 			self.collection_view_stack.setCurrentWidget(self.collection_md_editor)
-			self.collection_view_toggle_btn.setText('Preview')
+			self.collection_view_toggle_btn.setText(_tr('Preview'))
 			self._collection_apply_scroll_ratio(self.collection_md_editor, self._collection_scroll_ratio)
 		self._position_collection_toggle_button()
 		self.collection_view_toggle_btn.raise_()
@@ -7691,163 +8974,18 @@ end tell
 		margin = 12
 		btn = self.collection_view_toggle_btn
 		stack = self.collection_view_stack
-		btn.move(stack.width() - btn.width() - margin, stack.height() - btn.height() - margin)
+		btn.move(stack.width() - btn.width() - margin, margin)
 		btn.raise_()
 
 	def md2html(self, mdstr, pre_rendered_html=None):
-		extras = ['code-friendly', 'fenced-code-blocks', 'footnotes', 'tables', 'code-color', 'pyshell', 'nofollow',
-				  'cuddled-lists', 'header ids', 'strike', 'task_list', 'nofollow']
-
-		html = """
-		<html>
-		<head>
-		<meta content="text/html; charset=utf-8" http-equiv="content-type" />
-		<style>
-			.hll { background-color: #ffffcc }
-			.c { color: #0099FF; font-style: italic } /* Comment */
-			.err { color: #AA0000; background-color: #FFAAAA } /* Error */
-			.k { color: #006699; font-weight: bold } /* Keyword */
-			.o { color: #555555 } /* Operator */
-			.ch { color: #0099FF; font-style: italic } /* Comment.Hashbang */
-			.cm { color: #0099FF; font-style: italic } /* Comment.Multiline */
-			.cp { color: #009999 } /* Comment.Preproc */
-			.cpf { color: #0099FF; font-style: italic } /* Comment.PreprocFile */
-			.c1 { color: #0099FF; font-style: italic } /* Comment.Single */
-			.cs { color: #0099FF; font-weight: bold; font-style: italic } /* Comment.Special */
-			.gd { background-color: #FFCCCC; border: 1px solid #CC0000 } /* Generic.Deleted */
-			.ge { font-style: italic } /* Generic.Emph */
-			.gr { color: #FF0000 } /* Generic.Error */
-			.gh { color: #003300; font-weight: bold } /* Generic.Heading */
-			.gi { background-color: #CCFFCC; border: 1px solid #00CC00 } /* Generic.Inserted */
-			.go { color: #AAAAAA } /* Generic.Output */
-			.gp { color: #000099; font-weight: bold } /* Generic.Prompt */
-			.gs { font-weight: bold } /* Generic.Strong */
-			.gu { color: #003300; font-weight: bold } /* Generic.Subheading */
-			.gt { color: #99CC66 } /* Generic.Traceback */
-			.kc { color: #006699; font-weight: bold } /* Keyword.Constant */
-			.kd { color: #006699; font-weight: bold } /* Keyword.Declaration */
-			.kn { color: #006699; font-weight: bold } /* Keyword.Namespace */
-			.kp { color: #006699 } /* Keyword.Pseudo */
-			.kr { color: #006699; font-weight: bold } /* Keyword.Reserved */
-			.kt { color: #007788; font-weight: bold } /* Keyword.Type */
-			.m { color: #FF6600 } /* Literal.Number */
-			.s { color: #CC3300 } /* Literal.String */
-			.na { color: #330099 } /* Name.Attribute */
-			.nb { color: #336666 } /* Name.Builtin */
-			.nc { color: #00AA88; font-weight: bold } /* Name.Class */
-			.no { color: #336600 } /* Name.Constant */
-			.nd { color: #9999FF } /* Name.Decorator */
-			.ni { color: #999999; font-weight: bold } /* Name.Entity */
-			.ne { color: #CC0000; font-weight: bold } /* Name.Exception */
-			.nf { color: #CC00FF } /* Name.Function */
-			.nl { color: #9999FF } /* Name.Label */
-			.nn { color: #00CCFF; font-weight: bold } /* Name.Namespace */
-			.nt { color: #330099; font-weight: bold } /* Name.Tag */
-			.nv { color: #003333 } /* Name.Variable */
-			.ow { color: #000000; font-weight: bold } /* Operator.Word */
-			.w { color: #bbbbbb } /* Text.Whitespace */
-			.mb { color: #FF6600 } /* Literal.Number.Bin */
-			.mf { color: #FF6600 } /* Literal.Number.Float */
-			.mh { color: #FF6600 } /* Literal.Number.Hex */
-			.mi { color: #FF6600 } /* Literal.Number.Integer */
-			.mo { color: #FF6600 } /* Literal.Number.Oct */
-			.sa { color: #CC3300 } /* Literal.String.Affix */
-			.sb { color: #CC3300 } /* Literal.String.Backtick */
-			.sc { color: #CC3300 } /* Literal.String.Char */
-			.dl { color: #CC3300 } /* Literal.String.Delimiter */
-			.sd { color: #CC3300; font-style: italic } /* Literal.String.Doc */
-			.s2 { color: #CC3300 } /* Literal.String.Double */
-			.se { color: #CC3300; font-weight: bold } /* Literal.String.Escape */
-			.sh { color: #CC3300 } /* Literal.String.Heredoc */
-			.si { color: #AA0000 } /* Literal.String.Interpol */
-			.sx { color: #CC3300 } /* Literal.String.Other */
-			.sr { color: #33AAAA } /* Literal.String.Regex */
-			.s1 { color: #CC3300 } /* Literal.String.Single */
-			.ss { color: #FFCC33 } /* Literal.String.Symbol */
-			.bp { color: #336666 } /* Name.Builtin.Pseudo */
-			.fm { color: #CC00FF } /* Name.Function.Magic */
-			.vc { color: #003333 } /* Name.Variable.Class */
-			.vg { color: #003333 } /* Name.Variable.Global */
-			.vi { color: #003333 } /* Name.Variable.Instance */
-			.vm { color: #003333 } /* Name.Variable.Magic */
-			.il { color: #FF6600 } /* Literal.Number.Integer.Long */
-			table {
-					font-family: verdana,arial,sans-serif;
-					font-size:11px;
-					color:#333333;
-					border-width: 1px;
-					border-color: #999999;
-					border-collapse: collapse;
-					}
-			th {
-				background:#b5cfd2 url('cell-blue.jpg');
-				border-width: 1px;
-				padding: 8px;
-				border-style: solid;
-				border-color: #999999;
-				}
-			td {
-				background:#dcddc0 url('cell-grey.jpg');
-				border-width: 1px;
-				padding: 8px;
-				border-style: solid;
-				border-color: #999999;
-				}
-		</style>
-		</head>
-		<body>
-			%s
-		</body>
-		</html>
-		"""
-		if pre_rendered_html is None:
-			clean_one = mdstr.replace('\\(', '$').replace('\\)', '$').replace('\\[', '$').replace('\\]', '$')
-			clean_two = re.sub(r'\$(.*?)\$', lambda m: '$' + re.sub(r'[\n\t ]+', '', m.group(1)) + '$', clean_one,
-							   flags=re.DOTALL)
-			clean_three = re.sub(r'\|(\n(\t)*\n(\t)*)\|', '|\n|', clean_two)
-			ret = markdown2.markdown(clean_three, extras=extras)
-		else:
-			ret = pre_rendered_html
-		middlehtml = html % ret
-		html_content = """
-		<!DOCTYPE html>
-		<html lang="en">
-		<head>
-			<style>
-				body {
-					margin-right: 20px;
-					font-size: 14px;
-					padding: 0;
-					background-color: #F3F2EE;
-				}
-			</style>
-			<meta charset="UTF-8">
-			<meta name="viewport" content="width=device-width, initial-scale=1.0">
-			<script
-				src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.1/MathJax.js?config=TeX-MML-AM_CHTML">
-			</script>   
-		</head>
-		<body>
-			%s
-			<script type='text/x-mathjax-config'>
-			MathJax.Hub.Config({
-				displayAlign: 'left',
-				displayIndent: '4em',
-				tex2jax: {
-					inlineMath: [['$','$'], ['\\\\(','\\\\)']],
-					displayMath: [['$$','$$'], ['\\[','\\]']]
-				},
-				TeX:{
-					equationNumbers:{
-						autoNumber:"AMS"
-					}
-				}
-			});
-			</script>
-		</body>
-		</html>
-		""" % middlehtml
-		return html_content
+		"""The Collection page's preview page. Formulas vs. the dollar sign, the newer Markdown forms
+		(==highlight==, task lists, "+ " lists), the style sheet and the MathJax part come from
+		markdown_preview.py (the copy shared with Watermelon and Strawberry; the formula part is Broccoli's code).
+		2026-11-20, Ryan: "渲染…该更新的就更新"; "Tomato 的也跟着一起改" (formulas typeset: the preview is a web page)."""
+		body = markdown_preview.render_markdown_body(mdstr) if pre_rendered_html is None else pre_rendered_html
+		return markdown_preview.preview_page(
+			body, font_family='Helvetica Neue', font_size=14, background='#F3F2EE', text_color='#000000', dark=False,
+			extra_css='    body { margin: 8px 20px 8px 8px; line-height: 1.5; }')
 
 	def _open_collection_dir(self):
 		if os.path.isdir(self.fulldir_collection):
@@ -7859,34 +8997,34 @@ end tell
 	def _collect_copy_to_time(self):
 		row = self.collection_table.currentRow()
 		if row < 0:
-			QMessageBox.information(self, 'Select a row', 'Please select a row in the table first.')
+			tomato_alert(self, _tr('Select a row'), _tr('Please select a row in the table first.'))
 			return
 		name_item = self.collection_table.item(row, 0)
 		if name_item is None or name_item.text().strip() == '':
-			QMessageBox.warning(self, 'Missing name', 'The first column is empty. Please provide a task name.')
+			tomato_alert(self, _tr('Missing name'), _tr('The first column is empty. Please provide a task name.'))
 			return
 		item_name = name_item.text().strip()
 		selected_date = self.collect_date_edit.date()
 		selected_time = self.collect_time_edit.time()
 		if not (selected_date.isValid() and selected_time.isValid()):
-			QMessageBox.warning(self, 'Missing time', 'Please choose a valid date and time.')
+			tomato_alert(self, _tr('Missing time'), _tr('Please choose a valid date and time.'))
 			return
 		time_text = f"{selected_date.toString('yyyy-MM-dd')} {selected_time.toString('HH:mm')}"
 		try:
 			stamp_value = str(self.to_stamp(time_text))
 		except Exception:
-			QMessageBox.warning(self, 'Invalid time', 'Please choose a valid date and time.')
+			tomato_alert(self, _tr('Invalid time'), _tr('Please choose a valid date and time.'))
 			return
 		length_hours = self._convert_value_to_hours(self.collect_length_input.text(), self.collect_length_unit)
 		if length_hours is None:
-			QMessageBox.warning(self, 'Invalid length', 'Please enter a valid length.')
+			tomato_alert(self, _tr('Invalid length'), _tr('Please enter a valid length.'))
 			return
 		repeat_hours = '-'
 		repeat_text = self.collect_repeat_input.text().strip()
 		if repeat_text != '':
 			repeat_hours = self._convert_value_to_hours(repeat_text, self.collect_repeat_unit)
 			if repeat_hours is None:
-				QMessageBox.warning(self, 'Invalid repeat', 'Please enter a valid repeat interval.')
+				tomato_alert(self, _tr('Invalid repeat'), _tr('Please enter a valid repeat interval.'))
 				return
 		repeat_until = self._get_repeat_until_stamp(self.collect_repeat_until_check, self.collect_repeat_until_date)
 		new_row = [
@@ -8124,6 +9262,26 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		self.orderType = Qt.SortOrder.AscendingOrder
 		self.tableWidget_memo.sortByColumn(8, self.orderType)
 
+	def _refresh_on_program_change(self, edit, refresh):
+		"""`refresh` (the page's table read in again) when the program sets the box — the "setText('-');
+		clear()" after Add / Done — but not on every key typed into it. Before 2026-11-22 each key read the
+		whole table in twice and flipped its filter through "nothing chosen", which hid every row for a
+		moment and pulled the table's scroll bar up (Ryan: "输入一些文字它就会不停地把这个滚动条往上跑").
+		Typing sends textEdited before textChanged; setText sends textChanged only."""
+		typed = [False]
+
+		def edited(_text):
+			typed[0] = True
+
+		def changed(_text):
+			if typed[0]:
+				typed[0] = False
+				return
+			refresh()
+
+		edit.textEdited.connect(edited)
+		edit.textChanged.connect(changed)
+
 	def memo_refresh(self):
 		nowindex = self.widget2.currentIndex()
 		if nowindex == 0:
@@ -8227,19 +9385,7 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		self.lm1.clear()
 
 	def memo_text_change(self):
-		if self._suppress_diary_write:
-			return
-		if self.textii3.toPlainText() != '':
-			ISOTIMEFORMAT = '%Y-%m-%d diary'
-			theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
-			diary_name = str(theTime) + ".md"
-			diary_file = os.path.join(self.fulldir_dia, diary_name)
-			if not os.path.exists(diary_file):
-				with open(diary_file, 'a', encoding='utf-8') as f0:
-					f0.write(f'# {theTime}')
-			new_content = self.textii3.toPlainText()
-			with open(diary_file, 'w', encoding='utf-8') as f0:
-				f0.write(new_content)
+		self._save_diary_box(self.textii3)
 
 	def _memo_done_single(self):
 		if self.tableWidget_memo.currentItem() != None and self.tableWidget_memo.item(self.tableWidget_memo.currentRow(), 4).text() == 'UNDONE':
@@ -8432,13 +9578,6 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 
 			target_width = int(screen_geom.width() / 2)
 			btna4.setChecked(True)
-			accent = get_accent_color_hex()
-			self.btn_00.setStyleSheet(f'''
-						border: 1px outset grey;
-						background-color: {accent};
-						border-radius: 4px;
-						padding: 1px;
-						color: #FFFFFF''')
 			self.tab_bar.setVisible(True)
 			self.setMinimumSize(0, 0)
 			self.setMaximumSize(16777215, 16777215)
@@ -8448,17 +9587,11 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 			target_y = 0
 		if self.i % 2 == 0: # hide
 			btna4.setChecked(False)
-			self.btn_00.setStyleSheet('''
-						border: 1px outset grey;
-						background-color: #FFFFFF;
-						border-radius: 4px;
-						padding: 1px;
-						color: #000000''')
 			self.tab_bar.setVisible(False)
-			self.move(self.width() + 3, int((DE_HEIGHT - 70) / 2))
+			self.move(self.width() + 3, self._strip_top(screen_geom))
 			self.setFixedSize(self.new_width, 120)
 			target_x = 0
-			target_y = int((DE_HEIGHT - 70) / 2)
+			target_y = self._strip_top(screen_geom)
 
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
@@ -8625,13 +9758,6 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 
 			target_width = int(screen_geom.width() / 2)
 			btna4.setChecked(True)
-			accent = get_accent_color_hex()
-			self.btn_00.setStyleSheet(f'''
-						border: 1px outset grey;
-						background-color: {accent};
-						border-radius: 4px;
-						padding: 1px;
-						color: #FFFFFF''')
 			self.tab_bar.setVisible(True)
 			self.setMinimumSize(0, 0)
 			self.setMaximumSize(16777215, 16777215)
@@ -8641,17 +9767,11 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 			target_y = 0
 		if self.i % 2 == 0:
 			btna4.setChecked(False)
-			self.btn_00.setStyleSheet('''
-						border: 1px outset grey;
-						background-color: #FFFFFF;
-						border-radius: 4px;
-						padding: 1px;
-						color: #000000''')
 			self.tab_bar.setVisible(False)
 			self.resize(self.new_width, 120)
-			self.move(self.width() + 3, int((DE_HEIGHT - 70) / 2))
+			self.move(self.width() + 3, self._strip_top(screen_geom))
 			target_x = 0
-			target_y = int((DE_HEIGHT - 70) / 2)
+			target_y = self._strip_top(screen_geom)
 
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
@@ -8815,9 +9935,1255 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 				self.auto_record_thread.stop()
 				self.auto_record_thread = None
 
+	# ── right-click a table row = the quick-edit card (style book 5.12, 2026-11-22) ──────────────────────
+	# Ryan 2026-11-22: "选中了这一项之后呢……右键……弹出一个小小的框……在这个被点击的边上……包含这个事情的名称……
+	# 时间……时长，所有那些我们一开始设置的那些框框……以比较快的速度去修改". The card holds the boxes the page
+	# adds an item with; Save goes the way an edit of the table's cells goes (Reminders / Calendar follow,
+	# a repeating item's time still asks "only this one / this and later ones").
+	def _install_quick_edit(self):
+		self._quick_edit_card = None
+		for table, kind in ((self.tableWidget, 'time'), (self.tableWidget_freq, 'freq'),
+							(self.tableWidget_memo, 'memo'), (self.collection_table, 'collect')):
+			table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+			table.customContextMenuRequested.connect(lambda pos, t=table, k=kind: self._open_quick_edit(t, k, pos))
+
+	def _quick_edit_open(self):
+		card = getattr(self, '_quick_edit_card', None)
+		return card is not None and card.isVisible()
+
+	def _unit_for_hours(self, hours, items, fallback_index):
+		"""(unit index, value text) that shows `hours` as a whole number when one unit can (2 days, 30
+		minutes), else in hours."""
+		for index in sorted(range(len(items)), key=lambda i: -(items[i][1] or 0)):
+			factor = items[index][1]
+			if not factor:
+				continue
+			value = hours / float(factor)
+			if value >= 1 and abs(value - round(value)) < 1e-6:
+				return index, str(int(round(value)))
+		factor = items[fallback_index][1] or 1
+		return fallback_index, tomato_ui._format_length(hours / float(factor))
+
+	def _quick_number_row(self, card, text, unit_items, unit_index, placeholder, hours_text):
+		"""A number box + its unit drop-down, filled from an hours value ('-' = empty)."""
+		edit = QLineEdit(card)
+		edit.setFixedHeight(GREY_ROW_HEIGHT)
+		edit.setPlaceholderText(placeholder)
+		unit = compact_dropdown(card)
+		for label, factor in unit_items:
+			unit.addItem(_tr(label), factor)
+		unit.setFixedWidth(100)
+		unit.setCurrentIndex(unit_index)
+		try:
+			hours = float(hours_text)
+		except (TypeError, ValueError):
+			hours = None
+		if hours is not None and hours > 0:
+			index, value = self._unit_for_hours(hours, unit_items, self._time_unit_hours_index)
+			unit.setCurrentIndex(index)
+			edit.setText(value)
+		return edit, unit
+
+	def _style_card_boxes(self, card):
+		for field in card.findChildren(QDateEdit):
+			style_date_time_field(field, 'calendar')
+			glass_calendar_popup(field)
+		for field in card.findChildren(QTimeEdit):
+			style_date_time_field(field, 'clock')
+
+	def _open_quick_edit(self, table, kind, pos):
+		row = table.rowAt(pos.y())
+		if row < 0 or table.isRowHidden(row) or getattr(self, '_sync_counter', 0) > 0:
+			return None
+		if kind == 'collect' and table.columnCount() == 0:
+			return None
+		if self._quick_edit_open():
+			self._quick_edit_card.reject()
+		table.selectRow(row)
+		card = QuickEditCard(_tr('Edit item'), self)
+		builder = {'time': self._quick_time_fields, 'freq': self._quick_freq_fields,
+				   'memo': self._quick_memo_fields, 'collect': self._quick_collect_fields}[kind]
+		if not builder(card, table, row):
+			card.deleteLater()
+			return None
+		self._style_card_boxes(card)
+		card.allowed_windows = [tomato_ui.calendar_popup()] + list(getattr(card, '_clocks', []))
+		card.finished.connect(lambda _result, c=card: self._quick_edit_closed(c))
+		cell = table.visualRect(table.model().index(row, 0))
+		viewport = table.viewport()
+		row_rect = QRect(viewport.mapToGlobal(QPoint(0, cell.top())), QSize(viewport.width(), cell.height()))
+		card.place_at(row_rect, viewport.mapToGlobal(pos).x())
+		self._quick_edit_card = card
+		card.show()
+		card.raise_()
+		card.activateWindow()
+		first = getattr(card, '_first_box', None)
+		if first is not None:
+			first.setFocus()
+			first.selectAll()
+		return card
+
+	def _quick_edit_closed(self, card):
+		for time_edit in card.findChildren(QTimeEdit):
+			self._detach_clock(time_edit)
+		if getattr(self, '_quick_edit_card', None) is card:
+			self._quick_edit_card = None
+		card.deleteLater()
+
+	def _quick_name_box(self, card, text):
+		name = QLineEdit(card)
+		name.setFixedHeight(GREY_ROW_HEIGHT)
+		name.setPlaceholderText(_tr('Item'))
+		name.setText(text)
+		card._first_box = name
+		card.body.addWidget(name)
+		return name
+
+	@staticmethod
+	def _hbox(*widgets, stretch_last=False):
+		row = QHBoxLayout()
+		row.setContentsMargins(0, 0, 0, 0)
+		for widget in widgets:
+			if isinstance(widget, int):
+				row.addStretch(widget)
+			else:
+				row.addWidget(widget)
+		return row
+
+	def _cell_text(self, table, row, column, default='-'):
+		item = table.item(row, column)
+		return item.text() if item is not None and item.text() != '' else default
+
+	def _quick_time_fields(self, card, table, row):
+		name_text = self._cell_text(table, row, 0, '')
+		time_text = self._cell_text(table, row, 1, '')
+		if not self._time_text_ok(time_text):
+			return False
+		stamp = self._stamp_from_items(table.item(row, 8), table.item(row, 1))
+		card._key = (name_text, stamp)
+		card._old = {0: name_text, 1: time_text, 2: self._cell_text(table, row, 2), 3: self._cell_text(table, row, 3),
+					 6: self._cell_text(table, row, 6)}
+		name = self._quick_name_box(card, name_text)
+		start = datetime.datetime.strptime(time_text, '%Y-%m-%d %H:%M')
+		start_date = QDateEdit(card)
+		start_date.setDisplayFormat('yyyy-MM-dd')
+		start_date.setDate(QDate(start.year, start.month, start.day))
+		start_date.setFixedSize(118, GREY_ROW_HEIGHT)
+		start_date.setToolTip(_tr('Choose Date'))
+		start_time = QTimeEdit(card)
+		start_time.setDisplayFormat('HH:mm')
+		start_time.setTime(QTime(start.hour, start.minute))
+		start_time.setFixedSize(76, GREY_ROW_HEIGHT)
+		start_time.setToolTip(_tr('Hover to open clock picker'))
+		length, length_unit = self._quick_number_row(card, card._old[2], self._time_unit_items, self._time_unit_hours_index,
+													 _tr('Length'), card._old[2])
+		repeat, repeat_unit = self._quick_number_row(card, card._old[3], self._repeat_unit_items,
+													 self._time_unit_hours_index + 1, _tr('Repeat'), card._old[3])
+		arrow, end_date, end_time = end_time_boxes(card, start_date, start_time)
+		card._clocks = [self._attach_clock(start_time), self._attach_clock(end_time)]
+		card._link = EndTimeLink(start_date, start_time, length, length_unit, end_date, end_time, self._time_unit_hours_index)
+		until_check = QCheckBox(_tr('Repeat until'), card)
+		until_date = QDateEdit(card)
+		until_date.setDisplayFormat('yyyy-MM-dd')
+		until_date.setFixedSize(118, GREY_ROW_HEIGHT)
+		until_stamp = card._old[6]
+		try:
+			until = datetime.datetime.fromtimestamp(float(until_stamp))
+			until_date.setDate(QDate(until.year, until.month, until.day))
+			until_check.setChecked(True)
+		except (TypeError, ValueError, OverflowError, OSError):
+			until_date.setDate(QDate.currentDate())
+			until_check.setChecked(False)
+		until_date.setEnabled(until_check.isChecked())
+		until_check.toggled.connect(lambda _on: self._apply_repeat_until_enable(until_check, until_date))
+		card.body.addLayout(self._hbox(start_date, start_time, arrow, end_date, end_time, 1))
+		row3 = self._hbox(length, length_unit, repeat, repeat_unit)
+		row3.setStretch(0, 1)
+		row3.setStretch(2, 1)
+		card.body.addLayout(row3)
+		card.body.addLayout(self._hbox(until_check, until_date, 1))
+		card._boxes = dict(name=name, start_date=start_date, start_time=start_time, length=length, length_unit=length_unit,
+						   repeat=repeat, repeat_unit=repeat_unit, until_check=until_check, until_date=until_date)
+		card.validate = lambda c=card: self._quick_time_values(c)[1]
+		card.accepted.connect(lambda c=card: self._save_quick_time(c))
+		return True
+
+	def _quick_time_values(self, card):
+		"""({column: new text}, problem text)."""
+		box = card._boxes
+		name = box['name'].text().replace('\n', ' ').strip()
+		if not name:
+			return {}, _tr('Please enter the item name.')
+		when = '%s %s' % (box['start_date'].date().toString('yyyy-MM-dd'), box['start_time'].time().toString('HH:mm'))
+		old_length = card._old[2]
+		if box['length'].text().strip() == '' and old_length in ('', '-'):
+			length = old_length
+		else:
+			length = self._convert_value_to_hours(box['length'].text(), box['length_unit'])
+			if length is None:
+				return {}, _tr('Please enter a valid length.')
+		repeat = '-'
+		if box['repeat'].text().strip() not in ('', '-'):
+			repeat = self._convert_value_to_hours(box['repeat'].text(), box['repeat_unit'])
+			if repeat is None:
+				return {}, _tr('Please enter a valid repeat.')
+		until = self._get_repeat_until_stamp(box['until_check'], box['until_date'])
+		return {0: name, 1: when, 2: str(length), 3: str(repeat), 6: until}, ''
+
+	def _save_quick_time(self, card):
+		values, problem = self._quick_time_values(card)
+		if problem:
+			return
+		self._apply_time_changes(card._key, values)
+
+	def _apply_time_changes(self, key, values):
+		"""{column: new text} for the row (name, stamp), one cell at a time through the same path as an edit by hand."""
+		name, stamp = key
+		keep_repeat, keep_comment = self.le4.text(), self.textw1.toPlainText()     # an edit's save empties these
+		stamps = [stamp]
+		for column in (0, 1, 2, 3, 6):
+			if column not in values:
+				continue
+			new = values[column]
+			row = None
+			for candidate in stamps:
+				row = self._find_time_row_by_key(name, candidate)
+				if row is not None:
+					break
+			if row is None:
+				logging.warning('Quick edit: the row of %r is gone; the rest is not saved.', name)
+				break
+			item = self.tableWidget.item(row, column)
+			if item is None:
+				item = QTableWidgetItem('')
+				item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
+				self.tableWidget.setItem(row, column, item)
+			if item.text() == new:
+				continue
+			self._on_table_edit_started(row, column)
+			item.setText(new)
+			self.write_table_time()
+			if column == 0:
+				name = new
+			elif column == 1:
+				stamps = [self._normalize_stamp(self.to_stamp(new)), stamp]
+		self.le4.setText(keep_repeat)
+		if keep_comment:
+			self.textw1.setPlainText(keep_comment)
+
+	def _find_row_of(self, table, kind, name, stamp):
+		for row in range(table.rowCount()):
+			type_item, name_item = table.item(row, 7), table.item(row, 0)
+			if type_item is None or name_item is None or type_item.text() != kind:
+				continue
+			if name_item.text() == name and self._stamp_from_items(table.item(row, 8), table.item(row, 1)) == stamp:
+				return row
+		return None
+
+	def _quick_freq_fields(self, card, table, row):
+		name_text = self._cell_text(table, row, 0, '')
+		card._key = (name_text, self._stamp_from_items(table.item(row, 8), table.item(row, 1)))
+		name = self._quick_name_box(card, name_text)
+		target, progress = QLineEdit(card), QLineEdit(card)
+		for box, value, hint in ((target, self._cell_text(table, row, 5), _tr('Target times')),
+								 (progress, self._cell_text(table, row, 6), _tr('Done times'))):
+			box.setFixedHeight(GREY_ROW_HEIGHT)
+			box.setPlaceholderText(hint)
+			box.setToolTip(hint)
+			box.setText('' if value == '-' else value)
+		card.body.addLayout(self._hbox(target, progress))
+		card._boxes = dict(name=name, target=target, progress=progress)
+		card.validate = lambda c=card: self._quick_freq_values(c)[1]
+		card.accepted.connect(lambda c=card: self._save_quick_freq(c))
+		return True
+
+	def _quick_freq_values(self, card):
+		box = card._boxes
+		name = box['name'].text().replace('\n', ' ').strip()
+		if not name:
+			return {}, _tr('Please enter the item name.')
+		numbers = []
+		for key in ('target', 'progress'):
+			text = box[key].text().strip() or '0'
+			if not text.isdigit():
+				return {}, _tr('Target and done times must be whole numbers.')
+			numbers.append(str(int(text)))
+		return {0: name, 5: numbers[0], 6: numbers[1]}, ''
+
+	def _save_quick_freq(self, card):
+		values, problem = self._quick_freq_values(card)
+		if problem:
+			return
+		self._apply_freq_changes(card._key, values)
+
+	def _apply_freq_changes(self, key, values):
+		name, stamp = key
+		for column in (0, 5, 6):
+			if column not in values:
+				continue
+			row = self._find_row_of(self.tableWidget_freq, 'FREQ_SNS', name, stamp)
+			if row is None:
+				break
+			item = self.tableWidget_freq.item(row, column)
+			if item is None or item.text() == values[column]:
+				continue
+			self._on_freq_edit_started(row, column)
+			item.setText(values[column])
+			self.freq_write_time()
+			if column == 0:
+				name = values[0]
+
+	def _quick_memo_fields(self, card, table, row):
+		name_text = self._cell_text(table, row, 0, '')
+		card._key = (name_text, self._stamp_from_items(table.item(row, 8), table.item(row, 1)))
+		name = self._quick_name_box(card, name_text)
+		card._boxes = dict(name=name)
+		card.validate = lambda c=card: '' if c._boxes['name'].text().strip() else _tr('Please enter the item name.')
+		card.accepted.connect(lambda c=card: self._save_quick_memo(c))
+		return True
+
+	def _save_quick_memo(self, card):
+		self._apply_memo_name(card._key, card._boxes['name'].text())
+
+	def _apply_memo_name(self, key, new):
+		new = new.replace('\n', ' ').strip()
+		name, stamp = key
+		row = self._find_row_of(self.tableWidget_memo, 'MEMO_SNS', name, stamp)
+		if not new or row is None:
+			return
+		item = self.tableWidget_memo.item(row, 0)
+		if item is None or item.text() == new:
+			return
+		self._on_memo_edit_started(row, 0)
+		item.setText(new)
+		self.memo_click_write()
+
+	def _quick_collect_fields(self, card, table, row):
+		from PyQt6.QtWidgets import QGridLayout
+		grid = QGridLayout()
+		grid.setContentsMargins(0, 0, 0, 0)
+		grid.setHorizontalSpacing(8)
+		grid.setVerticalSpacing(6)
+		boxes = []
+		for column, header in enumerate(self._collection_headers()):
+			label = QLabel(header, card)
+			label.setStyleSheet('color: #8E8E93; font-size: 12px; background: transparent;')
+			label.setMaximumWidth(120)
+			box = QLineEdit(card)
+			box.setFixedHeight(GREY_ROW_HEIGHT)
+			box.setText(self._collection_item_text(row, column))
+			grid.addWidget(label, column, 0)
+			grid.addWidget(box, column, 1)
+			boxes.append(box)
+		card.body.addLayout(grid)
+		card._first_box = boxes[0] if boxes else None
+		card._row = row
+		card._boxes = boxes
+		card.validate = lambda c=card: ''
+		card.accepted.connect(lambda c=card: self._save_quick_collect(c))
+		return bool(boxes)
+
+	def _save_quick_collect(self, card):
+		row = card._row
+		if not (0 <= row < self.collection_table.rowCount()):
+			return
+		changed = False
+		self._collection_table_block = True
+		try:
+			for column, box in enumerate(card._boxes):
+				if column >= self.collection_table.columnCount():
+					break
+				item = self.collection_table.item(row, column)
+				if item is None:
+					item = QTableWidgetItem('')
+					self.collection_table.setItem(row, column, item)
+				if item.text() != box.text():
+					item.setText(box.text())
+					changed = True
+		finally:
+			self._collection_table_block = False
+		if changed:
+			self._save_collection_file()
+			self._update_collection_markdown_preview()
+
+	# ── what Broccoli's background vision saw, into the diary (tomato_feed.py, 2026-11-23) ───────────────
+	VISION_LINE_MAX_CHARS = 80      # Ryan: "不要写太长吧，就简短一点就好"
+
+	def _start_feed_watcher(self, data_dir=None):
+		if self._feed_watcher is not None:
+			return
+		data_dir = data_dir if data_dir is not None else tomato_broccoli.broccoli_data_dir()
+		if not os.path.isdir(data_dir):
+			return                          # no Broccoli on this Mac: nothing to wait for (looked at again at the next start)
+		self._feed_watcher = tomato_feed.make_watcher(
+			data_dir, lambda: self._app_settings.get('feed_state'), self._save_feed_state, self._feed_arrived, self)
+
+	def _save_feed_state(self, state):
+		if self._app_settings.get('feed_state') != state:
+			self._app_settings['feed_state'] = state
+			self._save_app_settings()
+
+	def _feed_arrived(self, entries):
+		"""One line per look, at the time of the look (Ryan: "多久有一次视觉，那就是多久记一次"). Switched off in the
+		menu: the entries are passed over, not kept for later. Only today's and yesterday's are written."""
+		if not self._app_settings.get('vision_to_diary', True):
+			return
+		oldest = datetime.datetime.now() - datetime.timedelta(days=1)
+		wrote = False
+		for entry in entries:
+			when = tomato_feed.entry_time(entry)
+			if entry.get('kind') != 'vision' or when < oldest:
+				continue
+			tomato_diary.append_line(self.fulldir_dia, tomato_diary.VISION_MARK + ' ' + entry['text'], when, self.VISION_LINE_MAX_CHARS + 2)
+			wrote = True
+		if wrote:
+			self._refresh_unfocused_diary_boxes()
+
+	def set_vision_to_diary(self, checked):
+		self._app_settings['vision_to_diary'] = bool(checked)
+		self._save_app_settings()
+
+	# ── the reports (tomato_report.py, 2026-11-23; weekly / monthly and the report language 2026-11-24) ──────────
+	# The numbers are Tomato's own and always there; the written part comes from Broccoli when it is on this Mac.
+	# Reports are due at 23:30 (one single-shot timer set for that moment, as the Broccoli link does — nothing
+	# looks at the clock in between) and, for one that was missed, at the next start.
+	REPORT_WAIT_SECONDS = 15 * 60
+
+	def _report_labels(self):
+		return {'title': _tr('Daily report'), 'title_week': _tr('Weekly report'), 'title_month': _tr('Monthly report'),
+				'apps': _tr('Time per app'), 'timeline': _tr('Timeline'), 'also': _tr('also'),
+				'taken': _tr('From the Collections'), 'total': _tr('Total'), 'items': _tr('Items'), 'notes': _tr('Own notes'),
+				'numbers': _tr('The numbers'), 'nothing': _tr('Nothing was recorded on this day.'),
+				'nothing_period': _tr('Nothing was recorded in this period.'), 'app': _tr('App'), 'length': _tr('Length'),
+				'per_day': _tr('Day by day'), 'day': _tr('Day'), 'mostly': _tr('Mostly')}
+
+	def _report_facts(self, day):
+		now = datetime.datetime.now()
+		end = now.hour * 3600 + now.minute * 60 + now.second if day == tomato_diary.day_name() else None
+		return tomato_report.build_facts(tomato_diary.read(self.fulldir_dia, day), self.fulldir_collection, end)
+
+	def _report_period_facts(self, kind, key):
+		return tomato_report.period_facts(kind, key, self._report_facts)
+
+	def report_auto(self):
+		return bool(self._app_settings.get('daily_report', True))
+
+	def set_report_auto(self, on):
+		self._app_settings['daily_report'] = bool(on)
+		self._save_app_settings()
+		self._report_time_came()
+
+	def report_languages(self):
+		"""(the languages the person keeps, the one in use). Until one is picked: the one of the interface."""
+		languages = tomato_report.normalize_languages(self._app_settings.get('report_languages'))
+		current = ' '.join(str(self._app_settings.get('report_language') or '').split())
+		if current not in languages:
+			current = tomato_report.default_language(UI_LANGUAGE, languages)
+		return languages, current
+
+	def set_report_language(self, language):
+		languages, _current = self.report_languages()
+		if language in languages and self._app_settings.get('report_language') != language:
+			self._app_settings['report_language'] = language
+			self._save_app_settings()
+
+	def set_report_languages(self, languages, current):
+		languages = tomato_report.normalize_languages(languages)
+		self._app_settings['report_languages'] = languages
+		self._app_settings['report_language'] = current if current in languages else languages[0]
+		self._save_app_settings()
+
+	def _report_time_came(self):
+		"""23:30 came, Tomato started, or the switch was turned: make the reports that are due, set the timer for
+		the next 23:30 (a far time is approached in steps; waking up late still lands here)."""
+		self._report_timer.stop()
+		if not self.report_auto():
+			return
+		try:
+			for kind, key in tomato_report.due_reports(TOMATO_DATA_DIR, self.fulldir_dia):
+				self.make_report(kind, key)
+		except Exception:
+			logging.exception('The reports could not be made.')
+		self._report_timer.start(int(min(tomato_report.seconds_to_next() + 2, 6 * 3600) * 1000))
+
+	def make_report(self, kind, key=None):
+		"""The numbers at once; then, with Broccoli on this Mac, the written part is asked for in the background.
+		(make_report(day) alone = that day's daily report.)"""
+		if key is None:
+			kind, key = 'day', kind
+		kind = tomato_report.kind_of(kind)
+		key = tomato_report.valid_key(kind, key)
+		if not key:
+			return False
+		facts = self._report_period_facts(kind, key)
+		if facts['empty']:
+			return False
+		_languages, language = self.report_languages()
+		template, own = tomato_report.read_template(TOMATO_DATA_DIR, kind, language)
+		meta = {'language': language, 'template': 'own' if own else 'default'}
+		tomato_report.save_report(TOMATO_DATA_DIR, key, tomato_report.numbers_report(kind, key, facts, self._report_labels(), meta), kind)
+		if tomato_broccoli.broccoli_installed():
+			prompt = tomato_report.prompt(kind, key, template, facts, language)
+			self._report_waiting[(kind, key)] = (time.time(), meta)
+			title = _tr('Daily report')                 # the Broccoli group all reports go into
+			name = {'day': _tr('Daily report'), 'week': _tr('Weekly report'), 'month': _tr('Monthly report')}[kind] + ' ' + key
+			sender = self._report_sender
+
+			def work():
+				try:
+					ok, reason = sender(name, int(time.time()), prompt, title=title)
+				except Exception as exc:
+					ok, reason = False, str(exc)
+				if not ok:
+					logging.warning('Report %s %s: Broccoli could not be asked (%s); the numbers stay.', kind, key, reason)
+					self._main_runner.post(lambda: self._report_asked_failed(kind, key))
+			threading.Thread(target=work, name='tomato-report', daemon=True).start()
+			QTimer.singleShot(int(self.REPORT_WAIT_SECONDS * 1000) + 500, lambda: self._report_refresh(kind, key))
+		self._report_refresh(kind, key)
+		return True
+
+	def _report_asked_failed(self, kind, key):
+		self._report_waiting.pop((kind, key), None)
+		self._report_refresh(kind, key)
+
+	def _report_refresh(self, kind, key):
+		if self._report_dialog is not None and self._report_dialog.isVisible():
+			self._report_dialog.refresh(kind, key)
+
+	def report_status(self, kind, key=None):
+		if key is None:
+			kind, key = 'day', kind
+		asked = self._report_waiting.get((kind, key))
+		if asked is None:
+			return ''
+		if time.time() - asked[0] > self.REPORT_WAIT_SECONDS:
+			self._report_waiting.pop((kind, key), None)
+			return ''
+		return _tr('Broccoli is writing…')
+
+	def report_text(self, kind, key=None):
+		if key is None:
+			kind, key = 'day', kind
+		return tomato_report.read_report(TOMATO_DATA_DIR, key, kind)
+
+	def report_has_record(self, kind, key):
+		if kind == 'day':
+			return tomato_report.has_record(self.fulldir_dia, key) and not self._report_facts(key)['empty']
+		return any(tomato_report.has_record(self.fulldir_dia, day) for day in tomato_report.period_days(kind, key))
+
+	def report_slots(self, days):
+		"""Worker thread: the calendar's days (files only)."""
+		return tomato_report.day_slots(self.fulldir_dia, days, self._report_slot_cache)
+
+	def report_streak(self, today):
+		return tomato_report.streak(self.fulldir_dia, today)
+
+	def report_html(self, markdown_text):
+		return self.md2html(markdown_text or '')
+
+	def report_template(self, kind='day'):
+		_languages, language = self.report_languages()
+		return tomato_report.read_template(TOMATO_DATA_DIR, kind, language)[0], tomato_report.default_template(kind, language)
+
+	def save_report_template(self, kind, text):
+		tomato_report.write_template(TOMATO_DATA_DIR, kind, text)
+		self._report_refresh(None, None)
+
+	def open_daily_report(self, day=None, kind=None):
+		if self._report_dialog is None:
+			self._report_dialog = tomato_report_ui.ReportDialog(self, None)
+		if day is not None or kind is not None:
+			self._report_dialog.show_day(day or tomato_diary.day_name(), kind)
+		else:
+			self._report_dialog.refresh()
+		self._report_dialog.show()
+		self._report_dialog.raise_()
+		return self._report_dialog
+
+	def _tool_report_key(self, a):
+		kind = str(a.get('kind') or 'day')
+		if kind not in tomato_report.KINDS:
+			raise tomato_tools.ToolError('"kind" is day, week or month.')
+		if kind == 'day':
+			return kind, self._tool_day(a)
+		key = tomato_report.valid_key(kind, a.get('day') or tomato_diary.day_name())
+		if not key:
+			raise tomato_tools.ToolError('"day" is written "YYYY-MM-DD" (a week: any day of it) or "YYYY-MM" (a month).')
+		return kind, key
+
+	def _tool_read_report(self, a):
+		kind, key = self._tool_report_key(a)
+		text, _mark, _meta = tomato_report.read_report(TOMATO_DATA_DIR, key, kind)
+		return text or 'There is no %s report for %s yet.' % (tomato_report.KIND_WORDS[kind], key)
+
+	def _tool_save_report(self, a):
+		kind, key = self._tool_report_key(a)
+		text = str(a.get('text') or '').strip()
+		if len(text) < 20 or len(text) > tomato_report.MAX_REPORT_CHARS:
+			raise tomato_tools.ToolError('"text" is the whole report, as Markdown.')
+		facts = self._report_period_facts(kind, key)
+		if facts['empty']:
+			raise tomato_tools.ToolError('Nothing was recorded in %s, so there is no report to save.' % key)
+		asked = self._report_waiting.pop((kind, key), None)
+		meta = asked[1] if asked else tomato_report.read_report(TOMATO_DATA_DIR, key, kind)[2]
+		tomato_report.save_report(TOMATO_DATA_DIR, key, tomato_report.written_report(kind, key, text, facts, self._report_labels(), meta), kind)
+		self._report_refresh(kind, key)
+		return 'Saved the %s report of %s.' % (tomato_report.KIND_WORDS[kind], key)
+
+	def _tool_create_report_picture(self, a):
+		"""The report as one long picture (what the report window's Share makes), saved as a PNG."""
+		kind, key = self._tool_report_key(a)
+		text, _mark, _meta = tomato_report.read_report(TOMATO_DATA_DIR, key, kind)
+		if not (text or '').strip():
+			raise tomato_tools.ToolError('There is no %s report for %s yet.' % (tomato_report.KIND_WORDS[kind], key))
+		target = str(a.get('path') or '').strip()
+		if target:
+			target = os.path.expanduser(target)
+			if not os.path.isabs(target) or not target.lower().endswith('.png') or not os.path.isdir(os.path.dirname(target)):
+				raise tomato_tools.ToolError('"path" is an absolute path ending in .png, in a folder that exists.')
+			if os.path.exists(target):
+				raise tomato_tools.ToolError('There is already a file at %s.' % target)
+		else:
+			folder = os.path.join(os.path.expanduser('~'), 'Downloads')
+			os.makedirs(folder, exist_ok=True)
+			stem, number = 'Tomato-report-%s' % key, 1
+			target = os.path.join(folder, stem + '.png')
+			while os.path.exists(target):
+				number += 1
+				target = os.path.join(folder, '%s %d.png' % (stem, number))
+		maker = share_picture.SharePictureMaker(self)
+		got, loop = [], QEventLoop()
+		maker.finished.connect(lambda pixmap: (got.append(pixmap), loop.quit()))
+		markdown = '## %s\n\n%s' % (tomato_report.period_label(kind, key), text)
+		if not maker.make(self.report_html(markdown), None, 720, False):
+			raise tomato_tools.ToolError('The picture could not be started.')
+		QTimer.singleShot(90000, loop.quit)
+		loop.exec()                    # the window keeps answering while the page is photographed
+		maker.deleteLater()
+		if not got or got[0] is None or got[0].isNull() or not got[0].save(target, 'PNG'):
+			raise tomato_tools.ToolError('The picture could not be made.')
+		return 'Saved a picture of the %s report of %s (%d × %d pixels): %s' % (
+			tomato_report.KIND_WORDS[kind], key, got[0].width(), got[0].height(), target)
+
+	# ── Tomato's functions as tools for an assistant app (2026-11-23) ────────────────────────────────────
+	# Ryan 2026-11-23: "把 Tomato 的所有的这些功能全部都暴露给 Broccoli，作为一个 MCP，他自动就挂上去了". Tomato runs
+	# a small MCP service on this Mac only (app_mcp_host.py, the file every app of the family carries) and leaves
+	# its card in the family's AppConnectors folder; Broccoli reads the folder — neither names the other in a list
+	# of apps. Every call runs here on the main thread, through the same paths as the same change made by hand
+	# (the table, All.csv, Reminders and Calendar stay in step); the service's thread only waits.
+	# 2026-11-24 (Ryan: "接口通用，别的也能接"): the service always starts, Broccoli or not; any other AI app reaches
+	# it through the bridge (Tomato started with --mcp-stdio; the menu's "Use in other AI apps…" copies the setup).
+	def _start_tools_service(self, card_dir=None):
+		if getattr(self, '_tools_host', None) is not None:
+			return True
+		host = app_mcp_host.AppMcpHost(
+			TOMATO_BUNDLE_ID, 'Tomato', VERSION,
+			description='The person\'s to-do items (timed, counted, memos), their diary of the day, their Collections (tables: recipes, books, …) and their daily / weekly / monthly reports.',
+			instructions='Tomato keeps the person\'s items (page "time": things with a start time; "frequency": things to do N times; '
+						 '"memory": memos), a diary file per day, and Collections (tables with free columns). Look before you '
+						 'change: list / search first, and say what you are going to change. Times are local, "YYYY-MM-DD HH:MM".')
+		obj = lambda **properties: {'type': 'object', 'properties': properties}
+		text = lambda description: {'type': 'string', 'description': description}
+		number = lambda description: {'type': 'number', 'description': description}
+		page = {'type': 'string', 'enum': ['time', 'frequency', 'memory'], 'description': 'Which page the item is on.'}
+		which = dict(page=page, name=text('The item\'s name, exactly as listed.'),
+					 start=text('For a timed item: its start "YYYY-MM-DD HH:MM", when several items share the name.'))
+		scope = {'type': 'string', 'enum': ['one', 'later'], 'description': 'For a repeating timed item, when its start is moved or it is deleted: only this one (default) or this and the later ones. (A new name or length always goes to its later ones too, as in the app.)'}
+		collection = text('The collection\'s name (list_collections).')
+		values = {'type': 'object', 'description': 'Column name → text.', 'additionalProperties': {'type': 'string'}}
+		add_columns = {'type': 'boolean', 'description': 'Add columns that are not there yet. Ask the person first.'}
+		host.tool('list_items', 'Lists the person\'s items. status: undone (default) / done / all. text: part of the name. '
+				  'start_from / start_to: "YYYY-MM-DD" bounds for timed items.',
+				  obj(page={'type': 'string', 'enum': ['all', 'time', 'frequency', 'memory']}, status={'type': 'string', 'enum': ['undone', 'done', 'all']},
+					  text=text('Part of the name.'), start_from=text('YYYY-MM-DD'), start_to=text('YYYY-MM-DD'), limit=number('At most this many (50).')),
+				  self._tool_list_items)
+		host.tool('create_item', 'Adds an item. time: name + start (+ length_hours, default 1; repeat_hours; repeat_until "YYYY-MM-DD"). '
+				  'frequency: name + target_times. memory: name only.',
+				  dict(obj(page=page, name=text('The item\'s name.'), start=text('"YYYY-MM-DD HH:MM" (time page).'),
+						   length_hours=number('How long, in hours.'), repeat_hours=number('Repeat every this many hours.'),
+						   repeat_until=text('Last day of the repeat, "YYYY-MM-DD".'), target_times=number('How many times (frequency page).')),
+					   required=['page', 'name']), self._tool_create_item, mutating=True)
+		host.tool('update_item', 'Changes an item: new_name; for a timed item also new_start, length_hours, repeat_hours; for a counted '
+				  'item target_times, done_times.',
+				  dict(obj(new_name=text('The new name.'), new_start=text('"YYYY-MM-DD HH:MM"'), length_hours=number('Hours.'),
+						   repeat_hours=number('Hours; 0 = no repeat.'), target_times=number('Target count.'), done_times=number('Count done.'),
+						   scope=scope, **which), required=['page', 'name']), self._tool_update_item, mutating=True)
+		host.tool('update_item_done', 'Marks an item as done (time, memory), or counts one more time for a counted item (frequency). '
+				  'comment: an optional note kept with it.',
+				  dict(obj(comment=text('A note.'), **which), required=['page', 'name']), self._tool_complete_item, mutating=True)
+		host.tool('delete_item', 'Deletes an item. Ask the person first.',
+				  dict(obj(scope=scope, **which), required=['page', 'name']), self._tool_delete_item, destructive=True)
+		host.tool('read_diary', 'The diary of a day (default today). form "summary" (default): time per app, the stretches of the day, what '
+				  'was seen on screen, what was taken from the Collections (meals …), finished items, the person\'s own notes. '
+				  'form "full": the file as it is (long).',
+				  obj(day=text('YYYY-MM-DD'), form={'type': 'string', 'enum': ['summary', 'full']}), self._tool_read_diary)
+		host.tool('write_diary_line', 'Adds one line to today\'s diary, stamped with the time. Either free text, or a row of a Collection '
+				  '(collection + row, e.g. a dish the person ate — search_collection first) with an optional note ("half a portion"). '
+				  'time "HH:MM": when it happened, if not now.',
+				  obj(text=text('Free text for the line.'), collection=collection, row=number('The row number from search_collection.'),
+					  note=text('A short note after the row\'s name.'), time=text('HH:MM today.')), self._tool_write_diary_line, mutating=True)
+		host.tool('list_collections', 'The person\'s Collections: name, columns, number of rows.', obj(), self._tool_list_collections)
+		host.tool('search_collection', 'Rows of a collection that hold every word of "text" (no text: the first rows). Gives row numbers.',
+				  dict(obj(collection=collection, text=text('Words to look for.'), limit=number('At most this many (20).')), required=['collection']),
+				  self._tool_search_collection)
+		host.tool('read_collection_row', 'One row in full.', dict(obj(collection=collection, row=number('Row number.')), required=['collection', 'row']),
+				  self._tool_read_collection_row)
+		host.tool('create_collection_row', 'Adds a row to a collection.',
+				  dict(obj(collection=collection, values=values, add_missing_columns=add_columns), required=['collection', 'values']),
+				  self._tool_create_collection_row, mutating=True)
+		host.tool('update_collection_row', 'Writes cells of one row (e.g. the nutrition of a dish); other cells stay.',
+				  dict(obj(collection=collection, row=number('Row number.'), values=values, add_missing_columns=add_columns),
+					   required=['collection', 'row', 'values']), self._tool_update_collection_row, mutating=True)
+		host.tool('delete_collection_row', 'Deletes one row. Ask the person first.',
+				  dict(obj(collection=collection, row=number('Row number.')), required=['collection', 'row']),
+				  self._tool_delete_collection_row, destructive=True)
+		host.tool('create_collection', 'Makes a new, empty collection with these columns.',
+				  dict(obj(collection=collection, columns={'type': 'array', 'items': {'type': 'string'}}), required=['collection', 'columns']),
+				  self._tool_create_collection, mutating=True)
+		report_kind = {'type': 'string', 'enum': ['day', 'week', 'month'], 'description': 'day (default), week (Monday–Sunday) or month.'}
+		report_day = text('YYYY-MM-DD; for a week any day of it (its Monday is used), for a month YYYY-MM.')
+		host.tool('read_daily_report', 'The daily, weekly or monthly report (default: today\'s daily report), if there is one.',
+				  obj(kind=report_kind, day=report_day), self._tool_read_report)
+		# Not marked as a change that needs the person's approval: it only puts the written half of a report into
+		# Tomato's own Reports folder (the report before it is kept), and it is asked for every night at 23:30 —
+		# an approval window then would stop the report nobody is there to approve.
+		host.tool('save_daily_report', 'Saves the written part of a daily, weekly or monthly report (Markdown). Tomato adds its own numbers under it. '
+				  'Use it only when asked for such a report.',
+				  dict(obj(kind=report_kind, day=report_day, text=text('The whole report, Markdown.')), required=['day', 'text']), self._tool_save_report)
+		host.tool('create_daily_report', 'Makes the daily, weekly or monthly report now (default: today\'s daily report): Tomato\'s numbers at once; '
+				  'the written part is asked from the person\'s assistant app when there is one (that uses their model). Replaces the report of that period.',
+				  obj(kind=report_kind, day=report_day), self._tool_create_report, mutating=True)
+		host.tool('create_report_picture', 'Saves a daily, weekly or monthly report (default: today\'s daily report) as one long picture (PNG) for '
+				  'sharing — what "Share" in the Reports window makes. Without "path" it goes into the Downloads folder; an existing file is never replaced.',
+				  obj(kind=report_kind, day=report_day, path=text('Where to save it: an absolute path ending in .png. Optional.')),
+				  self._tool_create_report_picture, mutating=True)
+		host.tool('read_report_template', 'The template the written part of a report follows (kind: day / week / month), and whether it is the default one.',
+				  obj(kind=report_kind), self._tool_read_template)
+		host.tool('update_report_template', 'Replaces the template of the daily, weekly or monthly report with "text" (Markdown: the headings and what goes under each). '
+				  '"" = the default template again. Show the person the new template first.',
+				  dict(obj(kind=report_kind, text=text('The whole template, or "".')), required=['text']), self._tool_update_template, mutating=True)
+		host.tool('search_diary', 'Diary lines of the last days that hold every word of "text" (when did I …, how often …): day + line, newest first.',
+				  dict(obj(text=text('Words to look for.'), days=number('How many days back (30).'), limit=number('At most this many lines (50).')), required=['text']),
+				  self._tool_search_diary)
+		diary_line = text('The line as the diary has it (read_diary with form "full", or search_diary), with its time.')
+		diary_day = text('YYYY-MM-DD (default today).')
+		host.tool('update_diary_line', 'Corrects one line of a diary: "line" is replaced by "new_text" (keep the time at its front). For a mistake the person points out.',
+				  dict(obj(day=diary_day, line=diary_line, new_text=text('The line as it should read.')), required=['line', 'new_text']),
+				  self._tool_update_diary_line, mutating=True)
+		host.tool('delete_diary_line', 'Takes one line out of a diary. Ask the person first.',
+				  dict(obj(day=diary_day, line=diary_line), required=['line']), self._tool_delete_diary_line, destructive=True)
+		column = text('The column\'s name (list_collections).')
+		host.tool('create_collection_column', 'Adds an empty column to a collection (e.g. "Zinc (mg)": put the unit in the name).',
+				  dict(obj(collection=collection, column=text('The new column\'s name.')), required=['collection', 'column']),
+				  self._tool_create_collection_column, mutating=True)
+		host.tool('update_collection_column', 'Renames a column of a collection; its cells stay.',
+				  dict(obj(collection=collection, column=column, new_name=text('The new name.')), required=['collection', 'column', 'new_name']),
+				  self._tool_update_collection_column, mutating=True)
+		host.tool('delete_collection_column', 'Deletes a column of a collection with everything in it. Ask the person first.',
+				  dict(obj(collection=collection, column=column), required=['collection', 'column']), self._tool_delete_collection_column, destructive=True)
+		switch = lambda description: {'type': 'boolean', 'description': description}
+		host.tool('read_settings', 'Tomato\'s switches: auto_record (the apps in use are written into the diary), auto_record_on_startup, always_on_top, '
+				  'show_on_all_spaces, vision_to_diary (lines from the assistant app\'s look at the screen), report_auto (a report every evening), '
+				  'repeat_pregenerate_count (how many rows a repeating item gets ahead).', obj(), self._tool_read_settings)
+		host.tool('update_settings', 'Sets any of Tomato\'s switches (read_settings names them); the rest stay.',
+				  obj(auto_record=switch('Record the apps in use into the diary, now.'), auto_record_on_startup=switch('Start recording when Tomato starts.'),
+					  always_on_top=switch('The main window above other windows.'), show_on_all_spaces=switch('On every desktop.'),
+					  vision_to_diary=switch('Write the assistant app\'s screen notes into the diary.'), report_auto=switch('Make a report every evening.'),
+					  repeat_pregenerate_count=number('1–15.')), self._tool_update_settings, mutating=True)
+		launch = None
+		marker = '.app/Contents/MacOS/'
+		if getattr(sys, 'frozen', False) and marker in sys.executable:      # the packaged app can be opened again by its card
+			launch = {'bundle_id': TOMATO_BUNDLE_ID, 'path': sys.executable.split(marker)[0] + '.app'}
+		try:
+			started = host.start(run_on_main=self._main_runner, launch=launch, card_dir=card_dir)
+		except Exception:
+			logging.exception('The tools service could not be started.')
+			started = False
+		self._tools_host = host if started else None
+		return started
+
+	def _tools_busy(self):
+		if self._broccoli_busy() or self._quick_edit_open() or self._time_cell_being_edited() \
+				or self.collection_table.state() == QAbstractItemView.State.EditingState:
+			raise tomato_tools.ToolError('Tomato is in the middle of an edit by the person. Try again in a moment.')
+
+	def _tool_list_items(self, a):
+		return tomato_tools.filter_items(tomato_tools.read_items(self.fulldirall), a.get('page') or 'all', a.get('status') or 'undone',
+										 a.get('text') or '', a.get('start_from') or '', a.get('start_to') or '', a.get('limit') or 50)
+
+	def _tool_stamp(self, value, what='start'):
+		try:
+			return int(self.to_stamp(' '.join(str(value or '').replace('T', ' ').split())[:16]))
+		except Exception:
+			raise tomato_tools.ToolError('"%s" is a local time written "YYYY-MM-DD HH:MM".' % what)
+
+	def _tool_hours(self, value, what, allow_zero=False):
+		try:
+			hours = float(value)
+		except (TypeError, ValueError):
+			raise tomato_tools.ToolError('"%s" is a number of hours.' % what)
+		if hours < 0 or (hours == 0 and not allow_zero) or hours > 24 * 366:
+			raise tomato_tools.ToolError('"%s" is out of range.' % what)
+		return hours
+
+	def _tool_count(self, value, what):
+		try:
+			count = int(float(value))
+		except (TypeError, ValueError):
+			raise tomato_tools.ToolError('"%s" is a whole number.' % what)
+		if not 0 <= count <= 100000:
+			raise tomato_tools.ToolError('"%s" is out of range.' % what)
+		return count
+
+	def _tool_table(self, page):
+		tables = {'time': (self.tableWidget, 'TIME_SNS'), 'frequency': (self.tableWidget_freq, 'FREQ_SNS'), 'memory': (self.tableWidget_memo, 'MEMO_SNS')}
+		if page not in tables:
+			raise tomato_tools.ToolError('"page" is time, frequency or memory.')
+		return tables[page]
+
+	def _tool_find_row(self, a, undone_only=False):
+		"""(table, kind, row) of the item a call names; words for the model when there is none or more than one."""
+		table, kind = self._tool_table(a.get('page'))
+		wanted, start = ' '.join(str(a.get('name') or '').split()).casefold(), ' '.join(str(a.get('start') or '').split())
+		if not wanted:
+			raise tomato_tools.ToolError('"name" is the item\'s name.')
+		rows = []
+		for row in range(table.rowCount()):
+			type_item, name_item = table.item(row, 7), table.item(row, 0)
+			if type_item is None or name_item is None or type_item.text() != kind:
+				continue
+			if ' '.join(name_item.text().split()).casefold() != wanted:
+				continue
+			if start and kind == 'TIME_SNS' and not self._cell_text(table, row, 1, '').startswith(start):
+				continue
+			rows.append(row)
+		undone = [row for row in rows if self._cell_text(table, row, 4, '') == 'UNDONE']
+		if undone_only or len(undone) >= 1:
+			rows = undone
+		if not rows:
+			raise tomato_tools.ToolError('No such item%s on the %s page. Use list_items to see the names.' % (' still to do' if undone_only else '', a.get('page')))
+		if len(rows) > 1:
+			if kind == 'TIME_SNS':
+				rows.sort(key=lambda row: self._cell_text(table, row, 1, ''))
+				if not start:
+					raise tomato_tools.ToolError('Several items have this name; pass "start". Their starts: '
+												 + ', '.join(self._cell_text(table, row, 1, '') for row in rows[:12]))
+			rows = rows[:1]
+		return table, kind, rows[0]
+
+	def _tool_create_item(self, a):
+		self._tools_busy()
+		page, name = a.get('page'), ' '.join(str(a.get('name') or '').split())
+		self._tool_table(page)
+		if not name:
+			raise tomato_tools.ToolError('"name" is the item\'s name.')
+		if page == 'time':
+			start = self._tool_stamp(a.get('start'))
+			length = self._tool_hours(a.get('length_hours', 1) or 1, 'length_hours')
+			repeat = self._tool_hours(a['repeat_hours'], 'repeat_hours') if a.get('repeat_hours') else None
+			until = None
+			if repeat and a.get('repeat_until'):
+				try:
+					day = datetime.datetime.strptime(str(a['repeat_until'])[:10], '%Y-%m-%d').date()
+				except ValueError:
+					raise tomato_tools.ToolError('"repeat_until" is a day written "YYYY-MM-DD".')
+				until = int(datetime.datetime.combine(day, datetime.time(23, 59, 59)).timestamp())
+				if until < start:
+					raise tomato_tools.ToolError('"repeat_until" is before the start.')
+			if self._find_time_row_by_key(name, start) is not None:
+				raise tomato_tools.ToolError('There is already an item with this name at this time.')
+			added = self._add_time_item(name, start, length, repeat, until)
+			return {'created': {'page': 'time', 'name': name, 'start': time.strftime('%Y-%m-%d %H:%M', time.localtime(start)),
+								'length_hours': length, 'repeat_hours': repeat}, 'rows_added': added}
+		box, extra = (self.lf1, self.lf2) if page == 'frequency' else (self.lm1, None)
+		keep = (box.text(), extra.text() if extra is not None else '')
+		box.setText(name)
+		if extra is not None:
+			extra.setText(str(max(1, self._tool_count(a.get('target_times', 1) or 1, 'target_times'))))
+		(self.add_to_freq if page == 'frequency' else self.memo_add)()
+		box.setText(keep[0])
+		if extra is not None:
+			extra.setText(keep[1])
+		return {'created': {'page': page, 'name': name}}
+
+	def _add_time_item(self, name, start, length_hours, repeat_hours=None, until=None):
+		"""A timed item and, when it repeats, its next ones as Add makes them. Returns how many rows were added."""
+		length = self._format_hours(float(length_hours))
+		repeat = self._format_hours(float(repeat_hours)) if repeat_hours else '-'
+		until_text = str(int(until)) if until else '-'
+		self._append_time_row_to_table([name, time.strftime('%Y-%m-%d %H:%M', time.localtime(start)), length, repeat,
+										'UNDONE', '-', until_text, 'TIME_SNS', str(start)])
+		commands = [self._sync_make_reminder_script((name, start)), self._sync_make_event_script((name, start))]
+		added = 1
+		if repeat_hours:
+			base_values = [name, '', length, repeat, 'UNDONE', '-', until_text, 'TIME_SNS', '']
+			for row_values, reminder_cmd, calendar_cmd in self._generate_repeat_occurrences(
+					base_values, self._get_repeat_pregenerate_count() - 1, float(start), float(repeat_hours), float(until) if until else None):
+				self._append_time_row_to_table(row_values)
+				commands += [reminder_cmd, calendar_cmd]
+				added += 1
+		self._broccoli_after_table_change(commands)
+		return added
+
+	def _tool_with_scope(self, a, work):
+		self._tool_repeat_scope = 'later' if a.get('scope') == 'later' else 'one'
+		try:
+			return work()
+		finally:
+			self._tool_repeat_scope = None
+
+	def _tool_update_item(self, a):
+		self._tools_busy()
+		table, kind, row = self._tool_find_row(a)
+		key = (self._cell_text(table, row, 0, ''), self._stamp_from_items(table.item(row, 8), table.item(row, 1)))
+		new_name = ' '.join(str(a.get('new_name') or '').split())
+		values = {0: new_name} if new_name else {}
+		if kind == 'TIME_SNS':
+			if a.get('new_start'):
+				values[1] = time.strftime('%Y-%m-%d %H:%M', time.localtime(self._tool_stamp(a['new_start'], 'new_start')))
+			if a.get('length_hours') is not None:
+				values[2] = self._format_hours(self._tool_hours(a['length_hours'], 'length_hours'))
+			if a.get('repeat_hours') is not None:
+				hours = self._tool_hours(a['repeat_hours'], 'repeat_hours', allow_zero=True)
+				values[3] = self._format_hours(hours) if hours else '-'
+		elif kind == 'FREQ_SNS':
+			if a.get('target_times') is not None:
+				values[5] = str(self._tool_count(a['target_times'], 'target_times'))
+			if a.get('done_times') is not None:
+				values[6] = str(self._tool_count(a['done_times'], 'done_times'))
+		if not values:
+			raise tomato_tools.ToolError('Nothing to change was given for an item of this page.')
+		if kind == 'TIME_SNS':
+			self._tool_with_scope(a, lambda: self._apply_time_changes(key, values))
+		elif kind == 'FREQ_SNS':
+			self._apply_freq_changes(key, values)
+		else:
+			self._apply_memo_name(key, values[0])
+		return {'updated': a.get('page'), 'name': values.get(0, key[0]), 'changed': sorted(
+			{0: 'name', 1: 'start', 2: 'length_hours', 3: 'repeat_hours', 5: 'target_times', 6: 'done_times'}[c] for c in values)}
+
+	def _tool_select(self, table, row):
+		table.clearSelection()
+		table.setCurrentCell(row, 0)
+
+	def _tool_complete_item(self, a):
+		self._tools_busy()
+		table, kind, row = self._tool_find_row(a, undone_only=True)
+		name = self._cell_text(table, row, 0, '')
+		box, done = {'TIME_SNS': (self.textw1, self.save_and_done), 'FREQ_SNS': (self.textw2, self.freq_add_time),
+					 'MEMO_SNS': (self.textw3, self.memo_done_memo)}[kind]
+		if kind == 'FREQ_SNS' and self._cell_text(table, row, 5, '-') in ('', '-'):
+			raise tomato_tools.ToolError('This counted item has no target number yet; set target_times with update_item first.')
+		keep = box.toPlainText()
+		box.setPlainText(tomato_diary.one_line(a.get('comment') or '', 2000))
+		self._tool_select(table, row)
+		try:
+			done()
+		finally:
+			box.setPlainText(keep)
+		return {'done': name, 'page': a.get('page')}
+
+	def _tool_delete_item(self, a):
+		self._tools_busy()
+		table, kind, row = self._tool_find_row(a)
+		name = self._cell_text(table, row, 0, '')
+		self._tool_select(table, row)
+		delete = {'TIME_SNS': self.delete_item, 'FREQ_SNS': self.freq_delete, 'MEMO_SNS': self.memo_delete}[kind]
+		self._tool_with_scope(a, delete)
+		return {'deleted': name, 'page': a.get('page')}
+
+	def _tool_day(self, a):
+		day = str(a.get('day') or '').strip()[:10] or tomato_diary.day_name()
+		try:
+			datetime.datetime.strptime(day, '%Y-%m-%d')
+		except ValueError:
+			raise tomato_tools.ToolError('"day" is written "YYYY-MM-DD".')
+		return day
+
+	def _tool_read_diary(self, a):
+		day = self._tool_day(a)
+		text = tomato_diary.read(self.fulldir_dia, day)
+		if not text.strip():
+			return 'There is no diary for %s.' % day
+		if a.get('form') == 'full':
+			return text if len(text) <= 60000 else text[:60000] + '\n… (cut; ask for the summary)'
+		now = datetime.datetime.now()
+		end = now.hour * 3600 + now.minute * 60 + now.second if day == tomato_diary.day_name() else None
+		return '# %s\n\n%s' % (day, tomato_diary.digest(text, end, max_chars=12000) or '(nothing recorded)')
+
+	def _refresh_unfocused_diary_boxes(self):
+		"""A line was added to the diary by a program: the boxes show it, except one the person is typing in
+		(that one takes the line in at its next save, see _save_diary_box)."""
+		for box in self._diary_text_edits:
+			if not box.hasFocus():
+				bar = box.verticalScrollBar()
+				at_end = bar.value() >= bar.maximum() - 4
+				value = bar.value()
+				self._refresh_diary_text_widget(box)
+				if not at_end:
+					bar.setValue(value)
+
+	def add_diary_line(self, text, when=None, limit=0):
+		line = tomato_diary.append_line(self.fulldir_dia, text, when, limit)
+		self._refresh_unfocused_diary_boxes()
+		return line
+
+	def _tool_write_diary_line(self, a):
+		when = None
+		if a.get('time'):
+			try:
+				clock = datetime.datetime.strptime(str(a['time']).strip()[:5], '%H:%M')
+			except ValueError:
+				raise tomato_tools.ToolError('"time" is written "HH:MM".')
+			when = datetime.datetime.now().replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
+		note = tomato_diary.one_line(a.get('note') or '', 200)
+		if a.get('collection'):
+			path = tomato_tools.collection_path(self.fulldir_collection, a['collection'])
+			columns, rows = tomato_tools.read_collection(path)
+			number = tomato_tools._row_number(a.get('row'), rows)
+			title = tomato_tools.row_title(columns, rows[number - 1])
+			if not title:
+				raise tomato_tools.ToolError('That row is empty.')
+			text = tomato_diary.collection_line(os.path.basename(path)[:-4], title) + (' — ' + note if note else '')
+		else:
+			text = tomato_diary.one_line(a.get('text') or '', 1000)
+			if not text:
+				raise tomato_tools.ToolError('Give "text", or "collection" and "row".')
+		return {'added': self.add_diary_line(text, when)}
+
+	def _tool_list_collections(self, a):
+		return tomato_tools.list_collections(self.fulldir_collection)
+
+	def _tool_search_collection(self, a):
+		return tomato_tools.search_collection(self.fulldir_collection, a.get('collection'), a.get('text') or '', a.get('limit') or 20)
+
+	def _tool_read_collection_row(self, a):
+		return tomato_tools.read_row(self.fulldir_collection, a.get('collection'), a.get('row'))
+
+	def _tools_collection_changed(self, path, row=None):
+		"""A tool wrote a collection file: the window shows it (the file that is open is read again, the same row
+		selected; a new file appears in the list)."""
+		current = self.collection_current_file
+		if current and os.path.exists(current) and os.path.samefile(current, path):
+			keep = self.collection_table.currentRow() if row is None else row
+			self._load_collection_file(current)
+			if 0 <= keep < self.collection_table.rowCount():
+				self.collection_table.setCurrentCell(keep, 0)
+		elif self.collection_file_combo.findData(path) == -1:
+			self._refresh_collection_files(current)
+
+	def _tool_create_collection_row(self, a):
+		self._tools_busy()
+		path, row = tomato_tools.add_row(self.fulldir_collection, a.get('collection'), a.get('values'), bool(a.get('add_missing_columns')))
+		self._tools_collection_changed(path, row['row'] - 1)
+		return {'created': row}
+
+	def _tool_update_collection_row(self, a):
+		self._tools_busy()
+		path, row = tomato_tools.update_row(self.fulldir_collection, a.get('collection'), a.get('row'), a.get('values'), bool(a.get('add_missing_columns')))
+		self._tools_collection_changed(path, row['row'] - 1)
+		return {'updated': row}
+
+	def _tool_delete_collection_row(self, a):
+		self._tools_busy()
+		path, row = tomato_tools.delete_row(self.fulldir_collection, a.get('collection'), a.get('row'))
+		self._tools_collection_changed(path)
+		return {'deleted': row}
+
+	def _tool_create_collection(self, a):
+		self._tools_busy()
+		path = tomato_tools.create_collection(self.fulldir_collection, a.get('collection'), a.get('columns'))
+		self._tools_collection_changed(path)
+		return {'created': os.path.basename(path)[:-4]}
+
+	# ── more tools (2026-11-25, Ryan: "所有的主要的功能都需要"): the menu's switches, a report made now, the report
+	# templates, the diary searched and one of its lines corrected, a collection's columns ─────────────────────
+	def _tool_read_settings(self, a):
+		settings = self._app_settings
+		return {'auto_record': bool(action4.isChecked()),
+				'auto_record_on_startup': bool(settings.get('auto_record_on_startup', False)),
+				'always_on_top': self.is_always_on_top(),
+				'show_on_all_spaces': bool(settings.get('show_on_all_spaces', True)),
+				'vision_to_diary': bool(settings.get('vision_to_diary', True)),
+				'report_auto': self.report_auto(),
+				'repeat_pregenerate_count': int(self._get_repeat_pregenerate_count())}
+
+	def _tool_update_settings(self, a):
+		before = self._tool_read_settings(a)
+		wanted = {}
+		for key in before:
+			if a.get(key) is None:
+				continue
+			if key == 'repeat_pregenerate_count':
+				try:
+					count = int(a[key])
+				except (TypeError, ValueError):
+					count = 0
+				if not 1 <= count <= len(repeat_pregenerate_actions) or count != a[key]:
+					raise tomato_tools.ToolError('"repeat_pregenerate_count" is a whole number from 1 to %d.' % len(repeat_pregenerate_actions))
+				wanted[key] = count
+			elif not isinstance(a[key], bool):
+				raise tomato_tools.ToolError('"%s" is true or false.' % key)
+			else:
+				wanted[key] = a[key]
+		wanted = {key: value for key, value in wanted.items() if value != before[key]}
+		if not wanted and not any(a.get(key) is not None for key in before):
+			raise tomato_tools.ToolError('Nothing to change. The settings are: %s.' % ', '.join(before))
+		# each goes the way its menu item goes; the menu's tick follows
+		if 'auto_record' in wanted:
+			action4.setChecked(wanted['auto_record'])
+			self.auto_record(wanted['auto_record'])
+			if action4.isChecked() != wanted['auto_record']:
+				raise tomato_tools.ToolError('Auto-record could not be switched on on this Mac.')
+		if 'auto_record_on_startup' in wanted:
+			action_auto_record_startup.setChecked(wanted['auto_record_on_startup'])
+			self._toggle_auto_record_startup(wanted['auto_record_on_startup'])
+		if 'always_on_top' in wanted:
+			action_always_on_top.setChecked(wanted['always_on_top'])
+			self._toggle_always_on_top(wanted['always_on_top'])
+		if 'show_on_all_spaces' in wanted:
+			action_all_spaces.setChecked(wanted['show_on_all_spaces'])
+			self._toggle_all_spaces(wanted['show_on_all_spaces'])
+		if 'vision_to_diary' in wanted:
+			action_vision_diary.setChecked(wanted['vision_to_diary'])
+			self.set_vision_to_diary(wanted['vision_to_diary'])
+		if 'report_auto' in wanted:
+			self.set_report_auto(wanted['report_auto'])
+			self._report_refresh(None, None)
+		if 'repeat_pregenerate_count' in wanted:
+			repeat_pregenerate_actions[wanted['repeat_pregenerate_count'] - 1].setChecked(True)
+			self._set_repeat_pregenerate_count(wanted['repeat_pregenerate_count'])
+		return {'changed': sorted(wanted), 'settings': self._tool_read_settings(a)}
+
+	def _tool_create_report(self, a):
+		kind, key = self._tool_report_key(a)
+		if not self.make_report(kind, key):
+			raise tomato_tools.ToolError('Nothing was recorded in %s, so there is no report to make.' % key)
+		words = 'Made the %s report of %s from Tomato\'s own numbers.' % (tomato_report.KIND_WORDS[kind], key)
+		if (kind, key) in self._report_waiting:
+			words += ' Its written part has been asked for and joins it when it arrives (read_daily_report shows what is there).'
+		return words
+
+	def _tool_template_kind(self, a):
+		kind = str(a.get('kind') or 'day')
+		if kind not in tomato_report.KINDS:
+			raise tomato_tools.ToolError('"kind" is day, week or month.')
+		return kind
+
+	def _tool_read_template(self, a):
+		kind = self._tool_template_kind(a)
+		template, default = self.report_template(kind)
+		return {'kind': kind, 'template': template, 'is_the_default': template == default}
+
+	def _tool_update_template(self, a):
+		kind = self._tool_template_kind(a)
+		template = str(a.get('text') or '')
+		if template.strip() and len(template.strip()) < 20 or len(template) > 20000:
+			raise tomato_tools.ToolError('"text" is the whole template (Markdown), or "" to go back to the default one.')
+		self.save_report_template(kind, template)
+		return 'Saved the template of the %s report.' % tomato_report.KIND_WORDS[kind] if template.strip() \
+			else 'The %s report uses the default template again.' % tomato_report.KIND_WORDS[kind]
+
+	def _tool_search_diary(self, a):
+		return tomato_tools.search_diary(self.fulldir_dia, a.get('text'), a.get('days'), a.get('limit'))
+
+	def _tool_change_diary_line(self, a, new):
+		self._tools_busy()
+		day = self._tool_day(a)
+		state, line = tomato_diary.replace_line(self.fulldir_dia, day, a.get('line'), new)
+		if state == 'several':
+			raise tomato_tools.ToolError('More than one line of %s reads like that; give the whole line with its time.' % day)
+		if state != 'done':
+			raise tomato_tools.ToolError('No line of %s reads like that. read_diary with form "full" shows the lines as they are.' % day)
+		if day == tomato_diary.day_name():
+			self._refresh_unfocused_diary_boxes()
+		return line
+
+	def _tool_update_diary_line(self, a):
+		new = tomato_diary.one_line(a.get('new_text') or '', 1000)
+		if not new:
+			raise tomato_tools.ToolError('"new_text" is the line as it should read (keep its time at the front).')
+		return {'now': self._tool_change_diary_line(a, new)}
+
+	def _tool_delete_diary_line(self, a):
+		return {'deleted': self._tool_change_diary_line(a, None)}
+
+	def _tool_create_collection_column(self, a):
+		self._tools_busy()
+		path, columns = tomato_tools.add_column(self.fulldir_collection, a.get('collection'), a.get('column'))
+		self._tools_collection_changed(path)
+		return {'columns': columns}
+
+	def _tool_update_collection_column(self, a):
+		self._tools_busy()
+		path, columns = tomato_tools.rename_column(self.fulldir_collection, a.get('collection'), a.get('column'), a.get('new_name'))
+		self._tools_collection_changed(path)
+		return {'columns': columns}
+
+	def _tool_delete_collection_column(self, a):
+		self._tools_busy()
+		path, columns, filled = tomato_tools.delete_column(self.fulldir_collection, a.get('collection'), a.get('column'))
+		self._tools_collection_changed(path)
+		return {'columns': columns, 'cells_that_held_something': filled}
+
+	# ── the show / hide shortcut (style book 5.12, 2026-11-22) ───────────────────────────────────────────
+	# Ryan 2026-11-22: "像 Broccoli 它能换出……然后再隐藏……给 Tomato 也加一个快捷键"; he chose a menu-bar item,
+	# ⌃⌥T to start with, and the system's hot-key registration (no permission to give).
+	def _register_show_hide_shortcut(self, text):
+		if getattr(self, '_show_hide_hotkey', None) is None:
+			self._show_hide_hotkey = tomato_hotkey.GlobalHotKey(lambda: QTimer.singleShot(0, self._show_hide_from_shortcut))
+		return self._show_hide_hotkey.set_shortcut(text)
+
+	def _show_hide_shortcut_text(self):
+		value = self._app_settings.get('show_hide_shortcut', tomato_hotkey.DEFAULT_SHORTCUT)
+		return tomato_hotkey.normalize(value) if isinstance(value, str) else ''
+
+	def _tomato_is_front(self):
+		return QGuiApplication.applicationState() == Qt.ApplicationState.ApplicationActive
+
+	def _bring_tomato_to_front(self):
+		try:
+			from AppKit import NSApplication
+			NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+		except Exception:
+			pass
+		self.raise_()
+		self.activateWindow()
+
+	def _show_hide_from_shortcut(self):
+		"""Slid in → slide out and come to the front; out but behind other apps → to the front; out and in
+		front → slide in."""
+		shown = self.i % 2 == 0
+		if not shown:
+			self.pin_a_tab2()
+			self._bring_tomato_to_front()
+		elif not self._tomato_is_front():
+			self._bring_tomato_to_front()
+		else:
+			self.pin_a_tab2()
+
+	def open_shortcut_dialog(self):
+		hotkey = getattr(self, '_show_hide_hotkey', None)
+		if hotkey is not None:
+			hotkey.unregister()        # while recording, pressing the current shortcut must reach the dialog
+		dialog = ShortcutDialog(self._show_hide_shortcut_text(), self)
+		self._shortcut_dialog = dialog
+		self._bring_tomato_to_front()
+		accepted = dialog.exec() == QDialog.DialogCode.Accepted
+		self._shortcut_dialog = None
+		value = dialog.value if accepted else self._show_hide_shortcut_text()
+		if accepted:
+			self._app_settings['show_hide_shortcut'] = value
+			self._save_app_settings()
+		if not self._register_show_hide_shortcut(value) and value:
+			tomato_alert(self, _tr('Show/Hide shortcut'),
+						 _tr('%1 could not be set as the shortcut. Try another one.').replace('%1', tomato_hotkey.display(value)))
+		return accepted
+
 	def _load_app_settings(self):
 		"""Load application settings from JSON file"""
-		self._app_settings = {'auto_record_on_startup': False, 'repeat_pregenerate_count': 10}
+		self._app_settings = {'auto_record_on_startup': False, 'repeat_pregenerate_count': 10, 'always_on_top': True, 'dock_icon': True, 'show_on_all_spaces': True,
+							  'show_hide_shortcut': tomato_hotkey.DEFAULT_SHORTCUT}
 		if os.path.exists(self.settings_file):
 			try:
 				with open(self.settings_file, 'r', encoding='utf-8') as f:
@@ -8826,6 +11192,17 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 				logging.exception("Failed to load app settings.")
 		# Apply the auto-record on startup setting to the menu item
 		action_auto_record_startup.setChecked(self._app_settings.get('auto_record_on_startup', False))
+		all_spaces = bool(self._app_settings.get('show_on_all_spaces', True))
+		action_all_spaces.setChecked(all_spaces)
+		set_show_on_all_spaces(all_spaces)
+		dock_icon = bool(self._app_settings.get('dock_icon', True))
+		action_dock_icon.setChecked(dock_icon)
+		set_dock_icon_visible(dock_icon)
+		on_top = bool(self._app_settings.get('always_on_top', True))
+		action_always_on_top.setChecked(on_top)
+		self.set_always_on_top(on_top)
+		self._register_show_hide_shortcut(self._show_hide_shortcut_text())
+		action_vision_diary.setChecked(bool(self._app_settings.get('vision_to_diary', True)))
 		# Apply the repeat pregenerate count setting to the menu
 		pregenerate_count = self._app_settings.get('repeat_pregenerate_count', 10)
 		if 1 <= pregenerate_count <= 15:
@@ -8859,35 +11236,6 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 			action4.setChecked(True)
 			self.auto_record(True)
 
-	@pyqtSlot(str)
-	def on_update_available(self, latest: str):
-		# 这里只在主线程里创建窗口或弹窗
-		# 你可以复用已有的 WindowUpdate 或者弹一个你的自定义对话框
-		# 例：用你已有的 RestartMessageBox/CustomMessageBox 风格
-		msg = CustomMessageBox(
-			self.tr(f"New version %n is available. Open release note page?").replace('%n', latest),
-			parent=self,
-			buttons=(self.tr("Open"), self.tr("Later"))
-		)
-		res = msg.exec()
-		if res == 0:
-			webbrowser.open('https://github.com/Ryan-the-hito/Tomato/releases')
-
-	# 或者你也可以这样：仅在有更新时展示现有的 WindowUpdate 小窗
-	# self.win_update.show()  # 它会 show() 并 checkupdate()，但建议只 show，然后把 latest 显示出来
-
-	@pyqtSlot(str)
-	def on_update_checked_ok(self, latest: str):
-		# 可选：比如在日志里记录或更新某个状态标签（主线程里的标签）
-		# print(f"Checked latest: {latest}")
-		pass
-
-	@pyqtSlot(str)
-	def on_update_checked_error(self, err: str):
-		# 可选：记录错误，不弹框打扰用户
-		# print(f"Check update error: {err}")
-		pass
-
 	def totalquit(self):
 		ISOTIMEFORMAT = '%Y-%m-%d diary'
 		theTime = datetime.datetime.now().strftime(ISOTIMEFORMAT)
@@ -8902,14 +11250,16 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		pretext = '- ' + theTime
 		with open(diary_file, 'a', encoding='utf-8') as f0:
 			f0.write(pretext)
+		if getattr(self, '_tools_host', None) is not None:
+			self._tools_host.stop()
 		if self.auto_record_thread:
 			self.auto_record_thread.stop()
 			self.auto_record_thread = None
 		if hasattr(self, 'reminder_sync_timer') and self.reminder_sync_timer.isActive():
 			self.reminder_sync_timer.stop()
-		if self.reminder_sync_thread:
-			self.reminder_sync_thread.stop()
-			self.reminder_sync_thread = None
+		if self.system_sync_thread:
+			self.system_sync_thread.stop()
+			self.system_sync_thread = None
 		action4.setChecked(False)
 
 		app.quit()
@@ -8928,213 +11278,111 @@ end tell""" % (escaped_name, otherStyleTime, otherStyleTime, length_hours)
 		self.close()
 
 
-style_sheet_ori = '''
-	QTabWidget::pane {
-		border: 1px solid #ECECEC;
-		background: #ECECEC;
-		border-radius: 9px;
-}
-	QTabBar::tab {
-		background: #C8C8C8;
-		color: #000000;
-		padding: 6px 12px;
-		border: none;
-		border-top-left-radius: 6px;
-		border-top-right-radius: 6px;
-		margin-right: 2px;
-}
-	QTabBar::tab:selected {
-		background: #ECECEC;
-}
-	QTableWidget{
-		border: 1px solid grey;  
-		border-radius:4px;
-		background-clip: border;
-		background-color: #FFFFFF;
-		color: #000000;
-		font: 14pt Helvetica;
-}
-	QPushButton{
-		border: 1px outset grey;
-		background-color: #FFFFFF;
-		border-radius: 4px;
-		padding: 1px;
-		color: #000000
-}
-	QPushButton:pressed{
-		border: 1px outset grey;
-		background-color: #0085FF;
-		border-radius: 4px;
-		padding: 1px;
-		color: #FFFFFF
-}
-	QPlainTextEdit{
-		border: 1px solid grey;  
-		border-radius:4px;
-		padding: 1px 5px 1px 3px; 
-		background-clip: border;
-		background-color: #F3F2EE;
-		color: #000000;
-		font: 14pt Times New Roman;
-}
-	QPlainTextEdit#edit{
-		border: 1px solid grey;  
-		border-radius:4px;
-		padding: 1px 5px 1px 3px; 
-		background-clip: border;
-		background-color: #FFFFFF;
-		color: rgb(113, 113, 113);
-		font: 14pt Helvetica;
-}
-	QTableWidget#small{
-		border: 1px solid grey;  
-		border-radius:4px;
-		background-clip: border;
-		background-color: #F3F2EE;
-		color: #000000;
-		font: 14pt Times New Roman;
-}
-	QLineEdit{
-		border-radius:4px;
-		border: 1px solid gray;
-		background-color: #FFFFFF;
-}
-	QTextEdit{
-		border: 1px solid grey;  
-		border-radius:4px;
-		padding: 1px 5px 1px 3px; 
-		background-clip: border;
-		background-color: #F3F2EE;
-		color: #000000;
-		font: 14pt Times New Roman;
-}
-	QMessageBox QPushButton {
-		min-width: 100px;
-		height: 20px;
-}
-	QInputDialog QPushButton {
-		min-width: 100px;
-		height: 20px;
-}
-'''
+install_window_liquid_glass(ClockPickerPopup, tomato_ui.POPUP_GLASS_RADIUS, 0, keep_shadow=True, menu_look=True)
+glass_kit.install_glass_button_class(WhiteButton)  # white capsules become glass (before any window is built)
+for _glass_window_cls in (WindowAbout, WindowUpdate, CustomDialog, CustomDialog2, CustomDialog3, CustomDialog4):
+	install_native_glass_window_class(_glass_window_cls)
 
-style_sheet_dark = '''
-	QTabWidget::pane {
-		border: 1px solid #2D2D2D;
-		background: #2D2D2D;
-		border-radius: 9px;
-}
-	QTabBar::tab {
-		background: #141414;
-		color: #FFFFFF;
-		padding: 6px 12px;
-		border: none;
-		border-top-left-radius: 6px;
-		border-top-right-radius: 6px;
-		margin-right: 2px;
-}
-	QTabBar::tab:selected {
-		background: #2D2D2D;
-}
-	QTableWidget{
-		border: 1px solid grey;
-		border-radius:4px;
-		background-clip: border;
-		background-color: #3A3A3A;
-		color: #FFFFFF;
-		font: 14pt Helvetica;
-}
-	QPushButton{
-		border: 1px outset grey;
-		background-color: #3A3A3A;
-		border-radius: 4px;
-		padding: 1px;
-		color: #FFFFFF
-}
-	QPushButton:pressed{
-		border: 1px outset grey;
-		background-color: #0085FF;
-		border-radius: 4px;
-		padding: 1px;
-		color: #FFFFFF
-}
-	QPlainTextEdit{
-		border: 1px solid grey;
-		border-radius:4px;
-		padding: 1px 5px 1px 3px;
-		background-clip: border;
-		background-color: #3A3A3A;
-		color: #FFFFFF;
-		font: 14pt Times New Roman;
-}
-	QPlainTextEdit#edit{
-		border: 1px solid grey;
-		border-radius:4px;
-		padding: 1px 5px 1px 3px;
-		background-clip: border;
-		background-color: #3A3A3A;
-		color: #CCCCCC;
-		font: 14pt Helvetica;
-}
-	QTableWidget#small{
-		border: 1px solid grey;
-		border-radius:4px;
-		background-clip: border;
-		background-color: #3A3A3A;
-		color: #FFFFFF;
-		font: 14pt Times New Roman;
-}
-	QLineEdit{
-		border-radius:4px;
-		border: 1px solid gray;
-		background-color: #3A3A3A;
-		color: #FFFFFF;
-}
-	QTextEdit{
-		border: 1px solid grey;
-		border-radius:4px;
-		padding: 1px 5px 1px 3px;
-		background-clip: border;
-		background-color: #3A3A3A;
-		color: #FFFFFF;
-		font: 14pt Times New Roman;
-}
-	QListWidget{
-		border: 1px grey;
-		border-radius:4px;
-		padding: 1px 5px 1px 3px;
-		background-clip: border;
-		background-color: #3A3A3A;
-		color: #FFFFFF;
-		font: 14pt;
-}
-	QLabel{
-		color: #FFFFFF;
-}
-	QMessageBox QPushButton {
-		min-width: 100px;
-		height: 20px;
-}
-	QInputDialog QPushButton {
-		min-width: 100px;
-		height: 20px;
-}
-'''
 
-def apply_theme(app):
-	if is_dark_theme(app):
-		set_dark_palette(app)
-		app.setStyleSheet(style_sheet_dark)
-	else:
-		set_light_palette(app)
-		app.setStyleSheet(style_sheet_ori)
-	for widget in app.topLevelWidgets():
-		widget.update()
+# Every Tomato window shows on all desktops (Spaces). This used to be the Dock icon's Options ▸ All Desktops,
+# clicked through System Events at every start — impossible once the Dock icon is hidden, it needed the
+# Accessibility permission, and the start waited for it. Now each window is told itself, natively, as Broccoli
+# and Strawberry do, set every time the window is shown (Qt may make a new native window, e.g. after its flags
+# change). Since 2026-11-20 it is a switch in the menu-bar menu (🪟 Show on all Spaces), with Broccoli's meaning:
+# on = every desktop and over other apps' full-screen windows; off = only the desktop the window is on.
+_NS_WINDOW_CAN_JOIN_ALL_SPACES = 1 << 0
+_NS_WINDOW_MOVE_TO_ACTIVE_SPACE = 1 << 1
+_NS_WINDOW_FULL_SCREEN_AUXILIARY = 1 << 8
+SHOW_ON_ALL_SPACES = True
+_ALL_SPACES_CLASSES = []
 
+
+# Stage Manager (2026-11-25, Ryan: "它有的时候左边显示就会突然空出来这么一块…这个问题早就有了"; measured on his
+# screen: the system fitted the sliding main window into the room right of its strip). The main window is a
+# panel at the screen's edge, not a document window: it is marked as one that belongs to no stage and shows with
+# every app's (auxiliary + can join all applications, never primary), so the system has no stage to fit it into.
+_NS_WINDOW_PRIMARY = 1 << 16
+_NS_WINDOW_AUXILIARY = 1 << 17
+_NS_WINDOW_CAN_JOIN_ALL_APPLICATIONS = 1 << 18
+
+
+def keep_out_of_stage_manager(widget):
+	if sys.platform != 'darwin' or QGuiApplication.platformName() != 'cocoa':
+		return False   # no system window behind the widget (e.g. Qt drawing off screen)
+	window = glass_kit._broccoli_own_ns_window(widget)
+	if window is None:
+		return False
+	try:
+		behavior = int(window.collectionBehavior())
+		wanted = (behavior & ~_NS_WINDOW_PRIMARY) | _NS_WINDOW_AUXILIARY | _NS_WINDOW_CAN_JOIN_ALL_APPLICATIONS
+		if wanted != behavior:
+			window.setCollectionBehavior_(wanted)
+			logging.info('Main window marked as outside Stage Manager: behaviour %#x -> %#x', behavior, int(window.collectionBehavior()))
+		return True
+	except Exception:
+		logging.exception('Main window: the Stage Manager mark could not be set')
+		return False
+
+
+def show_window_on_all_spaces(widget, enabled=None):
+	if sys.platform != 'darwin' or QGuiApplication.platformName() != 'cocoa':
+		return False   # no system window behind the widget (e.g. Qt drawing off screen)
+	window = glass_kit._broccoli_own_ns_window(widget)
+	if window is None:
+		return False
+	enabled = SHOW_ON_ALL_SPACES if enabled is None else bool(enabled)
+	bits = _NS_WINDOW_CAN_JOIN_ALL_SPACES | _NS_WINDOW_FULL_SCREEN_AUXILIARY
+	try:
+		behavior = int(window.collectionBehavior())
+		wanted = behavior & ~_NS_WINDOW_MOVE_TO_ACTIVE_SPACE
+		wanted = (wanted | bits) if enabled else (wanted & ~bits)
+		if wanted != behavior:
+			window.setCollectionBehavior_(wanted)
+		return True
+	except Exception:
+		return False
+
+
+def set_show_on_all_spaces(enabled):
+	"""The switch: for the windows that are open now and every one shown later."""
+	global SHOW_ON_ALL_SPACES
+	SHOW_ON_ALL_SPACES = bool(enabled)
+	for widget in QApplication.topLevelWidgets():
+		if isinstance(widget, tuple(_ALL_SPACES_CLASSES)) and widget.testAttribute(Qt.WidgetAttribute.WA_WState_Created):
+			show_window_on_all_spaces(widget)
+
+
+def install_all_spaces_class(cls):
+	original = cls.showEvent
+
+	def showEvent(self, event, _original=original):
+		_original(self, event)
+		show_window_on_all_spaces(self)
+
+	cls.showEvent = showEvent
+	_ALL_SPACES_CLASSES.append(cls)
+
+
+for _all_spaces_cls in (window3, WindowAbout, WindowUpdate, CustomDialog, CustomDialog2, CustomDialog3, CustomDialog4,
+						CustomDialog_warn, SyncIndicatorDialog, AutoCloseNotification,
+						tomato_broccoli_ui.TaskEditorDialog, tomato_broccoli_ui.TaskManagerDialog):
+	install_all_spaces_class(_all_spaces_cls)
 
 w1 = WindowAbout()  # about
 w2 = WindowUpdate()  # update
 w3 = window3()  # main1
+
+
+def _tell_data_folder_moved():
+	"""Once, after the start that moved the data: where it is now (a syncing or backup tool that watched the
+	old folder has to be pointed at the new one)."""
+	tomato_alert(None, NAME, _tr(
+		'Tomato\'s data has moved from the home folder to:\n\n%1\n\nNothing else changed. If a syncing or backup tool watched the old folder "TomatoAppPath", point it at the new one.'
+	).replace('%1', TOMATO_DATA_DIR.replace(str(Path.home()), '~', 1)))
+
+
+if DATA_FOLDER_MOVE_REPORT == 'moved':
+	QTimer.singleShot(1500, lambda: _tell_data_folder_moved())
 tray_time_controller = TimeSensitiveTrayController(
 	menu,
 	time_sensitive_menu,
@@ -9145,15 +11393,37 @@ tray_time_controller = TimeSensitiveTrayController(
 action1.triggered.connect(w1.activate)
 action2.triggered.connect(w2.activate)
 action3.triggered.connect(w3.pin_a_tab)
+action_broccoli_tasks.triggered.connect(w3.open_broccoli_tasks)
 action4.triggered.connect(w3.auto_record)
 action_auto_record_startup.triggered.connect(w3._toggle_auto_record_startup)
+action_always_on_top.triggered.connect(w3._toggle_always_on_top)
+action_dock_icon.triggered.connect(w3._toggle_dock_icon)
+action_all_spaces.triggered.connect(w3._toggle_all_spaces)
+action_shortcut.triggered.connect(w3.open_shortcut_dialog)
+action_vision_diary.toggled.connect(w3.set_vision_to_diary)
+action_daily_report.triggered.connect(lambda: w3.open_daily_report())
+action_ai_apps.triggered.connect(_copy_ai_apps_setup)
 # Connect repeat pregenerate count menu actions
 for i, action in enumerate(repeat_pregenerate_actions):
 	action.triggered.connect(lambda checked, count=i+1: w3._set_repeat_pregenerate_count(count))
 # tray.activated.connect(w3.activate)
 btna4.triggered.connect(w3.pin_a_tab2)
 quit.triggered.connect(w3.totalquit)
-apply_theme(app)
+tomato_ui.set_dialog_host(lambda: w3)
+tomato_ui._THEME_HOOKS.append(lambda dark: w3._style_edge_strip())
+on_theme_changed(apply_tomato_theme)
+install_theme_observer()
+apply_tomato_theme()
 # Start auto-record if the setting is enabled
 w3._start_auto_record_if_enabled()
+# Updates, Broccoli's way (2026-11-25, Ryan: "所有的软件……都是要学习 Broccoli 的这个更新写法的"): the previous
+# bundle / installers the last update left are removed in the background; 3 s after the start one release check
+# runs in the background, and when a newer release is out (or the last install left a note) the update window
+# comes out by itself, with its one-click "Update Now". No daily re-check, no switches, no "open the page?".
+threading.Thread(target=tomato_cleanup_update_leftovers, daemon=True, name='tomato-update-cleanup').start()
+QTimer.singleShot(3000, lambda: w2.checkupdate(popup_when_ready=True))
 app.exec()
+# One-click update: the bundles are swapped only once Qt has wound down (only when the update window prepared an
+# install before quitting). Tomato keeps Qt's own app delegate (it never calls setDelegate_), so app.exec()
+# returns on every Quit path (the menu's Quit → totalquit, ⌘Q, the Dock's Quit) and this line is reached.
+tomato_apply_pending_update_install()
