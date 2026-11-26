@@ -95,7 +95,7 @@ app.setQuitOnLastWindowClosed(False)
 BasePath = '/Applications/Tomato.app/Contents/Resources/'
 # BasePath = ''  # test
 
-VERSION = "1.2.12"
+VERSION = "1.2.13"
 NAME = 'Tomato'
 
 os.environ["QT_QUICK_BACKEND"] = "metal"
@@ -3131,6 +3131,7 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		super().showEvent(event)
 		self._connect_screen_fit_handle()
 		keep_out_of_stage_manager(self)
+		self._place_strip_button()
 
 	def _apply_window_flags(self):
 		flags = Qt.WindowType.FramelessWindowHint
@@ -3174,13 +3175,61 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		self.set_always_on_top(checked)
 
 	def _strip_top(self, area):
-		"""Where the 120-high strip window goes so that the strip's middle is the middle between the top of
-		the screen and the top of the Dock (Ryan 2026-11-16: "始终处于屏幕上下的正中间 … 去掉 dock 高度的
-		正中间"). `area` = the screen's available geometry (it ends where the Dock begins)."""
+		"""Where the 120-high strip window goes so that the strip's middle is the middle of the WHOLE screen
+		(Ryan 2026-11-26: "一直处于屏幕的正中间", menu bar and Dock not counted; this replaces the 2026-11-16
+		rule "middle between screen top and Dock"). `area` = the screen's available geometry, only used to
+		find the screen."""
 		screen = QGuiApplication.screenAt(area.center())
-		top = screen.geometry().y() if screen is not None else area.y()
-		bottom = area.y() + area.height()
-		return int(round((top + bottom) / 2 - 60))
+		whole = screen.geometry() if screen is not None else area
+		return int(round(whole.y() + whole.height() / 2 - 60))
+
+	def _place_strip_button(self):
+		"""Keep the strip button's middle at the middle of the whole screen, slid out or slid in, so it only
+		ever travels sideways (Ryan 2026-11-26). The button is placed by hand, not by a layout: the slid-out
+		window reaches under the menu bar and ends at the Dock, and Qt pushes its laid-out content down by the
+		menu bar's height, so neither the window's middle nor the layout's is the screen's."""
+		holder = getattr(self, '_strip_holder', None)
+		if holder is None:
+			return
+		handle = self.windowHandle()
+		screen = (handle.screen() if handle is not None else None) or self.screen() or QGuiApplication.primaryScreen()
+		if screen is None:
+			return
+		whole = screen.geometry()
+		middle = whole.y() + whole.height() / 2
+		top = int(round(middle - self.btn_00.height() / 2 - self._window_top_on_screen()))
+		top = max(0, min(top, max(0, self.height() - self.btn_00.height())))
+		spot = QPoint(self.width() - self.btn_00.width(), top)   # the holder is the last, 10-wide column
+		if self.btn_00.pos() != spot:
+			self.btn_00.move(spot)
+		self.btn_00.raise_()
+
+	def _window_top_on_screen(self):
+		"""The window's real top edge, in Qt's screen coordinates. The system keeps a window below the menu
+		bar and Qt does not always hear of it (asked for y 0, really at 39), so the system window is asked."""
+		if sys.platform == 'darwin' and QGuiApplication.platformName() == 'cocoa':
+			try:
+				handle = self.windowHandle()
+				if handle is None or handle is not getattr(self, '_strip_ns_handle', None):
+					# looked up once per system window (setWindowFlags() makes a new one), not on every move
+					self._strip_ns_window = glass_kit._broccoli_own_ns_window(self) if handle is not None else None
+					self._strip_ns_handle = handle
+				window = self._strip_ns_window
+				if window is not None:
+					from AppKit import NSScreen
+					frame = window.frame()
+					return float(NSScreen.screens()[0].frame().size.height) - float(frame.origin.y + frame.size.height)
+			except Exception:
+				pass
+		return float(self.mapToGlobal(QPoint(0, 0)).y())
+
+	def moveEvent(self, event):
+		super().moveEvent(event)
+		self._place_strip_button()
+
+	def resizeEvent(self, event):
+		super().resizeEvent(event)
+		self._place_strip_button()
 
 	def _schedule_screen_fit(self, *_args):
 		timer = getattr(self, '_screen_fit_timer', None)
@@ -3340,9 +3389,9 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		left_btn = QVBoxLayout()
 		left_btn.setContentsMargins(0, 0, 0, 0)
 		left_btn.addStretch()
-		left_btn.addWidget(self.btn_00)
-		left_btn.addStretch()
 		lbtn.setLayout(left_btn)
+		lbtn.setFixedWidth(self.btn_00.width())   # keeps the column free; the button itself is placed by
+		self._strip_holder = lbtn                 # _place_strip_button(), a child of the window, in no layout
 
 		main_h_box = QHBoxLayout()
 		main_h_box.setContentsMargins(0, 0, 0, 0)
@@ -3419,6 +3468,7 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		self._slide_serial = getattr(self, '_slide_serial', 0) + 1
 		serial = self._slide_serial
 		animation.finished.connect(lambda: QTimer.singleShot(self.SLIDE_LANDING_CHECK_MS, lambda: self._check_slide_landing(serial, QRect(new_pos))))
+		animation.finished.connect(self._place_strip_button)
 		animation.start()
 		self.i += 1
 		self._style_edge_strip()
@@ -3463,6 +3513,7 @@ class window3(QWidget):  # 主程序的代码块（Find a dirty word!）
 		animation.setDuration(400)
 		new_pos = QRect(width, height, self.width(), self.height())
 		animation.setEndValue(new_pos)
+		animation.finished.connect(self._place_strip_button)
 		animation.start()
 
 	def _current_screen_geometry(self):

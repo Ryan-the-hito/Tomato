@@ -9,7 +9,7 @@
 
 **Tomato is a schedule manager that puts Reminders and Calendar together.** You plan in one table; tick an item once and Reminders, Calendar, the diary and the records all follow. It can also note which apps you use during the day and write a report every evening, and it can hand an item to an AI ([Broccoli](https://github.com/Ryan-the-hito/Broccoli)) when its time comes. All of your data is ordinary files on your own Mac.
 
-Latest version: **v1.2.12** · Interface languages: English / 简体中文 / 日本語
+Latest version: **v1.2.13** · Interface languages: English / 简体中文 / 日本語
 
 ## What it solves
 
